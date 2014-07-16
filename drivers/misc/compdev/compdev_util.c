@@ -153,16 +153,13 @@ static int get_chroma_pitch(u32 luma_pitch, enum compdev_fmt fmt)
 	switch (fmt) {
 	case COMPDEV_FMT_YV12:
 		chroma_pitch = ALIGN((luma_pitch >> 1), 16);
-		break;
 	case COMPDEV_FMT_YUV420_SP:
 	case COMPDEV_FMT_YVU420_SP:
 		chroma_pitch = luma_pitch;
-		break;
 	case COMPDEV_FMT_YCBCR42XMBN:
 	case COMPDEV_FMT_YUV420_P:
 	case COMPDEV_FMT_YVU420_P:
 		chroma_pitch = luma_pitch >> 1;
-		break;
 	default:
 		chroma_pitch = 0;
 	}
@@ -182,12 +179,10 @@ static int get_chroma_size(u32 luma_pitch, u32 luma_height,
 	case COMPDEV_FMT_YUV420_P:
 	case COMPDEV_FMT_YVU420_P:
 	case COMPDEV_FMT_YV12:
-		return chroma_pitch *
-			((luma_height + 1) >> 1) << 1;
+		return chroma_pitch * ALIGN(luma_height, 2);
 	case COMPDEV_FMT_YUV420_SP:
 	case COMPDEV_FMT_YVU420_SP:
-		return chroma_pitch *
-			((luma_height + 1) >> 1);
+		return chroma_pitch * ((luma_height + 1) >> 1);
 	case COMPDEV_FMT_YCBCR42XMBN:
 		return chroma_pitch * (ALIGN(luma_height, 16) >> 1);
 	default:
@@ -322,7 +317,7 @@ static struct compdev_img_internal *compdev_cache_alloc(
 	} else {
 		cache_ctx->allocated++;
 		cache_ctx->unused_counter++;
-		cache_ctx->index = index;		
+		cache_ctx->index = index;
 		kref_get(&cache_ctx->img[index]->ref_count);
 		return cache_ctx->img[index];
 	}

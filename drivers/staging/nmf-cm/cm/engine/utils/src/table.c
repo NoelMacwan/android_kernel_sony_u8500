@@ -84,9 +84,15 @@ t_uint32 cm_addEntry(t_nmf_table *table, void *entry)
 {
 	unsigned int i;
 	t_uint32 hdl = 0;
+	t_cm_error error = CM_OK;
 
 	if (table->idxNb == table->idxMax)
-		cm_increaseTable(table);
+	{
+	    error = cm_increaseTable(table);
+		if(error != CM_OK)
+			return hdl;   //hdl will be 0x0,it means status flag is '0',so it is error and
+                          // are handled as CM_NO_MORE_MEMORY
+	}
 
 	for (i = table->idxCur;
 	     table->entries[i] != 0 && i != (table->idxCur-1);
@@ -125,7 +131,7 @@ void *cm_lookupEntry(const t_nmf_table *table, const t_uint32 hdl)
 	unsigned int idx = hdl & INDEX_MASK;
 
 	if ((idx >= table->idxMax)
-	    || (((unsigned int)table->entries[idx] << INDEX_SHIFT) != (hdl & ~INDEX_MASK)))
+	    || (((unsigned int)table->entries[idx] << LSBADDR_SHIFT) != (hdl & ~(INDEX_MASK |STATUSBIT_MASK))))
 		return NULL;
 	else
 		return table->entries[idx];

@@ -7,6 +7,7 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/dmaengine.h>
+#include <linux/dma-mapping.h>
 #include <asm/io.h>
 #include <mach/db8500-regs.h>
 
@@ -32,6 +33,9 @@ static int cmdma_write_cyclic_list_per2mem(
     unsigned int LOS);
 
 static bool cmdma_setup_relink_area_called = false;
+static bool cscall_cmdma_setup_relink_area_called = false;
+
+#define MSP4_ADDRESS                0x80116000
 
 int cmdma_setup_relink_area( unsigned int mem_addr,
     unsigned int per_addr,
@@ -40,8 +44,13 @@ int cmdma_setup_relink_area( unsigned int mem_addr,
     unsigned int LOS,
     enum cmdma_type type)
 {
-    if (!cmdma_setup_relink_area_called)
-	    cmdma_setup_relink_area_called = true;
+	if  (per_addr != MSP4_ADDRESS)
+		/* audiocodec case */
+		cmdma_setup_relink_area_called = true;
+
+	else
+		/* cscall_mpc case, using MSP4 */
+		cscall_cmdma_setup_relink_area_called = true;
 
     switch (type) {
 
@@ -207,19 +216,82 @@ void cmdma_destroy(void)
 
 void cmdma_stop_dma(void)
 {
-    if(cmdma_setup_relink_area_called) {
-        cmdma_setup_relink_area_called = false;
-        if (readl(dmabase + SSLNK_CHAN_2) & (0x3 << 28)) {
-            printk(KERN_ERR "CM: ERROR - RX DMA was running\n");
-        }
-        if (readl(dmabase + SDLNK_CHAN_2) & (0x3 << 28)) {
-            printk(KERN_ERR "CM: ERROR - TX DMA was running\n");
-        }
+	unsigned int tmp_register_sslnk;
+	unsigned int tmp_register_sdlnk;
 
-        writel(~(1 << 28), dmabase + SSLNK_CHAN_2);
-        while (readl(dmabase + SSLNK_CHAN_2) & (0x3 << 28));
+	if (cmdma_setup_relink_area_called) {
+		cmdma_setup_relink_area_called = false;
+		pr_err("cmdma_stop_dma (audiocodec channel)");
 
-        writel(~(1 << 28), dmabase + SDLNK_CHAN_2);
-        while (readl(dmabase + SDLNK_CHAN_2) & (0x3 << 28));
-    }
+		/* Checks if in disable state or not
+		(should already be set by audiocodec component) */
+		tmp_register_sslnk = readl(dmabase + SSLNK_CHAN_2);
+		if (tmp_register_sslnk & (0x3 << 28))
+			printk(KERN_ERR "CM: ERROR - RX DMA was running\n");
+
+		/* Checks if in disable state or not
+		(should already be set by audiocodec component) */
+		tmp_register_sdlnk = readl(dmabase + SDLNK_CHAN_2);
+		if  (tmp_register_sdlnk & (0x3 << 28))
+			printk(KERN_ERR "CM: ERROR - TX DMA was running\n");
+
+		/* Transitions to disable state MSP1 and MSP3
+		Rx logical channels */
+		/* Sets to 0 MSP1 and MSP3 event lines */
+		tmp_register_sslnk &= ~(3 << 28);
+		/* Sets to 2 (for Suspend_Req) MSP1 and MSP3 event lines */
+		tmp_register_sslnk |= (2 << 28);
+		/* Pushes it in DMA register */
+		writel(tmp_register_sslnk, dmabase + SSLNK_CHAN_2);
+		/* Polls on Disable state (HW transition) */
+		while (readl(dmabase + SSLNK_CHAN_2) & (0x3 << 28));
+
+		/* Transitions to disable state MSP1 and MSP3
+		Tx logical channels */
+		/* Sets to 0 MSP1 and MSP3 event lines */
+		tmp_register_sdlnk &= ~(3 << 28);
+		/* Sets to 2 (for Suspend_Req) MSP1 and MSP3 event lines */
+		tmp_register_sdlnk |= (2 << 28);
+		/* Pushes it in DMA register */
+		writel(tmp_register_sdlnk, dmabase + SDLNK_CHAN_2);
+		/* Polls on Disable state (HW transition) */
+		while (readl(dmabase + SDLNK_CHAN_2) & (0x3 << 28));
+	}
+
+	if (cscall_cmdma_setup_relink_area_called) {
+		cscall_cmdma_setup_relink_area_called = false;
+		pr_err("cmdma_stop_dma (cscall_mpc channel)");
+
+		/* Checks if in disable state or not
+		(should already be set by cscall_mpc component) */
+		tmp_register_sslnk = readl(dmabase + SSLNK_CHAN_2);
+		if (tmp_register_sslnk & (0x3 << 8))
+			printk(KERN_ERR "CM: ERROR - RX DMA was running for MSP4\n");
+
+		/* Checks if in disable state or not
+		(should already be set by cscall_mpc component) */
+		tmp_register_sdlnk = readl(dmabase + SDLNK_CHAN_2);
+		if (tmp_register_sdlnk & (0x3 << 10))
+			printk(KERN_ERR "CM: ERROR - TX DMA was running for MSP4\n");
+
+		/* Transitions to disable state MSP4 Rx logical channel */
+		/* Sets to 0 MSP4 Rx event line */
+		tmp_register_sslnk &= ~(3 << 8);
+		/* Sets to 2 (for Suspend_Req) MSP4 event line */
+		tmp_register_sslnk |= (2 << 8);
+		/* Pushes it in DMA register */
+		writel(tmp_register_sslnk, dmabase + SSLNK_CHAN_2);
+		/* Polls on Disable state (HW transition) */
+		while (readl(dmabase + SSLNK_CHAN_2) & (0x3 << 8));
+
+		/* Transitions to disable state MSP4 Tx logical channel */
+		/* Sets to 0 MSP4 Tx event line */
+		tmp_register_sdlnk &= ~(3 << 10);
+		/* Sets to 2 (for Suspend_Req) MSP4 Tx event line */
+		tmp_register_sdlnk |= (2 << 10);
+		/* Pushes it in DMA register */
+		writel(tmp_register_sdlnk, dmabase + SDLNK_CHAN_2);
+		/* Polls on Disable state (HW transition) */
+		while (readl(dmabase + SDLNK_CHAN_2) & (0x3 << 10));
+	}
 }

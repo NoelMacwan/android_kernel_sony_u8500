@@ -14,13 +14,17 @@
 #include <linux/platform_device.h>
 #include <linux/io.h>
 #include <linux/i2c.h>
+#include <linux/i2c-gpio.h>
+#include <linux/platform_data/i2c-nomadik.h>
 #include <linux/gpio.h>
 #include <linux/amba/bus.h>
 #include <linux/amba/pl022.h>
 #include <linux/amba/serial.h>
 #include <linux/spi/spi.h>
+#ifdef CONFIG_HSI
 #include <linux/hsi/hsi.h>
-#include <linux/mfd/ab8500.h>
+#endif
+#include <linux/mfd/abx500/ab8500.h>
 #include <linux/regulator/ab8500.h>
 #include <linux/mfd/tc3589x.h>
 #include <linux/mfd/abx500/ab8500-gpio.h>
@@ -34,18 +38,26 @@
 #include <linux/spi/stm_msp.h>
 #include <linux/leds_pwm.h>
 #include <linux/pwm_backlight.h>
+#include <linux/platform_data/crypto-ux500.h>
+#include <linux/platform_data/keypad-nomadik-ske.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/ft5306.h>//new add
 #include <linux/leds.h>
 #include <linux/mfd/abx500/ux500_sysctrl.h>
+#ifdef CONFIG_INPUT_AB8500_ACCDET
 #include <linux/input/abx500-accdet.h>
+#endif
 #include <linux/input/ab8505_micro_usb_iddet.h>
+#include <linux/tee.h>
 
 #include <asm/mach-types.h>
 #include <asm/mach/arch.h>
+#include <asm/hardware/gic.h>
 
-#include <plat/gpio-nomadik.h>
-#include <plat/i2c.h>
 #include <plat/ste_dma40.h>
 #include <plat/pincfg.h>
+#include <plat/gpio-nomadik.h>
 
 #include <mach/hardware.h>
 #include <mach/setup.h>
@@ -55,26 +67,69 @@
 #ifdef CONFIG_U8500_SIM_DETECT
 #include <mach/sim_detect.h>
 #endif
-#include <mach/crypto-ux500.h>
 #include <mach/pm.h>
-
+#include <mach/reboot_reasons.h>
+#ifdef CONFIG_AV8100
 #include <video/av8100.h>
-
-#ifdef CONFIG_KEYBOARD_NOMADIK_SKE
-#include <plat/ske.h>
+#endif
+//new add PLsensor
+#ifdef CONFIG_TSL27713_PLSENSOR
+#include <linux/tsl27713.h>
 #endif
 
+#include "id.h"
 #include "pins.h"
 #include "cpu-db8500.h"
 #include "pins-db8500.h"
 #include "devices-db8500.h"
 #include "board-mop500.h"
 #include "board-mop500-regulators.h"
+#include "board-ux500-usb.h"
 #include "board-mop500-bm.h"
+#if defined(CONFIG_CW1200) || defined(CONFIG_CW1200_MODULE)
 #include "board-mop500-wlan.h"
+#endif
 
 #define PRCM_DEBUG_NOPWRDOWN_VAL	0x194
 #define ARM_DEBUG_NOPOWER_DOWN_REQ	1
+
+/****G-sensor  and E-sensor******/
+#ifdef CONFIG_SENSORS_LSM303DLH
+#include <linux/lsm303dlh.h>
+#endif
+/****************************************************************/
+#ifdef CONFIG_SENSORS_L3G4200D
+#include <linux/l3g4200d.h>
+#endif
+
+/*
+ * LSM303DLH accelerometer + magnetometer & L3G4200D Gyroscope sensors
+ */
+
+#ifdef CONFIG_SENSORS_LSM303DLH
+#define LSM303DLHC_CHIP_ID 51
+static struct lsm303dlh_platform_data lsm303dlh_pdata_u8500 = {
+	.axis_map_x = 0,
+	.axis_map_y = 1,
+	.axis_map_z = 2,
+	.negative_x = 0,
+	.negative_y = 1,
+	.negative_z = 1,
+	.chip_id = LSM303DLHC_CHIP_ID,
+};
+#endif
+#ifdef CONFIG_SENSORS_L3G4200D
+
+static struct l3g4200d_gyr_platform_data l3g4200d_pdata_u8500 = {
+	.axis_map_x = 1,
+	.axis_map_y = 0,
+	.axis_map_z = 2,
+	.negative_x = 0,
+	.negative_y = 0,
+	.negative_z = 1,
+};
+#endif
+
 
 #ifdef CONFIG_AB8500_DENC
 static struct ab8500_denc_platform_data ab8500_denc_pdata = {
@@ -182,7 +237,7 @@ static struct ab8500_gpio_platform_data ab8505_gpio_pdata = {
 	 * GPIO pullup/pulldown configuration.
 	 * GPIO13(GpioPud2) = 1 and GPIO50(GpioPud7) = 1.
 	 */
-	.config_pullups    = {0xE0, 0x11, 0x00, 0x00, 0x00, 0x00, 0x02},
+	.config_pullups    = {0xE0, 0x11, 0x00, 0x00, 0x00, 0x00, 0x06},
 };
 
 static struct ab8500_sysctrl_platform_data ab8500_sysctrl_pdata = {
@@ -193,6 +248,7 @@ static struct ab8500_sysctrl_platform_data ab8500_sysctrl_pdata = {
 	 */
 	.initial_req_buf_config
 			= {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+	.reboot_reason_code = reboot_reason_code,
 };
 
 #ifdef CONFIG_INPUT_AB8500_ACCDET
@@ -262,7 +318,7 @@ static struct platform_device snowball_key_dev = {
 	.id		= -1,
 	.dev		= {
 		.platform_data  = &snowball_key_data,
-		.pwr_domain	= &ux500_dev_power_domain,
+		.pm_domain	= &ux500_dev_power_domain,
 	}
 };
 
@@ -327,6 +383,7 @@ static struct ab8500_platform_data ab8500_platdata = {
 	.pm_power_off = true,
 #endif
 	.thermal_time_out = 20, /* seconds */
+	.usb		= &abx500_usbgpio_plat_data,
 #ifdef CONFIG_INPUT_AB8505_MICRO_USB_DETECT
 	.iddet = &iddet_adc_val_list,
 #endif
@@ -450,70 +507,10 @@ static int ske_kp_exit(void)
 	return 0;
 }
 
-static int av8100_plat_init(void)
-{
-	struct ux500_pins *pins;
-	int res;
-
-	pins = ux500_pins_get("av8100-hdmi");
-	if (!pins) {
-		res = -EINVAL;
-		goto failed;
-	}
-
-	res = ux500_pins_enable(pins);
-	if (res != 0)
-		goto failed;
-
-	return res;
-
-failed:
-	pr_err("%s failed\n", __func__);
-	return res;
-}
-
-static int av8100_plat_exit(void)
-{
-	struct ux500_pins *pins;
-	int res;
-
-	pins = ux500_pins_get("av8100-hdmi");
-	if (!pins) {
-		res = -EINVAL;
-		goto failed;
-	}
-	res = ux500_pins_disable(pins);
-	if (res != 0)
-		goto failed;
-	return res;
-
-failed:
-	pr_err("%s failed\n", __func__);
-	return res;
-}
-
 static const unsigned int mop500_ske_keymap[] = {
-#if defined(CONFIG_KEYLAYOUT_LAYOUT1)
-	KEY(2, 5, KEY_END),
-	KEY(4, 1, KEY_HOME),
-	KEY(3, 5, KEY_VOLUMEDOWN),
-	KEY(1, 3, KEY_EMAIL),
-	KEY(5, 2, KEY_RIGHT),
-	KEY(5, 0, KEY_BACKSPACE),
-
-	KEY(0, 5, KEY_MENU),
-	KEY(7, 6, KEY_ENTER),
-	KEY(4, 5, KEY_0),
-	KEY(6, 7, KEY_DOT),
-	KEY(3, 4, KEY_UP),
-	KEY(3, 3, KEY_DOWN),
-
-	KEY(6, 4, KEY_SEND),
-	KEY(6, 2, KEY_BACK),
-	KEY(4, 2, KEY_VOLUMEUP),
-	KEY(5, 5, KEY_SPACE),
-	KEY(4, 3, KEY_LEFT),
-	KEY(3, 2, KEY_SEARCH),
+#ifdef CONFIG_KEYLAYOUT_LAYOUT1
+	KEY(1, 3, KEY_VOLUMEUP),
+	KEY(2, 3, KEY_VOLUMEDOWN),
 #elif defined(CONFIG_KEYLAYOUT_LAYOUT2)
 	KEY(2, 5, KEY_RIGHT),
 	KEY(4, 1, KEY_ENTER),
@@ -557,11 +554,10 @@ static struct ske_keypad_platform_data mop500_ske_keypad_data = {
 	.krow		= SKE_KPD_MAX_ROWS,     /* 8x8 matrix */
 	.kcol		= SKE_KPD_MAX_COLS,
 	.debounce_ms    = 20,			/* in timeout period */
-	.switch_delay	= 200,			/* in jiffies */
+	.switch_delay	= HZ / 10,			/* in jiffies *///fixed press key response too slowly bug by dyron
 };
 
 #endif
-
 
 /*
  * TC35892
@@ -569,7 +565,12 @@ static struct ske_keypad_platform_data mop500_ske_keypad_data = {
 
 static void mop500_tc35892_init(struct tc3589x *tc3589x, unsigned int base)
 {
-	mop500_sdi_tc35892_init();
+	struct device *parent = NULL;
+#if 0
+	/* FIXME: Is the sdi actually part of tc3589x? */
+	parent = tc3589x->dev;
+#endif
+	mop500_sdi_tc35892_init(parent);
 }
 
 static struct tc3589x_gpio_platform_data mop500_tc35892_gpio_data = {
@@ -601,9 +602,8 @@ static struct lp5521_led_config lp5521_pri_led[] = {
 	},
 };
 
+#ifdef CONFIG_AV8100
 static struct av8100_platform_data av8100_plat_data = {
-	.init			= av8100_plat_init,
-	.exit			= av8100_plat_exit,
 	.irq			= NOMADIK_GPIO_TO_IRQ(192),
 	.reset			= MOP500_HDMI_RST_GPIO,
 	.inputclk_id		= "sysclk2",
@@ -611,6 +611,7 @@ static struct av8100_platform_data av8100_plat_data = {
 	.alt_powerupseq		= false,
 	.mclk_freq		= 3, /* MCLK_RNG_31_38 */
 };
+#endif
 
 static struct lp5521_platform_data __initdata lp5521_pri_data = {
 	.label		= "lp5521_pri",
@@ -644,22 +645,36 @@ static struct lp5521_platform_data __initdata lp5521_sec_data = {
 	.clock_mode	= LP5521_CLOCK_EXT,
 };
 
+#ifdef CONFIG_TSL27713_PLSENSOR
+static struct tsl27713_platform_data tsl27713_data = {
+   .pdrive = 0x03,
+   .ppcount = 0x08,
+   .setup_resources = NULL,
+   .release_resources = NULL,
+};
+#endif    
+
 static struct i2c_board_info __initdata mop500_i2c0_devices[] = {
+#if 0
 	{
 		I2C_BOARD_INFO("tc3589x", 0x42),
 		.irq		= NOMADIK_GPIO_TO_IRQ(217),
 		.platform_data  = &mop500_tc35892_data,
 	},
+#ifdef CONFIG_AV8100
 	{
 		I2C_BOARD_INFO("av8100", 0x70),
 		.platform_data = &av8100_plat_data,
 	},
+#endif
+#endif
 	/* I2C0 devices only available prior to HREFv60 */
 };
 
 #define NUM_PRE_V60_I2C0_DEVICES 1
 
 static struct i2c_board_info __initdata mop500_i2c2_devices[] = {
+#if defined(CONFIG_LEDS_LP5521)
 	{
 		/* lp5521 LED driver, 1st device */
 		I2C_BOARD_INFO("lp5521", 0x33),
@@ -670,9 +685,71 @@ static struct i2c_board_info __initdata mop500_i2c2_devices[] = {
 		I2C_BOARD_INFO("lp5521", 0x34),
 		.platform_data = &lp5521_sec_data,
 	},
+#endif
+#if defined(CONFIG_SENSORS_BH1780)	
 	{
 		/* Light sensor Rohm BH1780GLI */
 		I2C_BOARD_INFO("bh1780", 0x29),
+	},
+#endif
+
+#ifdef CONFIG_TSL27713_PLSENSOR
+	{
+		/* TAOS TSL27713 Digital Proximity and Ambient Light Sensor */
+		I2C_BOARD_INFO("tsl27713", 0x39),
+		.irq = NOMADIK_GPIO_TO_IRQ(217),
+		.platform_data = &tsl27713_data,
+	},
+#endif
+
+#ifdef CONFIG_SENSORS_LSM303DLH
+	{
+		/* LSM303DLH Accelerometer */
+		I2C_BOARD_INFO("lsm303dlh_a", 0x19),
+		.platform_data = &lsm303dlh_pdata_u8500,
+	},
+	{
+		/* LSM303DLH Magnetometer */
+		I2C_BOARD_INFO("lsm303dlh_m", 0x1E),
+		.platform_data = &lsm303dlh_pdata_u8500,
+	},
+#endif
+#ifdef CONFIG_SENSORS_L3G4200D
+	{
+		/* L3G4200D Gyroscope */
+		I2C_BOARD_INFO("l3g4200d", 0x68),
+		.platform_data = &l3g4200d_pdata_u8500,
+	},	
+#endif
+};
+
+//new add ft5306
+
+static int ft5306_wake_up()
+{
+	gpio_set_value(HREFV60_TOUCH_RST_GPIO, 1);
+	mdelay(10);
+	gpio_set_value(HREFV60_TOUCH_RST_GPIO, 0);
+	mdelay(10);
+	gpio_set_value(HREFV60_TOUCH_RST_GPIO, 1);
+
+	return 0;
+}
+
+static struct ft5306_platform_data ft5306_pdata = {
+	.wake_up = ft5306_wake_up,
+	.res_x = 540,
+	.res_y = 960,
+	.touch_x_max = 540,
+	.touch_y_max = 1040,
+};
+
+static struct i2c_board_info __initdata mop500_i2c3_devices[] = {
+	{
+		/* Touschscreen */
+		I2C_BOARD_INFO("tp_ft5306", 0x38),
+		.irq = GPIO_TO_IRQ(6),
+		.platform_data = &ft5306_pdata,
 	},
 };
 
@@ -707,13 +784,15 @@ U8500_I2C_CONTROLLER(1, 0xe, 1, 8, 400000, 200, I2C_FREQ_MODE_FAST);
 U8500_I2C_CONTROLLER(2,	0xe, 1, 8, 400000, 200, I2C_FREQ_MODE_FAST);
 U8500_I2C_CONTROLLER(3,	0xe, 1, 8, 400000, 200, I2C_FREQ_MODE_FAST);
 
-static void __init mop500_i2c_init(void)
+
+static void __init mop500_i2c_init(struct device *parent)
 {
-	db8500_add_i2c0(&u8500_i2c0_data);
-	db8500_add_i2c1(&u8500_i2c1_data);
-	db8500_add_i2c2(&u8500_i2c2_data);
-	db8500_add_i2c3(&u8500_i2c3_data);
+	db8500_add_i2c0(parent, NULL);
+	db8500_add_i2c1(parent, NULL);
+	db8500_add_i2c2(parent, NULL);
+	db8500_add_i2c3(parent, NULL);
 }
+
 
 #ifdef CONFIG_LEDS_PWM
 static struct led_pwm pwm_leds_data[] = {
@@ -726,6 +805,7 @@ static struct led_pwm pwm_leds_data[] = {
 		.dutycycle_steps = 16,
 		.period_steps = 4,
 	},
+/*
 	[1] = {
 		.name = "sec-lcd-backlight",
 		.pwm_id = 2,
@@ -733,10 +813,18 @@ static struct led_pwm pwm_leds_data[] = {
 		.lth_brightness = 90,
 		.pwm_period_ns = 1023,
 	},
+*/
+	[1] = {
+		.name = "button-backlight",
+		.pwm_id = 2,
+		.max_brightness = 255,
+		.lth_brightness = 2,
+		.pwm_period_ns = 1023,
+		},
 };
 
 static struct led_pwm_platform_data u8500_leds_data = {
-	.num_leds = 1,
+	.num_leds = 2,
 	.leds = pwm_leds_data,
 };
 
@@ -799,14 +887,12 @@ static struct hsi_board_info __initdata u8500_hsi_devices[] = {
 			.mode = HSI_MODE_FRAME,
 			.channels = 1,
 			.speed = 200000,
-			.ch_prio = {},
 			{.arb_mode = HSI_ARB_RR},
 		},
 		.rx_cfg = {
 			.mode = HSI_MODE_FRAME,
 			.channels = 1,
 			.speed = 200000,
-			.ch_prio = {},
 			{.flow = HSI_FLOW_SYNC},
 		},
 	},
@@ -818,14 +904,12 @@ static struct hsi_board_info __initdata u8500_hsi_devices[] = {
 			.mode = HSI_MODE_FRAME,
 			.channels = 2,
 			.speed = 100000,
-			.ch_prio = {},
 			{.arb_mode = HSI_ARB_RR},
 		},
 		.rx_cfg = {
 			.mode = HSI_MODE_FRAME,
 			.channels = 2,
 			.speed = 200000,
-			.ch_prio = {},
 			{.flow = HSI_FLOW_SYNC},
 		},
 	},
@@ -837,14 +921,12 @@ static struct hsi_board_info __initdata u8500_hsi_devices[] = {
 			.mode = HSI_MODE_STREAM,
 			.channels = 2,
 			.speed = 20000,
-			.ch_prio = {},
 			{.arb_mode = HSI_ARB_RR},
 		},
 		.rx_cfg = {
 			.mode = HSI_MODE_STREAM,
 			.channels = 2,
 			.speed = 200000,
-			.ch_prio = {},
 			{.flow = HSI_FLOW_SYNC},
 		},
 	},
@@ -864,6 +946,7 @@ struct platform_device u8500_sim_detect_device = {
 };
 #endif
 
+#ifdef CONFIG_CRYPTO_DEV_UX500
 static struct cryp_platform_data u8500_cryp1_platform_data = {
 	.mem_to_engine = {
 		.dir = STEDMA40_MEM_TO_PERIPH,
@@ -902,6 +985,7 @@ static struct hash_platform_data u8500_hash1_platform_data = {
 	.mem_to_engine = &u8500_hash_dma_cfg_tx,
 	.dma_filter = stedma40_filter,
 };
+#endif
 
 /* add any platform devices here - TODO */
 static struct platform_device *mop500_platform_devs[] __initdata = {
@@ -913,12 +997,18 @@ static struct platform_device *mop500_platform_devs[] __initdata = {
 	&ux500_mmio_device,
 #endif
 	&ux500_hwmem_device,
+#ifdef CONFIG_FB_MCDE
 	&ux500_mcde_device,
+#endif
+#ifdef CONFIG_MCDE_DISPLAY_DSI
 	&u8500_dsilink_device[0],
 	&u8500_dsilink_device[1],
 	&u8500_dsilink_device[2],
+#endif
+#ifdef CONFIG_FB_B2R2
 	&ux500_b2r2_device,
 	&ux500_b2r2_blt_device,
+#endif
 #ifdef CONFIG_LEDS_PWM
 	&ux500_leds_device,
 #endif
@@ -928,9 +1018,6 @@ static struct platform_device *mop500_platform_devs[] __initdata = {
 #endif
 #ifdef CONFIG_DB8500_MLOADER
 	&mloader_fw_device,
-#endif
-#ifdef CONFIG_HSI
-	&u8500_hsi_device,
 #endif
 	&db8500_mali_gpu_device,
 };
@@ -975,9 +1062,9 @@ static struct pl022_ssp_controller ssp0_platform_data = {
 	.num_chipselect = NUM_SSP_CLIENTS,
 };
 
-static void __init mop500_spi_init(void)
+static void __init mop500_spi_init(struct device *parent)
 {
-	db8500_add_ssp0(&ssp0_platform_data);
+	db8500_add_ssp0(parent, &ssp0_platform_data);
 }
 
 #ifdef CONFIG_STE_DMA40_REMOVE
@@ -1036,6 +1123,7 @@ static struct stedma40_chan_cfg uart2_dma_cfg_tx = {
 };
 #endif
 
+
 static pin_cfg_t mop500_pins_uart0[] = {
 	GPIO0_U0_CTSn   | PIN_INPUT_PULLUP,
 	GPIO1_U0_RTSn   | PIN_OUTPUT_HIGH,
@@ -1063,24 +1151,6 @@ static void ux500_uart0_exit(void)
 		pr_err("pl011: uart pins_disable failed\n");
 }
 
-static void u8500_uart0_reset(void)
-{
-	/* UART0 lies in PER1 */
-	return u8500_reset_ip(1, PRCC_K_SOFTRST_UART0_MASK);
-}
-
-static void u8500_uart1_reset(void)
-{
-	/* UART1 lies in PER1 */
-	return u8500_reset_ip(1, PRCC_K_SOFTRST_UART1_MASK);
-}
-
-static void u8500_uart2_reset(void)
-{
-	/* UART2 lies in PER3 */
-	return u8500_reset_ip(3, PRCC_K_SOFTRST_UART2_MASK);
-}
-
 static struct amba_pl011_data uart0_plat = {
 #ifdef CONFIG_STE_DMA40_REMOVE
 	.dma_filter = stedma40_filter,
@@ -1089,7 +1159,6 @@ static struct amba_pl011_data uart0_plat = {
 #endif
 	.init = ux500_uart0_init,
 	.exit = ux500_uart0_exit,
-	.reset = u8500_uart0_reset,
 };
 
 static struct amba_pl011_data uart1_plat = {
@@ -1098,7 +1167,6 @@ static struct amba_pl011_data uart1_plat = {
 	.dma_rx_param = &uart1_dma_cfg_rx,
 	.dma_tx_param = &uart1_dma_cfg_tx,
 #endif
-	.reset = u8500_uart1_reset,
 };
 
 static struct amba_pl011_data uart2_plat = {
@@ -1107,20 +1175,31 @@ static struct amba_pl011_data uart2_plat = {
 	.dma_rx_param = &uart2_dma_cfg_rx,
 	.dma_tx_param = &uart2_dma_cfg_tx,
 #endif
-	.reset = u8500_uart2_reset,
 };
 
-static void __init mop500_uart_init(void)
+static void __init mop500_uart_init(struct device *parent)
 {
-	db8500_add_uart0(&uart0_plat);
-	db8500_add_uart1(&uart1_plat);
-	db8500_add_uart2(&uart2_plat);
+	db8500_add_uart0(parent, &uart0_plat);
+	db8500_add_uart1(parent, &uart1_plat);
+	db8500_add_uart2(parent, &uart2_plat);
 }
 
-static void __init u8500_cryp1_hash1_init(void)
+static void __init u8500_cryp1_hash1_init(struct device *parent)
 {
-	db8500_add_cryp1(&u8500_cryp1_platform_data);
-	db8500_add_hash1(&u8500_hash1_platform_data);
+#ifdef CONFIG_CRYPTO_DEV_UX500
+	db8500_add_cryp1(parent, &u8500_cryp1_platform_data);
+	db8500_add_hash1(parent, &u8500_hash1_platform_data);
+#endif
+}
+
+static struct tee_platform_data u8500_tee_platform_data = {
+	.api_version = TEE_VERSION_017,
+	.bridge_func_addr = (u32)IO_ADDRESS(U8500_BOOT_ROM_BASE + 0x17300)
+};
+
+static void __init u8500_tee_init(void)
+{
+	db8500_add_tee(&u8500_tee_platform_data);
 }
 
 static struct platform_device *snowball_platform_devs[] __initdata = {
@@ -1128,12 +1207,16 @@ static struct platform_device *snowball_platform_devs[] __initdata = {
 	&snowball_led_dev,
 	&snowball_key_dev,
 	&snowball_sbnet_dev,
+#ifdef CONFIG_FB_MCDE
 	&ux500_mcde_device,
+#endif
 	&u8500_dsilink_device[0],
 	&u8500_dsilink_device[1],
 	&u8500_dsilink_device[2],
+#ifdef CONFIG_FB_B2R2
 	&ux500_b2r2_device,
 	&ux500_b2r2_blt_device,
+#endif
 };
 
 /*
@@ -1143,7 +1226,8 @@ static struct platform_device *snowball_platform_devs[] __initdata = {
 static void accessory_detect_config(void)
 {
 #ifdef CONFIG_INPUT_AB8500_ACCDET
-	if (machine_is_hrefv60() || machine_is_u8520() || machine_is_u9540())
+	if (machine_is_hrefv60() || machine_is_u8520() || machine_is_u9540()
+			|| machine_is_a9500())
 		ab8500_accdet_pdata.is_detection_inverted = true;
 	else
 		ab8500_accdet_pdata.is_detection_inverted = false;
@@ -1160,19 +1244,40 @@ static void fixup_ab8505_gpio(void)
 	ab8500_gpio_pdata = ab8505_gpio_pdata;
 }
 
+static void __init mop500_init_irq(void)
+{
+	prcmu_early_init(&db8500_tcdm_map, false);
+	ux500_init_irq();
+}
+
+extern void __init mop500_rmi4_touch_init(void);
+
 static void __init mop500_init_machine(void)
 {
+	struct device *parent = NULL;
 	int i2c0_devs;
+	int i;
 
 	accessory_detect_config();
 
+	u8500_tee_init();
 	u8500_init_devices();
 
-	mop500_pins_init();
+	mop500_pinmaps_init();
+	dbx500_add_pinctrl(parent, "pinctrl-db8500");
+
+	if (!cpu_is_u8500v20()) {
+		struct db8500_prcmu_pdata *db8500_prcmu_pdata =
+			(struct db8500_prcmu_pdata *) db8500_prcmu_device.dev.platform_data;
+		db8500_prcmu_pdata->enable_set_ddr_opp = true;
+	}
+
+	platform_device_register(&db8500_prcmu_device);
+	platform_device_register(&u8500_usecase_gov_device);
 
 	mop500_regulator_init();
 
-	u8500_cryp1_hash1_init();
+	u8500_cryp1_hash1_init(parent);
 
 #ifdef CONFIG_HSI
 	hsi_register_board_info(u8500_hsi_devices,
@@ -1183,14 +1288,20 @@ static void __init mop500_init_machine(void)
 		u8500_leds_data.num_leds = 2;
 #endif
 	if (machine_is_snowball()) {
+		for (i = 0; i < ARRAY_SIZE(mop500_platform_devs); i++)
+			mop500_platform_devs[i]->dev.parent = parent;
+
 		platform_add_devices(snowball_platform_devs,
 					ARRAY_SIZE(snowball_platform_devs));
 	} else {
+		for (i = 0; i < ARRAY_SIZE(snowball_platform_devs); i++)
+			snowball_platform_devs[i]->dev.parent = parent;
+
 		platform_add_devices(mop500_platform_devs,
 					ARRAY_SIZE(mop500_platform_devs));
 	}
 
-	if (!cpu_is_u9500()) {
+	if (!machine_is_a9500()) {
 		platform_device_register(&u8500_shrm_device);
 #ifdef CONFIG_STE_TRACE_MODEM
 		platform_device_register(&u8500_trace_modem);
@@ -1200,12 +1311,14 @@ static void __init mop500_init_machine(void)
 #endif
 	}
 
-	mop500_i2c_init();
-	mop500_msp_init();
-	mop500_spi_init();
-	mop500_uart_init();
+	mop500_i2c_init(parent);
+	mop500_sdi_init(parent);
+	mop500_msp_init(parent);
+	mop500_spi_init(parent);
+	mop500_uart_init(parent);
+#if defined(CONFIG_CW1200) || defined(CONFIG_CW1200_MODULE)
 	mop500_wlan_init();
-        mop500_sdi_init();
+#endif
 
 #ifdef CONFIG_KEYBOARD_NOMADIK_SKE
 	/*
@@ -1214,7 +1327,8 @@ static void __init mop500_init_machine(void)
 	 */
 	if (!(prcmu_read(PRCM_DEBUG_NOPWRDOWN_VAL) &
 	      ARM_DEBUG_NOPOWER_DOWN_REQ))
-		db8500_add_ske_keypad(&mop500_ske_keypad_data);
+		db8500_add_ske_keypad(NULL, &mop500_ske_keypad_data,
+				sizeof(mop500_ske_keypad_data));
 #endif
 
 #ifdef CONFIG_ANDROID_STE_TIMED_VIBRA
@@ -1232,19 +1346,25 @@ static void __init mop500_init_machine(void)
 	i2c_register_board_info(0, mop500_i2c0_devices, i2c0_devs);
 	i2c_register_board_info(2, mop500_i2c2_devices,
 				ARRAY_SIZE(mop500_i2c2_devices));
-
+	i2c_register_board_info(3, mop500_i2c3_devices,
+				ARRAY_SIZE(mop500_i2c3_devices));
+#ifdef CONFIG_RMI4_I2C
+	mop500_rmi4_touch_init();
+#endif
 	/* This board has full regulator constraints */
 	regulator_has_full_constraints();
 }
 
 MACHINE_START(U8500, "ST-Ericsson MOP500 platform")
 	/* Maintainer: Srinidhi Kasagar <srinidhi.kasagar@stericsson.com> */
-	.boot_params	= 0x100,
+	.atag_offset	= 0x100,
 	.map_io		= u8500_map_io,
-	.init_irq	= ux500_init_irq,
+	.init_irq	= mop500_init_irq,
 	/* we re-use nomadik timer here */
 	.timer		= &ux500_timer,
+	.handle_irq	= gic_handle_irq,
 	.init_machine	= mop500_init_machine,
+	.restart	= ux500_restart,
 MACHINE_END
 
 /*
@@ -1252,34 +1372,73 @@ MACHINE_END
  * done for 8520.
  */
 MACHINE_START(U8520, "ST-Ericsson U8500 Platform HREFv60+")
-	.boot_params	= 0x100,
+	.atag_offset	= 0x100,
 	.map_io		= u8500_map_io,
-	.init_irq	= ux500_init_irq,
+	.init_irq	= mop500_init_irq,
 	.timer		= &ux500_timer,
+	.handle_irq	= gic_handle_irq,
 	.init_machine	= mop500_init_machine,
+	.restart	= ux500_restart,
 MACHINE_END
 
 MACHINE_START(HREFV60, "ST-Ericsson U8500 Platform HREFv60+")
-	.boot_params	= 0x100,
+	.atag_offset	= 0x100,
 	.map_io		= u8500_map_io,
-	.init_irq	= ux500_init_irq,
+	.init_irq	= mop500_init_irq,
 	.timer		= &ux500_timer,
+	.handle_irq	= gic_handle_irq,
 	.init_machine	= mop500_init_machine,
+	.restart	= ux500_restart,
+MACHINE_END
+
+MACHINE_START(A9500, "ST-Ericsson A9500 Platform")
+	.atag_offset	= 0x100,
+	.map_io		= u8500_map_io,
+	.init_irq	= mop500_init_irq,
+	.timer		= &ux500_timer,
+	.handle_irq	= gic_handle_irq,
+	.init_machine	= mop500_init_machine,
+	.restart	= ux500_restart,
 MACHINE_END
 
 MACHINE_START(SNOWBALL, "ST-Ericsson Snowball platform")
-	.boot_params	= 0x100,
+	.atag_offset	= 0x100,
+	.map_io		= u8500_map_io,
+	.init_irq	= mop500_init_irq,
+	/* we re-use nomadik timer here */
+	.timer		= &ux500_timer,
+	.handle_irq	= gic_handle_irq,
+	.init_machine	= mop500_init_machine,
+	.restart	= ux500_restart,
+MACHINE_END
+
+#ifdef CONFIG_MACH_UX500_DT
+static void __init u8500_init_machine(void)
+{
+	if (of_machine_is_compatible("calaosystems,snowball-a9500"))
+		return mop500_init_machine();
+	else if (of_machine_is_compatible("st-ericsson,hrefv60+"))
+		return mop500_init_machine();
+	else if (of_machine_is_compatible("st-ericsson,mop500"))
+		return mop500_init_machine();
+}
+
+static const char * u8500_dt_board_compat[] = {
+	"calaosystems,snowball-a9500",
+	"st-ericsson,hrefv60+",
+	"st-ericsson,u8500",
+	"st-ericsson,mop500",
+	NULL,
+};
+
+
+DT_MACHINE_START(U8500_DT, "ST-Ericsson U8500 platform (Device Tree Support)")
 	.map_io		= u8500_map_io,
 	.init_irq	= ux500_init_irq,
 	/* we re-use nomadik timer here */
 	.timer		= &ux500_timer,
-	.init_machine	= mop500_init_machine,
+	.handle_irq	= gic_handle_irq,
+	.init_machine	= u8500_init_machine,
+	.dt_compat      = u8500_dt_board_compat,
 MACHINE_END
-
-MACHINE_START(U9540, "ST-Ericsson 9540 platform")
-	.boot_params	= 0x100,
-	.map_io		= u8500_map_io,
-	.init_irq	= ux500_init_irq,
-	.timer		= &ux500_timer,
-	.init_machine	= mop500_init_machine,
-MACHINE_END
+#endif

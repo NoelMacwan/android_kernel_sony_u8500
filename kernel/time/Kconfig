@@ -1,6 +1,10 @@
 #
 # Timer subsystem related configuration options
 #
+
+# Core internal switch. Selected by NO_HZ / HIGH_RES_TIMERS. This is
+# only related to the tick functionality. Oneshot clockevent devices
+# are supported independ of this.
 config TICK_ONESHOT
 	bool
 
@@ -25,5 +29,17 @@ config HIGH_RES_TIMERS
 config GENERIC_CLOCKEVENTS_BUILD
 	bool
 	default y
-	depends on GENERIC_CLOCKEVENTS || GENERIC_CLOCKEVENTS_MIGR
+	depends on GENERIC_CLOCKEVENTS
 
+config GENERIC_CLOCKEVENTS_MIN_ADJUST
+	bool
+
+config ALARMTIMER_DEV_NAME
+	string "Alarmtime RTC wakeup"
+	depends on RTC_CLASS
+	help
+	  The RTC you specify here will be used by the alarmtimer framework
+	  to wakeup from suspend. If only one RTC exist leave
+	  it blank. This config is used to choose if several RTC exists.
+
+	  If unsure, leave it blank. The first registerd RTC will then be used.

@@ -11,15 +11,14 @@
 #include <linux/amba/mmci.h>
 #include <linux/mmc/host.h>
 #include <linux/platform_device.h>
-#include <linux/delay.h>
 
 #include <asm/mach-types.h>
 #include <plat/ste_dma40.h>
 #include <mach/devices.h>
 #include <mach/hardware.h>
 #include <mach/ste-dma40-db8500.h>
-#include <mach/cw1200_plat.h>
 
+#include "board-common-sdi.h"
 #include "devices-db8500.h"
 #include "board-mop500.h"
 
@@ -28,77 +27,13 @@
  */
 
 /* GPIO pins used by the sdi0 level shifter */
-static int sdi0_en = -1;
-static int sdi0_vsel = -1;
-
-static int mop500_sdi0_ios_handler(struct device *dev, struct mmc_ios *ios,
-				   enum rpm_status pm)
-{
-	static unsigned char power_mode = MMC_POWER_ON;
-	static unsigned char signal_voltage = MMC_SIGNAL_VOLTAGE_330;
-
-	if (signal_voltage == ios->signal_voltage)
-		goto do_power;
-
-	/*
-	 * We need to re-init the levelshifter when switching I/O voltage level.
-	 * Max discharge time according to ST6G3244ME spec is 1 ms.
-	 */
-	if (power_mode == MMC_POWER_ON) {
-		power_mode = MMC_POWER_OFF;
-		gpio_direction_output(sdi0_en, 0);
-		usleep_range(1000, 2000);
-	}
-
-	switch (ios->signal_voltage) {
-	case MMC_SIGNAL_VOLTAGE_330:
-		gpio_direction_output(sdi0_vsel, 0);
-		break;
-	case MMC_SIGNAL_VOLTAGE_180:
-		gpio_direction_output(sdi0_vsel, 1);
-		break;
-	default:
-		pr_warning("Non supported signal voltage for levelshifter.\n");
-		break;
-	}
-
-	signal_voltage = ios->signal_voltage;
-
-do_power:
-	if (power_mode == ios->power_mode)
-		goto do_pm;
-
-	switch (ios->power_mode) {
-	case MMC_POWER_UP:
-		break;
-	case MMC_POWER_ON:
-		gpio_direction_output(sdi0_en, 1);
-		/* Max settling time according to ST6G3244ME spec is 100 us. */
-		udelay(100);
-		break;
-	case MMC_POWER_OFF:
-		gpio_direction_output(sdi0_en, 0);
-		break;
-	}
-
-	power_mode = ios->power_mode;
-
-do_pm:
-	if ((pm == RPM_SUSPENDING) && (power_mode == MMC_POWER_ON)) {
-		/* Disable levelshifter to save power */
-		gpio_direction_output(sdi0_en, 0);
-	} else if ((pm == RPM_RESUMING) && (power_mode == MMC_POWER_ON)) {
-		/* Re-enable levelshifter. */
-		gpio_direction_output(sdi0_en, 1);
-		/* Max settling time according to ST6G3244ME spec is 100 us. */
-		udelay(100);
-	}
-
-	return 0;
-}
+static struct sdi_ios_pins sdi0_ios_pins = {
+	.enable = -1,
+	.vsel = -1,
+};
 
 #ifdef CONFIG_STE_DMA40
-struct stedma40_chan_cfg mop500_sdi0_dma_cfg_rx = {
+static struct stedma40_chan_cfg mop500_sdi0_dma_cfg_rx = {
 	.mode = STEDMA40_MODE_LOGICAL,
 	.dir = STEDMA40_PERIPH_TO_MEM,
 	.src_dev_type = DB8500_DMA_DEV1_SD_MMC0_RX,
@@ -122,13 +57,13 @@ static struct stedma40_chan_cfg mop500_sdi0_dma_cfg_tx = {
 #endif
 
 static struct mmci_platform_data mop500_sdi0_data = {
-	.ios_handler	= mop500_sdi0_ios_handler,
-	.f_max		= 50000000,
+	.f_max		= 100000000,
 	.capabilities	= MMC_CAP_4_BIT_DATA |
 				MMC_CAP_SD_HIGHSPEED |
 				MMC_CAP_MMC_HIGHSPEED |
 				MMC_CAP_UHS_SDR12 |
-				MMC_CAP_UHS_SDR25,
+				MMC_CAP_UHS_SDR25 |
+				MMC_CAP_UHS_DDR50,
 	.capabilities2	= MMC_CAP2_DETECT_ON_ERR,
 	.gpio_wp	= -1,
 	.levelshifter	= true,
@@ -144,57 +79,8 @@ static struct mmci_platform_data mop500_sdi0_data = {
 };
 
 /*
- * SDI 1 (SDIO WLAN)
+ * SDI1 (SDIO WLAN)
  */
-
-static const struct cw1200_platform_data *pdata;
-static const struct resource *reset;
-
-static void sdi1_configure(void)
-{
-	pdata = cw1200_get_platform_data();
-	reset = pdata->reset;
-	gpio_request(reset->start, reset->name);
-	gpio_direction_output(reset->start, 0);
-}
-
-static int mop500_sdi1_ios_handler(struct device *dev, struct mmc_ios *ios,
-				   enum rpm_status pm)
-{
-	static int power_mode = -1;
-
-	if (power_mode == ios->power_mode)
-		return 0;
-
-	switch (ios->power_mode) {
-	case MMC_POWER_UP:
-		break;
-	case MMC_POWER_ON:
-		msleep(100);
-		gpio_direction_output(reset->start, 1);
-		/* It is not stated in the datasheet, but at least some devices
-		 * have problems with reset if this stage is omited. */
-		msleep(50);
-		gpio_direction_output(reset->start, 0);
-                /* A valid reset shall be obtained by maintaining WRESETN
-		 * active (low) for at least two cycles of LP_CLK after VDDIO
-		 * is stable within it operating range. */
-		usleep_range(1000, 20000);
-		gpio_set_value(reset->start, 1);
-		/* The host should wait 32 ms after the WRESETN release
-		 * for the on-chip LDO to stabilize */
-		msleep(32);
-		break;
-	case MMC_POWER_OFF:
-		gpio_set_value(reset->start, 0);
-		break;
-	default:
-		dev_warn(dev, "Unknown power_mode: %d\n", ios->power_mode);
-	}
-	power_mode = ios->power_mode;
-	return 0;
-}
-
 #ifdef CONFIG_STE_DMA40
 static struct stedma40_chan_cfg sdi1_dma_cfg_rx = {
 	.mode = STEDMA40_MODE_LOGICAL,
@@ -216,11 +102,9 @@ static struct stedma40_chan_cfg sdi1_dma_cfg_tx = {
 #endif
 
 static struct mmci_platform_data mop500_sdi1_data = {
-	.ios_handler    = mop500_sdi1_ios_handler,
 	.ocr_mask	= MMC_VDD_29_30,
 	.f_max		= 50000000,
-	.capabilities	= MMC_CAP_4_BIT_DATA |
-				MMC_CAP_NONREMOVABLE,
+	.capabilities	= MMC_CAP_4_BIT_DATA,
 	.gpio_cd	= -1,
 	.gpio_wp	= -1,
 #ifdef CONFIG_STE_DMA40
@@ -230,40 +114,27 @@ static struct mmci_platform_data mop500_sdi1_data = {
 #endif
 };
 
-static void sdi0_sdi1_configure(void)
+static void sdi0_sdi1_configure(struct device *parent)
 {
 	int ret;
 	/* v2 has a new version of this block that need to be forced */
 	u32 periphid = 0x10480180;
 
-	ret = gpio_request(sdi0_en, "level shifter enable");
-	if (!ret)
-		ret = gpio_request(sdi0_vsel,
-				   "level shifter 1v8-3v select");
+	ret = ux500_common_sdi0_ios_handler_init(&mop500_sdi0_data,
+			&sdi0_ios_pins);
+	if (ret)
+		pr_err("%s: SDI0 ios hanfler init failed (%d)", __func__, ret);
 
-	if (ret) {
-		pr_warning("unable to config sdi0 gpios for level shifter.\n");
-		return;
-	}
-
-	/* Select the default 2.9V and enable level shifter */
-	gpio_direction_output(sdi0_vsel, 0);
-	gpio_direction_output(sdi0_en, 1);
-
-
-	db8500_add_sdi0(&mop500_sdi0_data, periphid);
-
-	sdi1_configure();
-
-	db8500_add_sdi1(&mop500_sdi1_data, periphid);
+	db8500_add_sdi0(parent, &mop500_sdi0_data, periphid);
+	db8500_add_sdi1(parent, &mop500_sdi1_data, periphid);
 }
 
-void mop500_sdi_tc35892_init(void)
+void mop500_sdi_tc35892_init(struct device *parent)
 {
 	mop500_sdi0_data.gpio_cd = GPIO_SDMMC_CD;
-	sdi0_en = GPIO_SDMMC_EN;
-	sdi0_vsel = GPIO_SDMMC_1V8_3V_SEL;
-	sdi0_sdi1_configure();
+	sdi0_ios_pins.enable = GPIO_SDMMC_EN;
+	sdi0_ios_pins.vsel = GPIO_SDMMC_1V8_3V_SEL;
+	sdi0_sdi1_configure(parent);
 }
 
 /*
@@ -291,11 +162,13 @@ static struct stedma40_chan_cfg mop500_sdi2_dma_cfg_tx = {
 
 static struct mmci_platform_data mop500_sdi2_data = {
 	.ocr_mask	= MMC_VDD_165_195,
-	.f_max		= 50000000,
+	.f_max		= 100000000,
 	.capabilities	= MMC_CAP_4_BIT_DATA |
-			  MMC_CAP_8_BIT_DATA |
-			  MMC_CAP_MMC_HIGHSPEED |
-			  MMC_CAP_ERASE,
+				MMC_CAP_8_BIT_DATA |
+				MMC_CAP_MMC_HIGHSPEED |
+				MMC_CAP_ERASE |
+				MMC_CAP_1_8V_DDR |
+				MMC_CAP_UHS_DDR50,
 	.capabilities2	= MMC_CAP2_NO_SLEEP_CMD,
 	.gpio_cd	= -1,
 	.gpio_wp	= -1,
@@ -334,7 +207,10 @@ static struct mmci_platform_data mop500_sdi4_data = {
 	.f_max		= 50000000,
 	.capabilities	= MMC_CAP_4_BIT_DATA |
 				MMC_CAP_8_BIT_DATA |
-				MMC_CAP_MMC_HIGHSPEED,
+				MMC_CAP_MMC_HIGHSPEED |
+				MMC_CAP_1_8V_DDR |
+				MMC_CAP_UHS_DDR50,
+
 	.gpio_cd	= -1,
 	.gpio_wp	= -1,
 #ifdef CONFIG_STE_DMA40
@@ -344,35 +220,35 @@ static struct mmci_platform_data mop500_sdi4_data = {
 #endif
 };
 
-void __init mop500_sdi_init(void)
+void __init mop500_sdi_init(struct device *parent)
 {
 	/* v2 has a new version of this block that need to be forced */
 	u32 periphid = 0x10480180;
 
 	/* sdi2 on snowball is in ATL_B mode for FSMC (LAN) */
 	if (!machine_is_snowball())
-		db8500_add_sdi2(&mop500_sdi2_data, periphid);
+		db8500_add_sdi2(parent, &mop500_sdi2_data, periphid);
 
 	/* On-board eMMC */
-	db8500_add_sdi4(&mop500_sdi4_data, periphid);
+	db8500_add_sdi4(parent, &mop500_sdi4_data, periphid);
 
 	if (machine_is_hrefv60() || machine_is_u8520() ||
-	    machine_is_snowball() || machine_is_u9540()) {
-		if (machine_is_hrefv60() || machine_is_u9540()) {
+	    machine_is_snowball() || machine_is_a9500()) {
+		if (machine_is_hrefv60() || machine_is_a9500()) {
 			mop500_sdi0_data.gpio_cd = HREFV60_SDMMC_CD_GPIO;
-			sdi0_en = HREFV60_SDMMC_EN_GPIO;
-			sdi0_vsel = HREFV60_SDMMC_1V8_3V_GPIO;
+			sdi0_ios_pins.enable = HREFV60_SDMMC_EN_GPIO;
+			sdi0_ios_pins.vsel = HREFV60_SDMMC_1V8_3V_GPIO;
 		} else if (machine_is_u8520()) {
 			mop500_sdi0_data.gpio_cd = U8520_SDMMC_CD_GPIO;
-			sdi0_en = U8520_SDMMC_EN_GPIO;
-			sdi0_vsel = U8520_SDMMC_1V8_3V_GPIO;
+			sdi0_ios_pins.enable = U8520_SDMMC_EN_GPIO;
+			sdi0_ios_pins.vsel = U8520_SDMMC_1V8_3V_GPIO;
 		} else if (machine_is_snowball()) {
 			mop500_sdi0_data.gpio_cd = SNOWBALL_SDMMC_CD_GPIO;
 			mop500_sdi0_data.cd_invert = true;
-			sdi0_en = SNOWBALL_SDMMC_EN_GPIO;
-			sdi0_vsel = SNOWBALL_SDMMC_1V8_3V_GPIO;
+			sdi0_ios_pins.enable = SNOWBALL_SDMMC_EN_GPIO;
+			sdi0_ios_pins.vsel = SNOWBALL_SDMMC_1V8_3V_GPIO;
 		}
-		sdi0_sdi1_configure();
+		sdi0_sdi1_configure(parent);
 	}
 
 	/*

@@ -8,27 +8,37 @@
 #include <linux/kernel.h>
 #include <linux/platform_device.h>
 #include <linux/interrupt.h>
+#include <linux/cpufreq.h>
 #include <linux/io.h>
 #include <linux/gpio.h>
 #include <linux/amba/bus.h>
 #include <linux/amba/pl022.h>
+#include <linux/platform_data/ap9540_c2c_plat.h>
+
 #include <plat/pincfg.h>
 #include <plat/gpio-nomadik.h>
-
 #include <plat/ste_dma40.h>
 
 #include <mach/devices.h>
 #include <mach/hardware.h>
 #include <mach/setup.h>
 #include <mach/pm.h>
+#include <mach/usecase_gov.h>
+#ifdef CONFIG_FB_MCDE
 #include <video/mcde.h>
+#endif
 #include <video/nova_dsilink.h>
 #include <linux/mfd/dbx500-prcmu.h>
+#ifdef CONFIG_HSI
 #include <mach/hsi.h>
+#endif
 #include <mach/ste-dma40-db8500.h>
+#ifdef CONFIG_FB_B2R2
 #include <video/b2r2_blt.h>
+#endif
 
 #include "pins-db8500.h"
+#include "pm/cpuidle.h"
 
 #define GPIO_DATA(_name, first, num)					\
 	{								\
@@ -198,6 +208,8 @@ struct platform_device u8500_dsilink_device[] = {
 	},
 };
 
+
+#ifdef CONFIG_FB_MCDE
 static struct resource mcde_resources[] = {
 	[0] = {
 		.name  = MCDE_IO_AREA,
@@ -294,6 +306,56 @@ struct platform_device ux500_mcde_device = {
 	.resource = mcde_resources,
 };
 
+static struct mcde_platform_data db8540_mcde_pdata = {
+	/*
+	 * [0] = 3: 24 bits DPI: connect LSB Ch B to D[0:7]
+	 * [3] = 4: 24 bits DPI: connect MID Ch B to D[24:31]
+	 * [4] = 5: 24 bits DPI: connect MSB Ch B to D[32:39]
+	 *
+	 * [1] = 3: TV out     : connect LSB Ch B to D[8:15]
+	 */
+#define DONT_CARE 0
+	.outmux = { 3, 3, DONT_CARE, 4, 5 },
+#undef DONT_CARE
+	.syncmux = 0x00,  /* DPI channel A and B on output pins A and B resp */
+#ifdef CONFIG_MCDE_DISPLAY_DSI
+	.regulator_vana_id = "vdddsi1v2",
+#endif
+	.regulator_mcde_epod_id = "vsupply",
+	.regulator_esram_epod_id = "v-esram34",
+#ifdef CONFIG_MCDE_DISPLAY_DSI
+	.clock_dsi_id = "hdmi",
+	.clock_dsi_lp_id = "tv",
+#endif
+	.clock_dpi_id = "lcd",
+	.clock_mcde_id = "mcde",
+	.platform_set_clocks = mcde_platform_set_display_clocks,
+	.platform_enable_dsipll = mcde_platform_enable_dsipll,
+	.platform_disable_dsipll = mcde_platform_disable_dsipll,
+	/* TODO: Remove rotation buffers once ESRAM driver is completed */
+	.rotbuf1 = U8540_ESRAM_BANK5,
+	.rotbuf2 = U8540_ESRAM_BANK5 + SZ_64K,
+	.rotbufsize = SZ_64K,
+	.pixelfetchwtrmrk = {MCDE_PIXFETCH_WTRMRKLVL_OVL0,
+				MCDE_PIXFETCH_WTRMRKLVL_OVL1,
+				MCDE_PIXFETCH_WTRMRKLVL_OVL2,
+				MCDE_PIXFETCH_WTRMRKLVL_OVL3,
+				MCDE_PIXFETCH_WTRMRKLVL_OVL4,
+				MCDE_PIXFETCH_WTRMRKLVL_OVL5},
+};
+
+struct platform_device db8540_mcde_device = {
+	.name = "mcde",
+	.id = -1,
+	.dev = {
+		.platform_data = &db8540_mcde_pdata,
+	},
+	.num_resources = ARRAY_SIZE(mcde_resources),
+	.resource = mcde_resources,
+};
+#endif /*  CONFIG_FB_MCDE */
+
+#ifdef CONFIG_FB_B2R2
 struct platform_device ux500_b2r2_blt_device = {
 	.name	= "b2r2_blt",
 	.id	= 0,
@@ -335,22 +397,196 @@ struct platform_device ux500_b2r2_device = {
 	.resource	= b2r2_resources,
 };
 
+static struct resource b2r2_1_resources[] = {
+	[0] = {
+		.start	= U9540_B2R2_1_BASE,
+		.end	= U9540_B2R2_1_BASE + SZ_4K - 1,
+		.name	= "b2r2_1_base",
+		.flags	= IORESOURCE_MEM,
+	},
+	[1] = {
+		.name  = "B2R2_IRQ",
+		.start = IRQ_DB8500_B2R2,
+		.end   = IRQ_DB8500_B2R2,
+		.flags = IORESOURCE_IRQ,
+	},
+};
 
+struct platform_device ux500_b2r2_1_device = {
+	.name	= "b2r2",
+	.id	= 1,
+	.dev	= {
+		.init_name = "b2r2_1_core",
+		.platform_data = &b2r2_platform_data,
+		.coherent_dma_mask = ~0,
+	},
+	.num_resources	= ARRAY_SIZE(b2r2_1_resources),
+	.resource	= b2r2_1_resources,
+};
+#endif /* CONFIG_FB_B2R2 */
+
+/*
+ * cpuidle
+ *
+ * All measurements are with two cpus online (worst case) and at
+ * 200 MHz (worst case)
+ *
+ * Enter latency depends on cpu frequency, and is only depending on
+ * code executing on the ARM.
+ * Exit latency is both depending on "wake latency" which is the
+ * time between the PRCMU has gotten the interrupt and the ARM starts
+ * to execute and the time before everything is done on the ARM.
+ * The wake latency is more or less constant related to cpu frequency,
+ * but can differ depending on what the modem does.
+ * Wake latency is not included for plain WFI.
+ * For states that uses RTC (Sleep & DeepSleep), wake latency is reduced
+ * from clock programming timeout.
+ *
+ */
+#define DEEP_SLEEP_WAKE_UP_LATENCY 8500
+/* Wake latency from ApSleep is measured to be around 1.0 to 1.5 ms */
+#define MIN_SLEEP_WAKE_UP_LATENCY 1000
+#define MAX_SLEEP_WAKE_UP_LATENCY 1500
+
+#define UL_PLL_START_UP_LATENCY 8000 /* us */
+
+static struct cstate cpuidle_cstates[] = {
+	{
+		.enter_latency = 0,
+		.exit_latency = 0,
+		.threshold = 0,
+		.power_usage = 1000,
+		.APE = APE_ON,
+		.ARM = ARM_ON,
+		.UL_PLL = UL_PLL_ON,
+		.ESRAM = ESRAM_RET,
+		.pwrst = PRCMU_AP_NO_CHANGE,
+		.state = CI_RUNNING,
+		.desc = "Running                ",
+	},
+	{
+		/* These figures are not really true. There is a cost for WFI */
+		.enter_latency = 0,
+		.exit_latency = 0,
+		.threshold = 0,
+		.power_usage = 10,
+		.APE = APE_ON,
+		.ARM = ARM_ON,
+		.UL_PLL = UL_PLL_ON,
+		.ESRAM = ESRAM_RET,
+		.pwrst = PRCMU_AP_NO_CHANGE,
+		.flags = CPUIDLE_FLAG_TIME_VALID,
+		.state = CI_WFI,
+		.desc = "Wait for interrupt     ",
+	},
+	{
+		.enter_latency = 170,
+		.exit_latency = 70,
+		.threshold = 260,
+		.power_usage = 4,
+		.APE = APE_ON,
+		.ARM = ARM_RET,
+		.UL_PLL = UL_PLL_ON,
+		.ESRAM = ESRAM_RET,
+		.pwrst = PRCMU_AP_IDLE,
+		.flags = CPUIDLE_FLAG_TIME_VALID,
+		.state = CI_IDLE,
+		.desc = "ApIdle                 ",
+	},
+	{
+		.enter_latency = 350,
+		.exit_latency = MAX_SLEEP_WAKE_UP_LATENCY + 200,
+		/*
+		 * Note: Sleep time must be longer than 120 us or else
+		 * there might be issues with the RTC-RTT block.
+		 */
+		.threshold = MAX_SLEEP_WAKE_UP_LATENCY + 350 + 200,
+		.power_usage = 3,
+		.APE = APE_OFF,
+		.ARM = ARM_RET,
+		.UL_PLL = UL_PLL_ON,
+		.ESRAM = ESRAM_RET,
+		.pwrst = PRCMU_AP_SLEEP,
+		.flags = CPUIDLE_FLAG_TIME_VALID,
+		.state = CI_SLEEP,
+		.desc = "ApSleep                ",
+	},
+	{
+		.enter_latency = 350,
+		.exit_latency = (MAX_SLEEP_WAKE_UP_LATENCY +
+				 UL_PLL_START_UP_LATENCY + 200),
+		.threshold = (MAX_SLEEP_WAKE_UP_LATENCY +
+			      UL_PLL_START_UP_LATENCY + 350 + 200),
+		.power_usage = 2,
+		.APE = APE_OFF,
+		.ARM = ARM_RET,
+		.UL_PLL = UL_PLL_OFF,
+		.ESRAM = ESRAM_RET,
+		.pwrst = PRCMU_AP_SLEEP,
+		.flags = CPUIDLE_FLAG_TIME_VALID,
+		.state = CI_SLEEP,
+		.desc = "ApSleep, UL PLL off    ",
+	},
+#ifdef CONFIG_DBX500_CPUIDLE_APDEEPIDLE
+	{
+		.enter_latency = 400,
+		.exit_latency = DEEP_SLEEP_WAKE_UP_LATENCY + 400,
+		.threshold = DEEP_SLEEP_WAKE_UP_LATENCY + 400 + 400,
+		.power_usage = 2,
+		.APE = APE_ON,
+		.ARM = ARM_OFF,
+		.UL_PLL = UL_PLL_ON,
+		.ESRAM = ESRAM_RET,
+		.pwrst = PRCMU_AP_DEEP_IDLE,
+		.flags = CPUIDLE_FLAG_TIME_VALID,
+		.state = CI_DEEP_IDLE,
+		.desc = "ApDeepIdle, UL PLL off ",
+	},
+#endif
+	{
+		.enter_latency = 410,
+		.exit_latency = DEEP_SLEEP_WAKE_UP_LATENCY + 420,
+		.threshold = DEEP_SLEEP_WAKE_UP_LATENCY + 410 + 420,
+		.power_usage = 1,
+		.APE = APE_OFF,
+		.ARM = ARM_OFF,
+		.UL_PLL = UL_PLL_OFF,
+		.ESRAM = ESRAM_RET,
+		.pwrst = PRCMU_AP_DEEP_SLEEP,
+		.flags = CPUIDLE_FLAG_TIME_VALID,
+		.state = CI_DEEP_SLEEP,
+		.desc = "ApDeepsleep, UL PLL off",
+	},
+};
+
+static struct dbx500_cpuidle_platform_data db8500_cpuidle_platform_data= {
+	.wakeups = PRCMU_WAKEUP(ARM) | PRCMU_WAKEUP(RTC) | PRCMU_WAKEUP(ABB),
+	.cstates = cpuidle_cstates,
+	.cstates_len = ARRAY_SIZE(cpuidle_cstates),
+	.min_sleep_wake_up_latency = MIN_SLEEP_WAKE_UP_LATENCY,
+	.ul_pll_start_up_latency = UL_PLL_START_UP_LATENCY,
+	.prcmu_interrupt = IRQ_DB8500_PRCMU1,
+};
+
+struct platform_device db8500_cpuidle_device = {
+	.name	= "dbx500-cpuidle",
+	.id	= -1,
+	.dev	= {
+		.platform_data = &db8500_cpuidle_platform_data,
+	},
+};
+
+#ifdef CONFIG_HSI
 /*
  * HSI
  */
+#define GPIO_HSI0_ACWAKE 226
+
 #define HSI0_CAWAKE { \
 	.start = IRQ_PRCMU_HSI0, \
 	.end   = IRQ_PRCMU_HSI0, \
 	.flags = IORESOURCE_IRQ, \
 	.name = "hsi0_cawake" \
-}
-
-#define HSI0_ACWAKE { \
-	.start = 226, \
-	.end   = 226, \
-	.flags = IORESOURCE_IO, \
-	.name = "hsi0_acwake" \
 }
 
 #define HSIR_OVERRUN(num) {			    \
@@ -426,7 +662,6 @@ static struct resource u8500_hsi_resources[] = {
        HSIR_OVERRUN(6),
        HSIR_OVERRUN(7),
        HSI0_CAWAKE,
-       HSI0_ACWAKE,
 };
 
 #ifdef CONFIG_STE_DMA40
@@ -456,6 +691,7 @@ static struct ste_hsi_port_cfg ste_hsi_port0_cfg = {
 struct ste_hsi_platform_data u8500_hsi_platform_data = {
 	.num_ports = 1,
 	.use_dma = 1,
+	.hsi0_acwake_gpio = GPIO_HSI0_ACWAKE,
 	.port_cfg = &ste_hsi_port0_cfg,
 };
 
@@ -468,18 +704,100 @@ struct platform_device u8500_hsi_device = {
 	.resource = u8500_hsi_resources,
 	.num_resources = ARRAY_SIZE(u8500_hsi_resources)
 };
+#endif /* CONFIG_HSI */
 
+#ifdef CONFIG_C2C
 /*
- * Thermal Sensor
+ * C2C
  */
+#define GPIO_WU_MOD 226
 
+#define C2C_RESS_GENO_IRQ(num) { \
+	.start  = IRQ_AP9540_C2C_GENO##num , \
+	.end    = IRQ_AP9540_C2C_GENO##num , \
+	.flags  = IORESOURCE_IRQ, \
+	.name   = "C2C_GENO"#num  \
+}
+
+static struct resource c2c_resources[] = {
+	{
+		.name = "C2C_REGS",
+		.start = U8500_C2C_BASE,
+		.end   = U8500_C2C_BASE + SZ_4K - 1,
+		.flags = IORESOURCE_MEM,
+	},
+	{
+		.name = "PRCMU_REGS",
+		.start = U8500_PRCMU_BASE,
+		.end   = U8500_PRCMU_BASE + SZ_8K + SZ_4K - 1,
+		.flags = IORESOURCE_MEM,
+	},
+	{
+		.name = "C2C_IRQ0",
+		.start = IRQ_AP9540_C2C_IRQ0,
+		.end   = IRQ_AP9540_C2C_IRQ0,
+		.flags = IORESOURCE_IRQ,
+	},
+	{
+		.name = "C2C_IRQ1",
+		.start = IRQ_AP9540_C2C_IRQ1,
+		.end   = IRQ_AP9540_C2C_IRQ1,
+		.flags = IORESOURCE_IRQ,
+	},
+	C2C_RESS_GENO_IRQ(0),
+	C2C_RESS_GENO_IRQ(1),
+	C2C_RESS_GENO_IRQ(2),
+	C2C_RESS_GENO_IRQ(3),
+	C2C_RESS_GENO_IRQ(4),
+	C2C_RESS_GENO_IRQ(5),
+	C2C_RESS_GENO_IRQ(6),
+	C2C_RESS_GENO_IRQ(7),
+	C2C_RESS_GENO_IRQ(8),
+	C2C_RESS_GENO_IRQ(9),
+	C2C_RESS_GENO_IRQ(10),
+	C2C_RESS_GENO_IRQ(11),
+	C2C_RESS_GENO_IRQ(12),
+	C2C_RESS_GENO_IRQ(13),
+	C2C_RESS_GENO_IRQ(14),
+	C2C_RESS_GENO_IRQ(15),
+	C2C_RESS_GENO_IRQ(16),
+	C2C_RESS_GENO_IRQ(17),
+	C2C_RESS_GENO_IRQ(18),
+	C2C_RESS_GENO_IRQ(19),
+	C2C_RESS_GENO_IRQ(20),
+	C2C_RESS_GENO_IRQ(21),
+	C2C_RESS_GENO_IRQ(22),
+	C2C_RESS_GENO_IRQ(23),
+	C2C_RESS_GENO_IRQ(24),
+	C2C_RESS_GENO_IRQ(25),
+	C2C_RESS_GENO_IRQ(26),
+	C2C_RESS_GENO_IRQ(27),
+	C2C_RESS_GENO_IRQ(28),
+	C2C_RESS_GENO_IRQ(29),
+	C2C_RESS_GENO_IRQ(30),
+	C2C_RESS_GENO_IRQ(31),
+};
+
+struct c2c_platform_data ux500_c2c_platform_data = {
+	.wumod_gpio = GPIO_WU_MOD,
+};
+
+struct platform_device ux500_c2c_device = {
+	.dev = {
+		.platform_data = &ux500_c2c_platform_data,
+	},
+	.name = "c2c",
+	.id = 0,
+	.num_resources = ARRAY_SIZE(c2c_resources),
+	.resource = c2c_resources,
+};
+#endif /* CONFIG_C2C */
 
 /* Mali GPU platform device */
 struct platform_device db8500_mali_gpu_device = {
 	.name = "mali",
 	.id = 0,
 };
-
 
 struct resource keypad_resources[] = {
 	[0] = {
@@ -499,4 +817,255 @@ struct platform_device u8500_ske_keypad_device = {
 	.id = -1,
 	.num_resources = ARRAY_SIZE(keypad_resources),
 	.resource = keypad_resources,
+};
+
+static struct cpufreq_frequency_table db8500_freq_table[] = {
+	[0] = {
+		.index = 0,
+		.frequency = 200000,
+	},
+	[1] = {
+		.index = 1,
+		.frequency = 400000,
+	},
+	[2] = {
+		.index = 2,
+		.frequency = 800000,
+	},
+	[3] = {
+		/* Used for MAX_OPP, if available */
+		.index = 3,
+		.frequency = CPUFREQ_TABLE_END,
+	},
+	[4] = {
+		.index = 4,
+		.frequency = CPUFREQ_TABLE_END,
+	},
+};
+
+static struct db8500_prcmu_pdata db8500_prcmu_pdata = {
+	.cpufreq = db8500_freq_table,
+	.cpufreq_size = ARRAY_SIZE(db8500_freq_table) *
+		sizeof(struct cpufreq_frequency_table),
+};
+
+struct platform_device db8500_prcmu_device = {
+	.name			= "db8500-prcmu",
+	.dev = {
+		.platform_data = &db8500_prcmu_pdata,
+	},
+};
+
+struct prcmu_tcdm_map db8500_tcdm_map = {
+	.tcdm_size = SZ_4K,
+	.legacy_offset = 0,
+};
+
+static struct cpufreq_frequency_table dbx540_freq_table[] = {
+	[0] = {
+		.index = 0,
+		.frequency = 266000,
+	},
+	[1] = {
+		.index = 1,
+		.frequency = 400000,
+	},
+	[2] = {
+		.index = 2,
+		.frequency = 800000,
+	},
+	[3] = {
+		.index = 3,
+		.frequency = 1200000,
+	},
+	[4] = {
+		.index = 4,
+		.frequency = 1500000,
+	},
+	[5] = {
+		/* Used for speed-binned maximum OPP, if available */
+		.index = 5,
+		.frequency = CPUFREQ_TABLE_END,
+	},
+	[6] = {
+		.index = 6,
+		.frequency = CPUFREQ_TABLE_END,
+	},
+	[7] = {
+		.index = 7,
+		.frequency = CPUFREQ_TABLE_END,
+	},
+	[8] = {
+		.index = 8,
+		.frequency = CPUFREQ_TABLE_END,
+	},
+	[9] = {
+		.index = 9,
+		.frequency = CPUFREQ_TABLE_END,
+	},
+	[10] = {
+		.index = 10,
+		.frequency = CPUFREQ_TABLE_END,
+	},
+	[11] = {
+		.index = 11,
+		.frequency = CPUFREQ_TABLE_END,
+	},
+};
+
+static struct dbx540_prcmu_pdata dbx540_prcmu_pdata = {
+	.cpufreq = dbx540_freq_table,
+	.cpufreq_size = ARRAY_SIZE(dbx540_freq_table) *
+		sizeof(struct cpufreq_frequency_table),
+};
+
+struct platform_device dbx540_prcmu_device = {
+	.name			= "dbx540-prcmu",
+	.dev = {
+		.platform_data = &dbx540_prcmu_pdata,
+	},
+};
+
+struct prcmu_tcdm_map db9540_tcdm_map = {
+	.tcdm_size = SZ_4K + SZ_8K,
+	.legacy_offset = SZ_8K,
+};
+
+struct prcmu_tcdm_map db8540_tcdm_map = {
+	.tcdm_size = SZ_32K,
+	.legacy_offset = SZ_32K - SZ_4K,
+};
+
+static struct usecase_config u8500_usecase_conf[UX500_UC_MAX] = {
+	[UX500_UC_NORMAL] = {
+		.name			= "normal",
+		.cpuidle_multiplier	= 1024,
+		.second_cpu_online	= true,
+		.l2_prefetch_en		= true,
+		.cpuidle_force_state	= 0,
+		.vc_override		= false,
+	},
+	[UX500_UC_VC] = {
+		.name			= "voice-call",
+		.min_arm		= 400000,
+		.cpuidle_multiplier	= 0,
+		.second_cpu_online	= true,
+		.l2_prefetch_en		= false,
+		.cpuidle_force_state	= 0,
+		.vc_override		= true,
+	},
+	[UX500_UC_LPA] = {
+		.name			= "low-power-audio",
+		.min_arm		= 400000,
+		.cpuidle_multiplier	= 0,
+		.second_cpu_online	= false,
+		.l2_prefetch_en		= false,
+	/* TODO: Fetch forced_state dynamically from cpuidle configuration */
+		.cpuidle_force_state	= 3,
+		.vc_override		= false,
+	},
+};
+
+struct platform_device u8500_usecase_gov_device = {
+		.name = "dbx500-usecase-gov",
+		.dev = {
+			 .platform_data = u8500_usecase_conf,
+		}
+};
+
+/* U9540 Support */
+static struct usecase_config u9540_usecase_conf[UX500_UC_MAX] = {
+	[UX500_UC_NORMAL] = {
+		.name			= "normal",
+		.min_arm		= 266000,
+		.cpuidle_multiplier	= 1024,
+		.second_cpu_online	= true,
+		.l2_prefetch_en		= true,
+		.cpuidle_force_state	= 0,
+		.vc_override		= false,
+	},
+	[UX500_UC_VC] = {
+		.name			= "voice-call",
+		.min_arm		= 400000,
+		.cpuidle_multiplier	= 0,
+		.second_cpu_online	= false,
+		.l2_prefetch_en		= true,
+		.cpuidle_force_state	= 0,
+		.vc_override		= true,
+	},
+	[UX500_UC_LPA] = {
+		.name			= "low-power-audio",
+		.min_arm		= 400000,
+		.cpuidle_multiplier	= 0,
+		.second_cpu_online	= false,
+		.l2_prefetch_en		= true,
+		.cpuidle_force_state	= 3,
+		.vc_override		= false,
+	},
+};
+
+struct platform_device u9540_usecase_gov_device = {
+		.name = "dbx500-usecase-gov",
+		.dev = {
+			 .platform_data = u9540_usecase_conf,
+		}
+};
+
+/*
+ * XMIP
+*/
+#define XMIP_RESS_MODAPP_IRQ(num) { \
+	.start  = IRQ_DB8540_XMIP_MODAPP##num , \
+	.end    = IRQ_DB8540_XMIP_MODAPP##num , \
+	.flags  = IORESOURCE_IRQ, \
+	.name   = "XMIP_MODAPP"#num  \
+}
+
+static struct resource db8540_xmip_resources[] = {
+	{
+		.name = "PRCM_REGS",
+		.start = U8500_PRCMU_BASE,
+		.end   = U8500_PRCMU_BASE + SZ_8K + SZ_4K - 1,
+		.flags = IORESOURCE_MEM,
+	},
+
+	XMIP_RESS_MODAPP_IRQ(0),
+	XMIP_RESS_MODAPP_IRQ(1),
+	XMIP_RESS_MODAPP_IRQ(2),
+	XMIP_RESS_MODAPP_IRQ(3),
+	XMIP_RESS_MODAPP_IRQ(4),
+	XMIP_RESS_MODAPP_IRQ(5),
+	XMIP_RESS_MODAPP_IRQ(6),
+	XMIP_RESS_MODAPP_IRQ(7),
+	XMIP_RESS_MODAPP_IRQ(8),
+	XMIP_RESS_MODAPP_IRQ(9),
+	XMIP_RESS_MODAPP_IRQ(10),
+	XMIP_RESS_MODAPP_IRQ(11),
+	XMIP_RESS_MODAPP_IRQ(12),
+	XMIP_RESS_MODAPP_IRQ(13),
+	XMIP_RESS_MODAPP_IRQ(14),
+	XMIP_RESS_MODAPP_IRQ(15),
+	XMIP_RESS_MODAPP_IRQ(16),
+	XMIP_RESS_MODAPP_IRQ(17),
+	XMIP_RESS_MODAPP_IRQ(18),
+	XMIP_RESS_MODAPP_IRQ(19),
+	XMIP_RESS_MODAPP_IRQ(20),
+	XMIP_RESS_MODAPP_IRQ(21),
+	XMIP_RESS_MODAPP_IRQ(22),
+	XMIP_RESS_MODAPP_IRQ(23),
+	XMIP_RESS_MODAPP_IRQ(24),
+	XMIP_RESS_MODAPP_IRQ(25),
+	XMIP_RESS_MODAPP_IRQ(26),
+	XMIP_RESS_MODAPP_IRQ(27),
+	XMIP_RESS_MODAPP_IRQ(28),
+	XMIP_RESS_MODAPP_IRQ(29),
+	XMIP_RESS_MODAPP_IRQ(30),
+	XMIP_RESS_MODAPP_IRQ(31),
+};
+
+struct platform_device db8540_xmip_device = {
+	.name = "ste-xmip",
+	.id = 0,
+	.num_resources = ARRAY_SIZE(db8540_xmip_resources),
+	.resource = db8540_xmip_resources,
 };

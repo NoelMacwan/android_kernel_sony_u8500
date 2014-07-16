@@ -49,13 +49,25 @@ static u8 handle_irq(u8 *io)
 		/* DSI TE polling answer received */
 		ret |= DSILINK_IRQ_TRIGGER;
 
+	if (irq_status &
+		DSI_DIRECT_CMD_STS_FLAG_V3_ACKNOWLEDGE_WITH_ERR_RECEIVED_FLAG_MASK)
+		ret |= DSILINK_IRQ_ACK_WITH_ERR;
+
 	dsi_wreg(io, DSI_DIRECT_CMD_STS_CLR_V3, irq_status);
 
 	irq_status = dsi_rreg(io, DSI_CMD_MODE_STS_FLAG_V3);
 	if (irq_status & DSI_CMD_MODE_STS_FLAG_V3_ERR_NO_TE_FLAG_MASK)
 		ret |= DSILINK_IRQ_NO_TE;
 
+	if (irq_status & DSI_CMD_MODE_STS_FLAG_V3_ERR_TE_MISS_FLAG_MASK)
+		ret |= DSILINK_IRQ_TE_MISS;
+
 	dsi_wreg(io, DSI_CMD_MODE_STS_CLR_V3, irq_status);
+
+	irq_status = dsi_rreg(io, DSI_VID_MODE_STS_FLAG_V3);
+	dsi_wreg(io, DSI_VID_MODE_STS_CLR_V3, irq_status);
+	if (irq_status & DSI_VID_MODE_STS_FLAG_V3_ERR_MISSING_VSYNC_FLAG_MASK)
+		ret |= DSILINK_IRQ_MISSING_VSYNC;
 
 	return ret;
 }
@@ -178,9 +190,15 @@ static void te_request(u8 *io)
 	dsi_wreg(io, DSI_DIRECT_CMD_STS_CLR_V3,
 		DSI_DIRECT_CMD_STS_CLR_V3_TE_RECEIVED_CLR(true));
 	dsi_wfld(io, DSI_DIRECT_CMD_STS_CTL_V3, TE_RECEIVED_EN, true);
+	dsi_wreg(io, DSI_DIRECT_CMD_STS_CLR_V3,
+		DSI_DIRECT_CMD_STS_CLR_V3_ACKNOWLEDGE_WITH_ERR_RECEIVED_CLR(true));
+	dsi_wfld(io, DSI_DIRECT_CMD_STS_CTL_V3, ACKNOWLEDGE_WITH_ERR_EN, true);
 	dsi_wreg(io, DSI_CMD_MODE_STS_CLR_V3,
 		DSI_CMD_MODE_STS_CLR_V3_ERR_NO_TE_CLR(true));
 	dsi_wfld(io, DSI_CMD_MODE_STS_CTL_V3, ERR_NO_TE_EN, true);
+	dsi_wreg(io, DSI_CMD_MODE_STS_CLR_V3,
+		DSI_CMD_MODE_STS_CLR_V3_ERR_TE_MISS_CLR(true));
+	dsi_wfld(io, DSI_CMD_MODE_STS_CTL_V3, ERR_TE_MISS_EN, true);
 	dsi_wreg(io, DSI_DIRECT_CMD_SEND_V3, true);
 }
 
@@ -237,7 +255,21 @@ static int read(u8 *io, struct device *dev, u8 cmd, u32 *data, int *len)
 			memcpy(data, &rddat, *len);
 		}
 	} else {
-		ret = -EIO;
+		u8 dat1_status;
+		u32 sts;
+
+		sts = dsi_rreg(io, DSI_DIRECT_CMD_STS_V3);
+		dat1_status = dsi_rfld(io, DSI_MCTL_LANE_STS_V3,
+							DATLANE1_STATE);
+		dev_err(dev, "DCS read failed, err=%d, D0 state %d sts %X\n",
+						error, dat1_status, sts);
+		dsi_wreg(io, DSI_DIRECT_CMD_RD_INIT_V3, true);
+		/* If dat1 is still in read to a force stop */
+		if (dat1_status == DSILINK_LANE_STATE_READ ||
+						sts == DSI_CMD_TRANSMISSION)
+			ret = -EAGAIN;
+		else
+			ret = -EIO;
 	}
 
 	dsi_wreg(io, DSI_CMD_MODE_STS_CLR_V3, ~0);
@@ -249,18 +281,17 @@ static int read(u8 *io, struct device *dev, u8 cmd, u32 *data, int *len)
 static void force_stop(u8 *io)
 {
 	dsi_wfld(io, DSI_MCTL_MAIN_PHY_CTL_V3, FORCE_STOP_MODE, true);
-	usleep_range(20, 20);
+	dsi_wfld(io, DSI_MCTL_MAIN_PHY_CTL_V3, CLK_FORCE_STOP, true);
+	udelay(20);
 	dsi_wfld(io, DSI_MCTL_MAIN_PHY_CTL_V3, FORCE_STOP_MODE, false);
+	dsi_wfld(io, DSI_MCTL_MAIN_PHY_CTL_V3, CLK_FORCE_STOP, false);
 }
 
 static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
 				struct dsilink_dsi_vid_registers *vid_regs)
 {
 	int i = 0;
-	bool useMoreThan2DL = false;
-
-	if (port->phy.num_data_lanes > 2)
-		useMoreThan2DL = true;
+	u8 n_lanes = port->phy.num_data_lanes;
 
 	dsi_wfld(io, DSI_MCTL_MAIN_DATA_CTL_V3, LINK_EN, true);
 	dsi_wfld(io, DSI_MCTL_MAIN_DATA_CTL_V3, BTA_EN, true);
@@ -276,17 +307,46 @@ static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
 		dsi_wfld(io, DSI_MCTL_MAIN_DATA_CTL_V3, TE_HW_POLLING_EN, true);
 	}
 
-	dsi_wreg(io, DSI_MCTL_DPHY_STATIC_V3,
-		DSI_MCTL_DPHY_STATIC_V3_UI_X4(port->phy.ui));
+	/*
+	 * To be in conformance with the specification, it is necessary to
+	 * change HSTX_SLEWRATE value to "010" in DPHY_LANES_TRIM registers
+	 * for the clock and all data lanes.
+	 *
+	 * MIPI WG realized later the sensitivity of this spec and relaxed the
+	 * Tr/Tf min value to 100ps in MIPI DPHY spec ver1.1, but recommended
+	 * to keep tr/tf min as 150ps for datarates <1Gbps to avoid
+	 * excessive radiations.
+	 */
+	dsi_wfld(io, DSI_DPHY_LANES_TRIM1_V3, HSTX_SLEWRATE_CL, 0x2);
+	dsi_wfld(io, DSI_DPHY_LANES_TRIM2_V3, HSTX_SLEWRATE_DL1, 0x2);
+	dsi_wfld(io, DSI_DPHY_LANES_TRIM3_V3, HSTX_SLEWRATE_DL2, 0x2);
+	dsi_wfld(io, DSI_DPHY_LANES_TRIM4_V3, HSTX_SLEWRATE_DL3, 0x2);
+	dsi_wfld(io, DSI_DPHY_LANES_TRIM5_V3, HSTX_SLEWRATE_DL4, 0x2);
+
+	if (n_lanes > 2) {
+		dsi_wreg(io, DSI_MCTL_DPHY_STATIC_V3,
+			DSI_MCTL_DPHY_STATIC_V3_HS_INVERT_DAT1(1) |
+			DSI_MCTL_DPHY_STATIC_V3_HS_INVERT_DAT2(1) |
+			DSI_MCTL_DPHY_STATIC_V3_HS_INVERT_DAT3(1) |
+			DSI_MCTL_DPHY_STATIC_V3_HS_INVERT_DAT4(1) |
+			DSI_MCTL_DPHY_STATIC_V3_UI_X4(port->phy.ui));
+		dsi_wfld(io, DSI_DPHY_LANES_TRIM2_V3, SKEW_DL1, 0x3);
+		dsi_wfld(io, DSI_DPHY_LANES_TRIM3_V3, SKEW_DL2, 0x3);
+		dsi_wfld(io, DSI_DPHY_LANES_TRIM4_V3, SKEW_DL3, 0x3);
+		dsi_wfld(io, DSI_DPHY_LANES_TRIM5_V3, SKEW_DL4, 0x3);
+	} else {
+		dsi_wreg(io, DSI_MCTL_DPHY_STATIC_V3,
+			DSI_MCTL_DPHY_STATIC_V3_UI_X4(port->phy.ui));
+	}
 
 	dsi_wreg(io, DSI_MCTL_MAIN_PHY_CTL_V3,
 		DSI_MCTL_MAIN_PHY_CTL_V3_WAIT_BURST_TIME(0xf) |
 		DSI_MCTL_MAIN_PHY_CTL_V3_LANE2_EN(
-			port->phy.num_data_lanes >= 2) |
+			n_lanes >= 2) |
 		DSI_MCTL_MAIN_PHY_CTL_V3_LANE3_EN(
-			port->phy.num_data_lanes >= 3) |
+			n_lanes >= 3) |
 		DSI_MCTL_MAIN_PHY_CTL_V3_LANE4_EN(
-			port->phy.num_data_lanes >= 4) |
+			n_lanes >= 4) |
 		DSI_MCTL_MAIN_PHY_CTL_V3_CLK_ULPM_EN(true) |
 		DSI_MCTL_MAIN_PHY_CTL_V3_DAT1_ULPM_EN(true) |
 		DSI_MCTL_MAIN_PHY_CTL_V3_DAT2_ULPM_EN(true) |
@@ -299,7 +359,7 @@ static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
 		DSI_MCTL_ULPOUT_TIME_V3_DATA_ULPOUT_TIME(1));
 	dsi_wreg(io, DSI_DPHY_LANES_TRIM1_V3,
 		DSI_DPHY_LANES_TRIM1_V3_SPEC_81_ENUM(0_90) |
-		DSI_DPHY_LANES_TRIM1_V3_CTRL_4DL(useMoreThan2DL));
+		DSI_DPHY_LANES_TRIM1_V3_CTRL_4DL(n_lanes > 2));
 	dsi_wreg(io, DSI_MCTL_DPHY_TIMEOUT1_V3,
 		DSI_MCTL_DPHY_TIMEOUT1_V3_CLK_DIV(0xf) |
 		DSI_MCTL_DPHY_TIMEOUT1_V3_HSTX_TO_VAL(0x3fff));
@@ -313,9 +373,9 @@ static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
 		DSI_MCTL_MAIN_EN_V3_PLL_START(true) |
 		DSI_MCTL_MAIN_EN_V3_CKLANE_EN(true) |
 		DSI_MCTL_MAIN_EN_V3_DAT1_EN(true) |
-		DSI_MCTL_MAIN_EN_V3_DAT2_EN(port->phy.num_data_lanes > 1) |
-		DSI_MCTL_MAIN_EN_V3_DAT3_EN(port->phy.num_data_lanes > 2) |
-		DSI_MCTL_MAIN_EN_V3_DAT4_EN(port->phy.num_data_lanes > 3) |
+		DSI_MCTL_MAIN_EN_V3_DAT2_EN(n_lanes > 1) |
+		DSI_MCTL_MAIN_EN_V3_DAT3_EN(n_lanes > 2) |
+		DSI_MCTL_MAIN_EN_V3_DAT4_EN(n_lanes > 3) |
 		DSI_MCTL_MAIN_EN_V3_IF1_EN(true) |
 		DSI_MCTL_MAIN_EN_V3_IF2_EN(false));
 
@@ -324,13 +384,13 @@ static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
 						DSILINK_LANE_STATE_START ||
 		(dsi_rfld(io, DSI_MCTL_MAIN_STS_V3, DAT2_READY) ==
 					DSILINK_LANE_STATE_START &&
-						port->phy.num_data_lanes > 1) ||
+						n_lanes > 1) ||
 		(dsi_rfld(io, DSI_MCTL_MAIN_STS_V3, DAT3_READY) ==
 					DSILINK_LANE_STATE_START &&
-						port->phy.num_data_lanes > 2) ||
+						n_lanes > 2) ||
 		(dsi_rfld(io, DSI_MCTL_MAIN_STS_V3, DAT4_READY) ==
 					DSILINK_LANE_STATE_START &&
-						port->phy.num_data_lanes > 3)) {
+						n_lanes > 3)) {
 		usleep_range(1000, 1000);
 		if (i++ == 10) {
 			dev_warn(dev, "DSI lane not ready!\n");
@@ -382,8 +442,9 @@ static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
 		/* 1: if1 in video mode, 0: if1 in command mode */
 		dsi_wfld(io, DSI_MCTL_MAIN_DATA_CTL_V3, IF_VID_MODE, 1);
 
-		/* 1: enables the link, 0: disables the link */
-		dsi_wfld(io, DSI_MCTL_MAIN_DATA_CTL_V3, VID_EN, 1);
+		/* enable error interrupts */
+		dsi_wfld(io, DSI_VID_MODE_STS_CTL_V3, ERR_MISSING_VSYNC_EN,
+				true);
 	} else {
 		dsi_wfld(io, DSI_CMD_MODE_CTL_V3, IF1_ID, 0);
 	}
@@ -392,6 +453,7 @@ static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
 
 static void disable(u8 *io)
 {
+	dsi_wfld(io, DSI_VID_MODE_STS_CTL_V3, ERR_MISSING_VSYNC_EN, false);
 }
 
 static int update_frame_parameters(u8 *io, struct dsilink_video_mode *vmode,
@@ -408,6 +470,9 @@ static int update_frame_parameters(u8 *io, struct dsilink_video_mode *vmode,
 	dsi_wfld(io, DSI_VID_HSIZE2_V3, RGB_SIZE, vmode->xres * bpp);
 	dsi_wfld(io, DSI_VID_MAIN_CTL_V3, VID_PIXEL_MODE, vid_regs->pixel_mode);
 	dsi_wfld(io, DSI_VID_MAIN_CTL_V3, HEADER, vid_regs->rgb_header);
+	dsi_wfld(io, DSI_VID_MAIN_CTL_V3, RECOVERY_MODE, 1);
+	dsi_wfld(io, DSI_TVG_IMG_SIZE_V3, TVG_NBLINE, vmode->yres);
+	dsi_wfld(io, DSI_TVG_IMG_SIZE_V3, TVG_LINE_SIZE, vmode->xres * bpp);
 
 	if (vid_regs->tvg_enable) {
 		/*
@@ -422,9 +487,6 @@ static int update_frame_parameters(u8 *io, struct dsilink_video_mode *vmode,
 		dsi_wfld(io, DSI_TVG_CTL_V3, TVG_STOPMODE, 2);
 		dsi_wfld(io, DSI_TVG_CTL_V3, TVG_RUN, 1);
 
-		dsi_wfld(io, DSI_TVG_IMG_SIZE_V3, TVG_NBLINE, vmode->yres);
-		dsi_wfld(io, DSI_TVG_IMG_SIZE_V3, TVG_LINE_SIZE,
-							vmode->xres * bpp);
 		dsi_wfld(io, DSI_TVG_COLOR1_BIS_V3, COL1_BLUE, 0);
 		dsi_wfld(io, DSI_TVG_COLOR1_V3, COL1_GREEN, 0);
 		dsi_wfld(io, DSI_TVG_COLOR1_V3, COL1_RED, 0xFF);
@@ -451,8 +513,7 @@ static int update_frame_parameters(u8 *io, struct dsilink_video_mode *vmode,
 		dsi_wfld(io, DSI_VID_VCA_SETTING2_V3, EXACT_BURST_LIMIT,
 							vid_regs->blkeol_pck);
 	}
-	if (vid_regs->sync_is_pulse)
-		dsi_wfld(io, DSI_VID_VCA_SETTING2_V3, MAX_LINE_LIMIT,
+	dsi_wfld(io, DSI_VID_VCA_SETTING2_V3, MAX_LINE_LIMIT,
 						vid_regs->blkline_pck - 6);
 
 	return 0;
@@ -463,88 +524,19 @@ static void set_clk_continous(u8 *io, bool value)
 	dsi_wfld(io, DSI_MCTL_MAIN_PHY_CTL_V3, CLK_CONTINUOUS, value);
 }
 
+static void enable_video_mode(u8 *io, bool enable)
+{
+	dsi_wfld(io, DSI_MCTL_MAIN_DATA_CTL_V3, VID_EN, enable);
+}
+
 static int handle_ulpm(u8 *io, struct device *dev,
 			const struct dsilink_port *port, bool enter_ulpm)
 {
-	u8 num_data_lanes = port->phy.num_data_lanes;
-	u8 nbr_of_retries = 0;
-	u8 lane_state;
-	int ret = 0;
-
-	/*
-	 * The D-PHY protocol specifies the time to leave the ULP mode
-	 * in ms. It will at least take 1 ms to exit ULPM.
-	 * The ULPOUT time value is using number of system clock ticks
-	 * divided by 1000. The system clock for the DSI link is the dsi sys
-	 * clock.
-	 */
-	dsi_wreg(io, DSI_MCTL_ULPOUT_TIME_V3,
-			DSI_MCTL_ULPOUT_TIME_V3_CKLANE_ULPOUT_TIME(0x1FF) |
-			DSI_MCTL_ULPOUT_TIME_V3_DATA_ULPOUT_TIME(0x1FF));
-
-	if (enter_ulpm) {
-		lane_state = DSILINK_LANE_STATE_ULPM;
-		switch_byteclk_to_sys_clk(port->link);
-		dsi_wfld(io, DSI_MCTL_PLL_CTL_V3, PLL_OUT_SEL, true);
-	}
-
-	dsi_wfld(io, DSI_MCTL_MAIN_EN_V3, DAT1_ULPM_REQ, enter_ulpm);
-	dsi_wfld(io, DSI_MCTL_MAIN_EN_V3, DAT2_ULPM_REQ,
-					enter_ulpm && num_data_lanes == 2);
-	dsi_wfld(io, DSI_MCTL_MAIN_EN_V3, DAT3_ULPM_REQ,
-					enter_ulpm && num_data_lanes == 3);
-	dsi_wfld(io, DSI_MCTL_MAIN_EN_V3, DAT4_ULPM_REQ,
-					enter_ulpm && num_data_lanes == 4);
-	dsi_wfld(io, DSI_MCTL_MAIN_EN_V3, CLKLANE_ULPM_REQ, enter_ulpm);
-
-	if (!enter_ulpm) {
-		lane_state = DSILINK_LANE_STATE_IDLE;
-		switch_byteclk_to_hs_clk(port->link);
-		dsi_wfld(io, DSI_MCTL_PLL_CTL_V3, PLL_OUT_SEL, false);
-	}
-
-	/* Wait for data lanes to enter ULPM */
-	while ((dsi_rfld(io, DSI_MCTL_LANE_STS_V3, DATLANE1_STATE)
-						!= lane_state) ||
-		(dsi_rfld(io, DSI_MCTL_LANE_STS_V3, DATLANE2_STATE)
-						!= lane_state &&
-							num_data_lanes == 1) ||
-		(dsi_rfld(io, DSI_MCTL_LANE_STS_V3, DATLANE3_STATE)
-						!= lane_state &&
-							num_data_lanes == 2) ||
-		(dsi_rfld(io, DSI_MCTL_LANE_STS_V3, DATLANE4_STATE)
-						!= lane_state &&
-							num_data_lanes == 3)) {
-			usleep_range(DSI_WAIT_FOR_ULPM_STATE_MS,
-						DSI_WAIT_FOR_ULPM_STATE_MS);
-			if (nbr_of_retries++ == DSI_ULPM_STATE_NBR_OF_RETRIES) {
-				dev_warn(dev,
-					"Could not enter correct state=%d!\n",
-								lane_state);
-				ret = -EFAULT;
-				break;
-			}
-	}
-
-	nbr_of_retries = 0;
-
-	/* Wait for clock lane to enter ULPM */
-	while (dsi_rfld(io, DSI_MCTL_LANE_STS_V3, CLKLANE_STATE)
-						!= lane_state) {
-		usleep_range(DSI_WAIT_FOR_ULPM_STATE_MS,
-						DSI_WAIT_FOR_ULPM_STATE_MS);
-		if (nbr_of_retries++ == DSI_ULPM_STATE_NBR_OF_RETRIES) {
-			dev_warn(dev,
-				"Could not enter correct state=%d!\n",
-								lane_state);
-			ret = -EFAULT;
-			break;
-		}
-	}
-	return ret;
+	/* Currently not supported for dsilink v3 */
+	return 0;
 }
 
-void __init nova_dsilink_v3_init(struct dsilink_ops *ops)
+void __devinit nova_dsilink_v3_init(struct dsilink_ops *ops)
 {
 	ops->force_stop = force_stop;
 	ops->read = read;
@@ -555,7 +547,8 @@ void __init nova_dsilink_v3_init(struct dsilink_ops *ops)
 	ops->enable = enable;
 	ops->disable = disable;
 	ops->update_frame_parameters = update_frame_parameters;
-	ops->handle_ulpm = handle_ulpm;
 	ops->set_clk_continous = set_clk_continous;
+	ops->enable_video_mode = enable_video_mode;
+	ops->handle_ulpm = handle_ulpm;
 }
 

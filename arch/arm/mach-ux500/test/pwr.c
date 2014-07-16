@@ -6,12 +6,9 @@
  * License terms: GNU General Public License (GPL) version 2
  *
  * This is a module test for clocks and regulators.
- *
- * Modified by Munjeni @ XDA Developers 2013
  */
 
 #include <linux/module.h>
-#include <linux/init.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/seq_file.h>
@@ -28,8 +25,8 @@
 #include <mach/pm.h>
 
 #include "../pm/suspend_dbg.h"
-#include "../../../../drivers/regulator/dbx500-prcmu.h"
-#include "../../../../drivers/regulator/ab8500-debug.h"
+#include "../../../drivers/regulator/dbx500-prcmu.h"
+#include "../../../drivers/regulator/ab8500-debug.h"
 
 /* To reach main_wake_lock */
 #include "../../../../kernel/power/power.h"
@@ -787,6 +784,8 @@ static int pwr_test_idle(struct seq_file *s, void *data)
 
 static bool suspend_testing;
 static int suspend_test_length;
+static u32 suspend_down_len = 1;
+static u32 suspend_up_len = 1;
 
 static ssize_t pm_test_suspend_set(struct file *file,
 				   const char __user *user_buf,
@@ -794,9 +793,7 @@ static ssize_t pm_test_suspend_set(struct file *file,
 {
 	long unsigned val;
 	int err;
-#ifdef CONFIG_WAKELOCK
-	struct wake_lock main_wake_lock;
-#endif
+
 	err = kstrtoul_from_user(user_buf, count, 0, &val);
 
 	if (err)
@@ -804,8 +801,9 @@ static ssize_t pm_test_suspend_set(struct file *file,
 
 	suspend_test_length = (int)val;
 
-	ux500_suspend_dbg_test_start(suspend_test_length);
-
+	ux500_suspend_dbg_test_start(suspend_test_length,
+				     suspend_down_len,
+				     suspend_up_len);
 	suspend_testing = true;
 #ifdef CONFIG_WAKELOCK
 	wake_unlock(&main_wake_lock);
@@ -873,14 +871,11 @@ static const struct file_operations pwr_test_suspend_debugfs_ops = {
 	.release	= single_release,
 };
 
-static struct dentry *debugfs_dir;
-
 static int __init pwr_test_init(void)
 {
-	int err = 0;
+	int err;
 	void *err_ptr;
-
-	printk ("Loaded pwr test module.\n");
+	struct dentry *debugfs_dir;
 
 	debugfs_dir = debugfs_create_dir("pwr_test", NULL);
 	if (IS_ERR(debugfs_dir))
@@ -904,22 +899,25 @@ static int __init pwr_test_init(void)
 		goto out;
 	}
 
+	err_ptr = debugfs_create_u32("suspend_down_len", S_IWUGO | S_IRUGO,
+				     debugfs_dir,
+				     &suspend_down_len);
+	if (IS_ERR_OR_NULL(err_ptr)) {
+		err = PTR_ERR(err_ptr);
+		goto out;
+	}
+
+	err_ptr = debugfs_create_u32("suspend_up_len", S_IWUGO | S_IRUGO,
+				     debugfs_dir,
+				     &suspend_up_len);
+	if (IS_ERR_OR_NULL(err_ptr)) {
+		err = PTR_ERR(err_ptr);
+		goto out;
+	}
+
 	return 0;
 out:
-	printk ("pwr test error!\n");
 	debugfs_remove_recursive(debugfs_dir);
 	return err;
 }
-
-static void __exit pwr_test_exit(void)
-{
-	printk ("Unloaded pwr test module.\n");
-	debugfs_remove_recursive(debugfs_dir);
-
-	return;
-}
-
-module_init(pwr_test_init);
-module_exit(pwr_test_exit);
-
-MODULE_LICENSE("GPL v2");
+late_initcall(pwr_test_init);

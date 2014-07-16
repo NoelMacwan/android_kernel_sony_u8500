@@ -1,6 +1,4 @@
 /*
- * hsi-char.c
- *
  * HSI character device driver, implements the character device
  * interface.
  *
@@ -25,13 +23,15 @@
 
 #include <linux/errno.h>
 #include <linux/types.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/poll.h>
+#include <linux/kmemleak.h>
 #include <linux/ioctl.h>
 #include <linux/wait.h>
 #include <linux/fs.h>
@@ -40,123 +40,153 @@
 #include <linux/cdev.h>
 #include <linux/uaccess.h>
 #include <linux/scatterlist.h>
+#include <linux/stat.h>
 #include <linux/hsi/hsi.h>
 #include <linux/hsi/hsi_char.h>
 
-#define HSI_CHAR_CHANNELS	8
-#define HSI_CHAR_DEVS		8
-#define HSI_CHAR_MSGS		4
+#define HSC_DEVS		16 /* Num of channels */
+#define HSC_MSGS		4
 
-#define HSI_CHST_UNAVAIL	0 /* SBZ! */
-#define HSI_CHST_AVAIL		1
+#define HSC_RXBREAK		0
 
-#define HSI_CHST_CLOSED		(0 << 4)
-#define HSI_CHST_CLOSING	(1 << 4)
-#define HSI_CHST_OPENING	(2 << 4)
-#define HSI_CHST_OPENED		(3 << 4)
+#define HSC_ID_BITS		6
+#define HSC_PORT_ID_BITS	4
+#define HSC_ID_MASK		3
+#define HSC_PORT_ID_MASK	3
+#define HSC_CH_MASK		0xf
 
-#define HSI_CHST_READOFF	(0 << 8)
-#define HSI_CHST_READON		(1 << 8)
-#define HSI_CHST_READING	(2 << 8)
+/*
+ * We support up to 4 controllers that can have up to 4
+ * ports, which should currently be more than enough.
+ */
+#define HSC_BASEMINOR(id, port_id) \
+		((((id) & HSC_ID_MASK) << HSC_ID_BITS) | \
+		(((port_id) & HSC_PORT_ID_MASK) << HSC_PORT_ID_BITS))
 
-#define HSI_CHST_WRITEOFF	(0 << 12)
-#define HSI_CHST_WRITEON	(1 << 12)
-#define HSI_CHST_WRITING	(2 << 12)
+enum {
+	HSC_CH_OPEN,
+	HSC_CH_READ,
+	HSC_CH_POLL,
+	HSC_CH_WRITE,
+	HSC_CH_WLINE,
+};
 
-#define HSI_CHST_OC_MASK	0xf0
-#define HSI_CHST_RD_MASK	0xf00
-#define HSI_CHST_WR_MASK	0xf000
+enum {
+	HSC_RX,
+	HSC_TX,
+};
 
-#define HSI_CHST_OC(c)		((c)->state & HSI_CHST_OC_MASK)
-#define HSI_CHST_RD(c)		((c)->state & HSI_CHST_RD_MASK)
-#define HSI_CHST_WR(c)		((c)->state & HSI_CHST_WR_MASK)
-
-#define HSI_CHST_OC_SET(c, v) \
-	do { \
-		(c)->state &= ~HSI_CHST_OC_MASK; \
-		(c)->state |= v; \
-	} while (0);
-
-#define HSI_CHST_RD_SET(c, v) \
-	do { \
-		(c)->state &= ~HSI_CHST_RD_MASK; \
-		(c)->state |= v; \
-	} while (0);
-
-#define HSI_CHST_WR_SET(c, v) \
-	do { \
-		(c)->state &= ~HSI_CHST_WR_MASK; \
-		(c)->state |= v; \
-	} while (0);
-
-#define HSI_CHAR_POLL_RST	(-1)
-#define HSI_CHAR_POLL_OFF	0
-#define HSI_CHAR_POLL_ON	1
-
-#define HSI_CHAR_RX		0
-#define HSI_CHAR_TX		1
-
-struct hsi_char_channel {
+struct hsc_client_data;
+/**
+ * struct hsc_channel - hsi_char internal channel data
+ * @ch: channel number
+ * @flags: Keeps state of the channel (open/close, reading, writing)
+ * @free_msgs_list: List of free HSI messages/requests
+ * @rx_msgs_queue: List of pending RX requests
+ * @tx_msgs_queue: List of pending TX requests
+ * @lock: Serialize access to the lists
+ * @cl: reference to the associated hsi_client
+ * @cl_data: reference to the client data that this channels belongs to
+ * @rx_wait: RX requests wait queue
+ * @tx_wait: TX requests wait queue
+ */
+struct hsc_channel {
 	unsigned int		ch;
-	unsigned int		state;
-	int			wlrefcnt;
-	int			rxpoll;
-	struct hsi_client	*cl;
+	unsigned long		flags;
+	unsigned int		poll_event;
 	struct list_head	free_msgs_list;
 	struct list_head	rx_msgs_queue;
 	struct list_head	tx_msgs_queue;
-	int			poll_event;
 	spinlock_t		lock;
-	struct fasync_struct	*async_queue;
+	struct hsi_client	*cl;
+	struct hsc_client_data *cl_data;
 	wait_queue_head_t	rx_wait;
 	wait_queue_head_t	tx_wait;
 };
 
-struct hsi_char_client_data {
-	atomic_t		refcnt;
-	int			attached;
-	atomic_t		breq;
-	struct hsi_char_channel	channels[HSI_CHAR_DEVS];
+/**
+ * struct hsc_client_data - hsi_char internal client data
+ * @cdev: Characther device associated to the hsi_client
+ * @lock: Lock to serialize open/close access
+ * @flags: Keeps track of port state (rx hwbreak armed)
+ * @usecnt: Use count for claiming the HSI port (mutex protected)
+ * @cl: Referece to the HSI client
+ * @channels: Array of channels accessible by the client
+ */
+struct hsc_client_data {
+	struct cdev		cdev;
+	struct mutex		lock;
+	unsigned long		flags;
+	unsigned int		usecnt;
+	struct hsi_client	*cl;
+	struct hsc_channel	channels[HSC_DEVS];
 };
 
+/* Stores the major number dynamically allocated for hsi_char */
+static unsigned int hsc_major;
+/* Maximum buffer size that hsi_char will accept from userspace */
 static unsigned int max_data_size = 0x1000;
-module_param(max_data_size, uint, 1);
+module_param(max_data_size, uint, 0);
 MODULE_PARM_DESC(max_data_size, "max read/write data size [4,8..65536] (^2)");
 
-static int channels_map[HSI_CHAR_DEVS] = {0, -1, -1, -1, -1, -1, -1, -1};
-module_param_array(channels_map, int, NULL, 0);
-MODULE_PARM_DESC(channels_map, "Array of HSI channels ([0...7]) to be probed");
-
-static dev_t hsi_char_dev;
-static struct hsi_char_client_data hsi_char_cl_data;
-
-static inline void hsi_char_msg_free(struct hsi_msg *msg)
+static void hsc_add_tail(struct hsc_channel *channel, struct hsi_msg *msg,
+							struct list_head *queue)
 {
-	msg->complete = NULL;
-	msg->destructor = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&channel->lock, flags);
+	list_add_tail(&msg->link, queue);
+	spin_unlock_irqrestore(&channel->lock, flags);
+}
+
+static struct hsi_msg *hsc_get_first_msg(struct hsc_channel *channel,
+							struct list_head *queue)
+{
+	struct hsi_msg *msg = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&channel->lock, flags);
+
+	if (list_empty(queue))
+		goto out;
+
+	msg = list_first_entry(queue, struct hsi_msg, link);
+	list_del(&msg->link);
+out:
+	spin_unlock_irqrestore(&channel->lock, flags);
+
+	return msg;
+}
+
+static inline void hsc_msg_free(struct hsi_msg *msg)
+{
 	kfree(sg_virt(msg->sgt.sgl));
 	hsi_free_msg(msg);
 }
 
-static inline void hsi_char_msgs_free(struct hsi_char_channel *channel)
+static void hsc_free_list(struct list_head *list)
 {
 	struct hsi_msg *msg, *tmp;
 
-	list_for_each_entry_safe(msg, tmp, &channel->free_msgs_list, link) {
+	list_for_each_entry_safe(msg, tmp, list, link) {
 		list_del(&msg->link);
-		hsi_char_msg_free(msg);
-	}
-	list_for_each_entry_safe(msg, tmp, &channel->rx_msgs_queue, link) {
-		list_del(&msg->link);
-		hsi_char_msg_free(msg);
-	}
-	list_for_each_entry_safe(msg, tmp, &channel->tx_msgs_queue, link) {
-		list_del(&msg->link);
-		hsi_char_msg_free(msg);
+		hsc_msg_free(msg);
 	}
 }
 
-static inline struct hsi_msg *hsi_char_msg_alloc(unsigned int alloc_size)
+static void hsc_reset_list(struct hsc_channel *channel, struct list_head *l)
+{
+	unsigned long flags;
+	LIST_HEAD(list);
+
+	spin_lock_irqsave(&channel->lock, flags);
+	list_splice_init(l, &list);
+	spin_unlock_irqrestore(&channel->lock, flags);
+
+	hsc_free_list(&list);
+}
+
+static inline struct hsi_msg *hsc_msg_alloc(unsigned int alloc_size)
 {
 	struct hsi_msg *msg;
 	void *buf;
@@ -170,357 +200,156 @@ static inline struct hsi_msg *hsi_char_msg_alloc(unsigned int alloc_size)
 		goto out;
 	}
 	sg_init_one(msg->sgt.sgl, buf, alloc_size);
-	msg->context = buf;
+	/* Ignore false positive, due to sg pointer handling */
+	kmemleak_ignore(buf);
+
 	return msg;
 out:
 	return NULL;
 }
 
-static inline int hsi_char_msgs_alloc(struct hsi_char_channel *channel)
+static inline int hsc_msgs_alloc(struct hsc_channel *channel)
 {
 	struct hsi_msg *msg;
 	int i;
 
-	for (i = 0; i < HSI_CHAR_MSGS; i++) {
-		msg = hsi_char_msg_alloc(max_data_size);
+	for (i = 0; i < HSC_MSGS; i++) {
+		msg = hsc_msg_alloc(max_data_size);
 		if (!msg)
 			goto out;
 		msg->channel = channel->ch;
 		list_add_tail(&msg->link, &channel->free_msgs_list);
 	}
+
 	return 0;
 out:
-	hsi_char_msgs_free(channel);
+	hsc_free_list(&channel->free_msgs_list);
 
 	return -ENOMEM;
 }
 
-static int _hsi_char_release(struct hsi_char_channel *channel, int remove)
-{
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(channel->cl);
-	int ret = 0, refcnt;
-
-	spin_lock_bh(&channel->lock);
-	if (HSI_CHST_OC(channel) != HSI_CHST_OPENED)
-		goto out;
-	HSI_CHST_OC_SET(channel, HSI_CHST_CLOSING);
-	spin_unlock_bh(&channel->lock);
-
-	while (channel->wlrefcnt > 0) {
-		hsi_stop_tx(channel->cl);
-		channel->wlrefcnt--;
-	}
-
-	if (channel->rxpoll == HSI_CHAR_POLL_ON)
-		channel->poll_event |= POLLERR;
-
-	wake_up_interruptible(&channel->rx_wait);
-	wake_up_interruptible(&channel->tx_wait);
-
-	refcnt = atomic_dec_return(&cl_data->refcnt);
-	if (!refcnt) {
-		hsi_flush(channel->cl);
-		hsi_release_port(channel->cl);
-		cl_data->attached = 0;
-	}
-	hsi_char_msgs_free(channel);
-
-	spin_lock_bh(&channel->lock);
-	HSI_CHST_OC_SET(channel, HSI_CHST_CLOSED);
-	HSI_CHST_RD_SET(channel, HSI_CHST_READOFF);
-	HSI_CHST_WR_SET(channel, HSI_CHST_WRITEOFF);
-out:
-	if (remove)
-		channel->cl = NULL;
-	spin_unlock_bh(&channel->lock);
-
-	return ret;
-}
-
-static struct hsi_client_driver hsi_char_driver;
-static struct cdev hsi_char_cdev;
-static const struct file_operations hsi_char_fops;
-static struct class *hsi_char_class;
-
-static int __devinit hsi_char_probe(struct device *dev)
-{
-	struct hsi_char_client_data *cl_data = &hsi_char_cl_data;
-	struct hsi_char_channel *channel = cl_data->channels;
-	struct hsi_client *cl = to_hsi_client(dev);
-	char devname[] = "hsi_char";
-	int i;
-	int ret;
-
-	for (i = 0; i < HSI_CHAR_DEVS; i++, channel++) {
-		if (channel->state == HSI_CHST_AVAIL)
-			channel->cl = cl;
-	}
-	cl->hsi_start_rx = NULL;
-	cl->hsi_stop_rx = NULL;
-	atomic_set(&cl_data->refcnt, 0);
-	atomic_set(&cl_data->breq, 1);
-	cl_data->attached = 0;
-	hsi_client_set_drvdata(cl, cl_data);
-
-	ret = alloc_chrdev_region(&hsi_char_dev, 0, HSI_CHAR_DEVS, devname);
-	if (ret < 0) {
-		hsi_unregister_client_driver(&hsi_char_driver);
-		return ret;
-	}
-
-	cdev_init(&hsi_char_cdev, &hsi_char_fops);
-	ret = cdev_add(&hsi_char_cdev, hsi_char_dev, HSI_CHAR_DEVS);
-	if (ret) {
-		unregister_chrdev_region(hsi_char_dev, HSI_CHAR_DEVS);
-		hsi_unregister_client_driver(&hsi_char_driver);
-		return ret;
-	}
-
-	hsi_char_class = class_create(THIS_MODULE, "hsi");
-	if (IS_ERR(hsi_char_class))
-		pr_err("ERROR: hsi class creation failed!\n");
-
-	device_create(hsi_char_class, NULL, hsi_char_cdev.dev, NULL, devname);
-
-	return 0;
-}
-
-static int __devexit hsi_char_remove(struct device *dev)
-{
-	struct hsi_client *cl = to_hsi_client(dev);
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(cl);
-	struct hsi_char_channel *channel = cl_data->channels;
-	int i;
-
-	for (i = 0; i < HSI_CHAR_DEVS; i++, channel++) {
-		if (!(channel->state & HSI_CHST_AVAIL))
-			continue;
-		_hsi_char_release(channel, 1);
-	}
-
-	return 0;
-}
-
-static inline unsigned int hsi_char_msg_len_get(struct hsi_msg *msg)
+static inline unsigned int hsc_msg_len_get(struct hsi_msg *msg)
 {
 	return msg->sgt.sgl->length;
 }
 
-static inline void hsi_char_msg_len_set(struct hsi_msg *msg, unsigned int len)
+static inline void hsc_msg_len_set(struct hsi_msg *msg, unsigned int len)
 {
 	msg->sgt.sgl->length = len;
 }
 
-static void hsi_char_data_available(struct hsi_msg *msg)
+static void hsc_msg_destructor(struct hsi_msg *msg)
 {
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(msg->cl);
-	struct hsi_char_channel *channel = cl_data->channels + msg->channel;
-	int ret;
+	BUG_ON(!msg->complete);
+	msg->status = HSI_STATUS_ERROR;
+	hsc_msg_len_set(msg, 0);
+	msg->complete(msg);
+}
 
-	if (msg->status == HSI_STATUS_ERROR) {
-		ret = hsi_async_read(channel->cl, msg);
-		if (ret < 0) {
-			list_add_tail(&msg->link, &channel->free_msgs_list);
-			spin_lock_bh(&channel->lock);
-			list_add_tail(&msg->link, &channel->free_msgs_list);
-			channel->rxpoll = HSI_CHAR_POLL_OFF;
-			spin_unlock_bh(&channel->lock);
-		}
+static void hsc_rx_completed(struct hsi_msg *msg)
+{
+	struct hsc_client_data *cl_data = hsi_client_drvdata(msg->cl);
+	struct hsc_channel *channel = cl_data->channels + msg->channel;
+
+	if (test_bit(HSC_CH_READ, &channel->flags)) {
+		hsc_add_tail(channel, msg, &channel->rx_msgs_queue);
+		wake_up(&channel->rx_wait);
 	} else {
-		spin_lock_bh(&channel->lock);
-		channel->rxpoll = HSI_CHAR_POLL_OFF;
-		channel->poll_event |= (POLLIN | POLLRDNORM);
-		spin_unlock_bh(&channel->lock);
-		spin_lock_bh(&channel->lock);
-		list_add_tail(&msg->link, &channel->free_msgs_list);
-		spin_unlock_bh(&channel->lock);
-		wake_up_interruptible(&channel->rx_wait);
+		hsc_add_tail(channel, msg, &channel->free_msgs_list);
 	}
 }
 
-static void hsi_char_rx_completed(struct hsi_msg *msg)
+static void hsc_poll_completed(struct hsi_msg *msg)
 {
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(msg->cl);
-	struct hsi_char_channel *channel = cl_data->channels + msg->channel;
+	struct hsc_client_data *cl_data = hsi_client_drvdata(msg->cl);
+	struct hsc_channel *channel = cl_data->channels + msg->channel;
 
 	spin_lock_bh(&channel->lock);
-	list_add_tail(&msg->link, &channel->rx_msgs_queue);
+	channel->poll_event |= POLLIN | POLLRDNORM;
+	if (msg->status == HSI_STATUS_ERROR)
+		channel->poll_event |= POLLERR;
+	clear_bit(HSC_CH_POLL, &channel->flags);
 	spin_unlock_bh(&channel->lock);
-	wake_up_interruptible(&channel->rx_wait);
+	hsc_add_tail(channel, msg, &channel->free_msgs_list);
+	wake_up(&channel->rx_wait);
 }
 
-static void hsi_char_rx_msg_destructor(struct hsi_msg *msg)
+static void hsc_tx_completed(struct hsi_msg *msg)
 {
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(msg->cl);
-	struct hsi_char_channel *channel = cl_data->channels + msg->channel;
+	struct hsc_client_data *cl_data = hsi_client_drvdata(msg->cl);
+	struct hsc_channel *channel = cl_data->channels + msg->channel;
 
-	spin_lock_bh(&channel->lock);
-	list_add_tail(&msg->link, &channel->free_msgs_list);
-	HSI_CHST_RD_SET(channel, HSI_CHST_READOFF);
-	spin_unlock_bh(&channel->lock);
-}
-
-static void hsi_char_rx_poll_destructor(struct hsi_msg *msg)
-{
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(msg->cl);
-	struct hsi_char_channel *channel = cl_data->channels + msg->channel;
-
-	spin_lock_bh(&channel->lock);
-	list_add_tail(&msg->link, &channel->free_msgs_list);
-	channel->rxpoll = HSI_CHAR_POLL_RST;
-	spin_unlock_bh(&channel->lock);
-}
-
-static int hsi_char_rx_poll(struct hsi_char_channel *channel)
-{
-	struct hsi_msg *msg;
-	int ret = 0;
-
-	spin_lock_bh(&channel->lock);
-	if (list_empty(&channel->free_msgs_list)) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	if (channel->rxpoll == HSI_CHAR_POLL_ON)
-		goto out;
-	msg = list_first_entry(&channel->free_msgs_list, struct hsi_msg, link);
-	list_del(&msg->link);
-	channel->rxpoll = HSI_CHAR_POLL_ON;
-	spin_unlock_bh(&channel->lock);
-	hsi_char_msg_len_set(msg, 0);
-	msg->complete = hsi_char_data_available;
-	msg->destructor = hsi_char_rx_poll_destructor;
-	/* don't touch msg->context! */
-	ret = hsi_async_read(channel->cl, msg);
-	spin_lock_bh(&channel->lock);
-	if (ret < 0) {
-		list_add_tail(&msg->link, &channel->free_msgs_list);
-		channel->rxpoll = HSI_CHAR_POLL_OFF;
-		goto out;
-	}
-out:
-	spin_unlock_bh(&channel->lock);
-
-	return ret;
-}
-
-static void hsi_char_tx_completed(struct hsi_msg *msg)
-{
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(msg->cl);
-	struct hsi_char_channel *channel = cl_data->channels + msg->channel;
-
-	spin_lock_bh(&channel->lock);
-	list_add_tail(&msg->link, &channel->tx_msgs_queue);
-	channel->poll_event |= (POLLOUT | POLLWRNORM);
-	spin_unlock_bh(&channel->lock);
-	wake_up_interruptible(&channel->tx_wait);
-}
-
-static void hsi_char_tx_msg_destructor(struct hsi_msg *msg)
-{
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(msg->cl);
-	struct hsi_char_channel *channel = cl_data->channels + msg->channel;
-
-	spin_lock_bh(&channel->lock);
-	list_add_tail(&msg->link, &channel->free_msgs_list);
-	HSI_CHST_WR_SET(channel, HSI_CHST_WRITEOFF);
-	spin_unlock_bh(&channel->lock);
-}
-
-static void hsi_char_rx_poll_rst(struct hsi_client *cl)
-{
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(cl);
-	struct hsi_char_channel *channel = cl_data->channels;
-	int i;
-
-	for (i = 0; i < HSI_CHAR_DEVS; i++, channel++) {
-		if ((HSI_CHST_OC(channel) == HSI_CHST_OPENED) &&
-			(channel->rxpoll == HSI_CHAR_POLL_RST))
-			hsi_char_rx_poll(channel);
+	if (test_bit(HSC_CH_WRITE, &channel->flags)) {
+		hsc_add_tail(channel, msg, &channel->tx_msgs_queue);
+		wake_up(&channel->tx_wait);
+	} else {
+		hsc_add_tail(channel, msg, &channel->free_msgs_list);
 	}
 }
 
-static void hsi_char_reset(struct hsi_client *cl)
+static void hsc_break_req_destructor(struct hsi_msg *msg)
 {
-	hsi_flush(cl);
-	hsi_char_rx_poll_rst(cl);
-}
-
-static void hsi_char_rx_cancel(struct hsi_char_channel *channel)
-{
-	hsi_flush(channel->cl);
-	hsi_char_rx_poll_rst(channel->cl);
-}
-
-static void hsi_char_tx_cancel(struct hsi_char_channel *channel)
-{
-	hsi_flush(channel->cl);
-	hsi_char_rx_poll_rst(channel->cl);
-}
-
-static void hsi_char_bcast_break(struct hsi_client *cl)
-{
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(cl);
-	struct hsi_char_channel *channel = cl_data->channels;
-	int i;
-
-	for (i = 0; i < HSI_CHAR_DEVS; i++, channel++) {
-		if (HSI_CHST_OC(channel) != HSI_CHST_OPENED)
-			continue;
-		channel->poll_event |= POLLPRI;
-		wake_up_interruptible(&channel->rx_wait);
-		wake_up_interruptible(&channel->tx_wait);
-	}
-}
-
-static void hsi_char_break_received(struct hsi_msg *msg)
-{
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(msg->cl);
-	int ret;
-
-	hsi_char_bcast_break(msg->cl);
-	ret = hsi_async_read(msg->cl, msg);
-	if (ret < 0) {
-		hsi_free_msg(msg);
-		atomic_inc(&cl_data->breq);
-	}
-}
-
-static void hsi_char_break_req_destructor(struct hsi_msg *msg)
-{
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(msg->cl);
+	struct hsc_client_data *cl_data = hsi_client_drvdata(msg->cl);
 
 	hsi_free_msg(msg);
-	atomic_inc(&cl_data->breq);
+	clear_bit(HSC_RXBREAK, &cl_data->flags);
 }
 
-static int hsi_char_break_request(struct hsi_client *cl)
+static void hsc_break_received(struct hsi_msg *msg)
 {
-	struct hsi_char_client_data *cl_data = hsi_client_drvdata(cl);
-	struct hsi_msg *msg;
-	int ret = 0;
+	struct hsc_client_data *cl_data = hsi_client_drvdata(msg->cl);
+	struct hsc_channel *channel = cl_data->channels;
+	int i, ret;
 
-	if (!atomic_dec_and_test(&cl_data->breq)) {
-		atomic_inc(&cl_data->breq);
-		return -EBUSY;
+	/* Broadcast HWBREAK on all channels */
+	for (i = 0; i < HSC_DEVS; i++, channel++) {
+		struct hsi_msg *msg2;
+
+		if (!test_bit(HSC_CH_READ, &channel->flags))
+			continue;
+		msg2 = hsc_get_first_msg(channel, &channel->free_msgs_list);
+		if (!msg2)
+			continue;
+		clear_bit(HSC_CH_READ, &channel->flags);
+		hsc_msg_len_set(msg2, 0);
+		msg2->status = HSI_STATUS_COMPLETED;
+		hsc_add_tail(channel, msg2, &channel->rx_msgs_queue);
+		wake_up(&channel->rx_wait);
 	}
+	hsi_flush(msg->cl);
+	ret = hsi_async_read(msg->cl, msg);
+	if (ret < 0)
+		hsc_break_req_destructor(msg);
+}
+
+static int hsc_break_request(struct hsi_client *cl)
+{
+	struct hsc_client_data *cl_data = hsi_client_drvdata(cl);
+	struct hsi_msg *msg;
+	int ret;
+
+	if (test_and_set_bit(HSC_RXBREAK, &cl_data->flags))
+		return -EBUSY;
+
 	msg = hsi_alloc_msg(0, GFP_KERNEL);
-	if (!msg)
+	if (!msg) {
+		clear_bit(HSC_RXBREAK, &cl_data->flags);
 		return -ENOMEM;
+	}
 	msg->break_frame = 1;
-	msg->complete = hsi_char_break_received;
-	msg->destructor = hsi_char_break_req_destructor;
+	msg->complete = hsc_break_received;
+	msg->destructor = hsc_break_req_destructor;
 	ret = hsi_async_read(cl, msg);
 	if (ret < 0)
-		hsi_free_msg(msg);
+		hsc_break_req_destructor(msg);
 
 	return ret;
 }
 
-static int hsi_char_break_send(struct hsi_client *cl)
+static int hsc_break_send(struct hsi_client *cl)
 {
 	struct hsi_msg *msg;
-	int ret = 0;
+	int ret;
 
 	msg = hsi_alloc_msg(0, GFP_ATOMIC);
 	if (!msg)
@@ -535,401 +364,235 @@ static int hsi_char_break_send(struct hsi_client *cl)
 	return ret;
 }
 
-static inline int ssi_check_common_cfg(struct hsi_config *cfg)
+static int hsc_rx_set(struct hsi_client *cl, struct hsc_rx_config *rxc)
 {
-	if ((cfg->mode != HSI_MODE_STREAM) && (cfg->mode != HSI_MODE_FRAME))
-		return -EINVAL;
-	if ((cfg->channels == 0) || (cfg->channels > HSI_CHAR_CHANNELS))
-		return -EINVAL;
-	if (cfg->channels & (cfg->channels - 1))
-		return -EINVAL;
-
-	return 0;
-}
-
-static inline int ssi_check_rx_cfg(struct hsi_config *cfg)
-{
+	struct hsi_config tmp;
 	int ret;
 
-	ret = ssi_check_common_cfg(cfg);
-	if (ret < 0)
-		return ret;
-	if ((cfg->flow != HSI_FLOW_SYNC) && (cfg->flow != HSI_FLOW_PIPE))
+	if ((rxc->mode != HSI_MODE_STREAM) && (rxc->mode != HSI_MODE_FRAME))
 		return -EINVAL;
-
-	return 0;
-}
-
-static inline int ssi_check_tx_cfg(struct hsi_config *cfg)
-{
-	int ret;
-
-	ret = ssi_check_common_cfg(cfg);
-	if (ret < 0)
-		return ret;
-	if ((cfg->arb_mode != HSI_ARB_RR) && (cfg->arb_mode != HSI_ARB_PRIO))
+	if ((rxc->channels == 0) || (rxc->channels > HSC_DEVS))
 		return -EINVAL;
-
-	return 0;
-}
-
-static inline int hsi_char_cfg_set(struct hsi_client *cl,
-						struct hsi_config *cfg, int dir)
-{
-	struct hsi_config *rxtx_cfg;
-	int ret = 0;
-
-	if (dir == HSI_CHAR_RX) {
-		rxtx_cfg = &cl->rx_cfg;
-		ret = ssi_check_rx_cfg(cfg);
-	} else {
-		rxtx_cfg = &cl->tx_cfg;
-		ret = ssi_check_tx_cfg(cfg);
-	}
-	if (ret < 0)
-		return ret;
-
-	*rxtx_cfg = *cfg;
+	if (rxc->channels & (rxc->channels - 1))
+		return -EINVAL;
+	if ((rxc->flow != HSI_FLOW_SYNC) && (rxc->flow != HSI_FLOW_PIPE))
+		return -EINVAL;
+	tmp = cl->rx_cfg;
+	cl->rx_cfg.mode = rxc->mode;
+	cl->rx_cfg.channels = rxc->channels;
+	cl->rx_cfg.flow = rxc->flow;
 	ret = hsi_setup(cl);
-	if (ret < 0)
+	if (ret < 0) {
+		cl->rx_cfg = tmp;
 		return ret;
-
-	if ((dir == HSI_CHAR_RX) && (cfg->mode == HSI_MODE_FRAME))
-		hsi_char_break_request(cl);
+	}
+	if (rxc->mode == HSI_MODE_FRAME)
+		hsc_break_request(cl);
 
 	return ret;
 }
 
-static inline void hsi_char_cfg_get(struct hsi_client *cl,
-						struct hsi_config *cfg, int dir)
+static inline void hsc_rx_get(struct hsi_client *cl, struct hsc_rx_config *rxc)
 {
-	struct hsi_config *rxtx_cfg;
-
-	if (dir == HSI_CHAR_RX)
-		rxtx_cfg = &cl->rx_cfg;
-	else
-		rxtx_cfg = &cl->tx_cfg;
-	*cfg = *rxtx_cfg;
+	rxc->mode = cl->rx_cfg.mode;
+	rxc->channels = cl->rx_cfg.channels;
+	rxc->flow = cl->rx_cfg.flow;
 }
 
-static inline void hsi_char_rx2icfg(struct hsi_config *cfg,
-						struct hsc_rx_config *rx_cfg)
+static int hsc_tx_set(struct hsi_client *cl, struct hsc_tx_config *txc)
 {
-	cfg->mode = rx_cfg->mode;
-	cfg->flow = rx_cfg->flow;
-	cfg->channels = rx_cfg->channels;
-	cfg->speed = 0;
+	struct hsi_config tmp;
+	int ret;
+
+	if ((txc->mode != HSI_MODE_STREAM) && (txc->mode != HSI_MODE_FRAME))
+		return -EINVAL;
+	if ((txc->channels == 0) || (txc->channels > HSC_DEVS))
+		return -EINVAL;
+	if (txc->channels & (txc->channels - 1))
+		return -EINVAL;
+	if ((txc->arb_mode != HSI_ARB_RR) && (txc->arb_mode != HSI_ARB_PRIO))
+		return -EINVAL;
+	tmp = cl->tx_cfg;
+	cl->tx_cfg.mode = txc->mode;
+	cl->tx_cfg.channels = txc->channels;
+	cl->tx_cfg.speed = txc->speed;
+	cl->tx_cfg.arb_mode = txc->arb_mode;
+	ret = hsi_setup(cl);
+	if (ret < 0) {
+		cl->tx_cfg = tmp;
+		return ret;
+	}
+
+	return ret;
 }
 
-static inline void hsi_char_tx2icfg(struct hsi_config *cfg,
-						struct hsc_tx_config *tx_cfg)
+static inline void hsc_tx_get(struct hsi_client *cl, struct hsc_tx_config *txc)
 {
-	int ch;
-
-	cfg->mode = tx_cfg->mode;
-	cfg->channels = tx_cfg->channels;
-	cfg->speed = tx_cfg->speed;
-	cfg->arb_mode = tx_cfg->arb_mode;
-	for (ch = 0; ch < HSI_MAX_CHANNELS; ch++)
-		cfg->ch_prio[ch] = (tx_cfg->priority >> ch) & 1;
+	txc->mode = cl->tx_cfg.mode;
+	txc->channels = cl->tx_cfg.channels;
+	txc->speed = cl->tx_cfg.speed;
+	txc->arb_mode = cl->tx_cfg.arb_mode;
 }
 
-static inline void hsi_char_rx2ecfg(struct hsc_rx_config *rx_cfg,
-							struct hsi_config *cfg)
+static ssize_t hsc_read(struct file *file, char __user *buf, size_t len,
+						loff_t *ppos __maybe_unused)
 {
-	rx_cfg->mode = cfg->mode;
-	rx_cfg->flow = cfg->flow;
-	rx_cfg->channels = cfg->channels;
-}
-
-static inline void hsi_char_tx2ecfg(struct hsc_tx_config *tx_cfg,
-							struct hsi_config *cfg)
-{
-	int ch;
-
-	tx_cfg->mode = cfg->mode;
-	tx_cfg->channels = cfg->channels;
-	tx_cfg->speed = cfg->speed;
-	tx_cfg->arb_mode = cfg->arb_mode;
-	tx_cfg->priority = 0;
-	for (ch = 0; ch < HSI_MAX_CHANNELS; ch++)
-		if (cfg->ch_prio[ch])
-			tx_cfg->priority |= (1 << ch);
-}
-
-static ssize_t hsi_char_read(struct file *file, char __user *buf,
-						size_t len, loff_t *ppos)
-{
-	struct hsi_char_channel *channel = file->private_data;
-	struct hsi_msg *msg = NULL;
+	struct hsc_channel *channel = file->private_data;
+	struct hsi_msg *msg;
 	ssize_t ret;
 
-	if (len == 0) {
-		channel->poll_event &= ~POLLPRI;
+	if (len == 0)
 		return 0;
-	}
-	channel->poll_event &= ~POLLPRI;
-
 	if (!IS_ALIGNED(len, sizeof(u32)))
 		return -EINVAL;
-
 	if (len > max_data_size)
 		len = max_data_size;
-
-	spin_lock_bh(&channel->lock);
-	if (HSI_CHST_OC(channel) != HSI_CHST_OPENED) {
-		ret = -ENODEV;
+	if (channel->ch >= channel->cl->rx_cfg.channels)
+		return -ECHRNG;
+	if (test_and_set_bit(HSC_CH_READ, &channel->flags))
+		return -EBUSY;
+	msg = hsc_get_first_msg(channel, &channel->free_msgs_list);
+	if (!msg) {
+		ret = -ENOSPC;
 		goto out;
 	}
-	if (HSI_CHST_RD(channel) != HSI_CHST_READOFF) {
-		ret = -EBUSY;
-		goto out;
-	}
-	if (channel->ch >= channel->cl->rx_cfg.channels) {
-		ret = -ENODEV;
-		goto out;
-	}
-	if (list_empty(&channel->free_msgs_list)) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	msg = list_first_entry(&channel->free_msgs_list, struct hsi_msg, link);
-	list_del(&msg->link);
-	spin_unlock_bh(&channel->lock);
-	hsi_char_msg_len_set(msg, len);
-	msg->complete = hsi_char_rx_completed;
-	msg->destructor = hsi_char_rx_msg_destructor;
+	hsc_msg_len_set(msg, len);
+	msg->complete = hsc_rx_completed;
+	msg->destructor = hsc_msg_destructor;
 	ret = hsi_async_read(channel->cl, msg);
-	spin_lock_bh(&channel->lock);
-	if (ret < 0)
+	channel->poll_event = 0;
+	if (ret < 0) {
+		hsc_add_tail(channel, msg, &channel->free_msgs_list);
 		goto out;
-	HSI_CHST_RD_SET(channel, HSI_CHST_READING);
-	msg = NULL;
+	}
 
-	for ( ; ; ) {
-		DEFINE_WAIT(wait);
+	ret = wait_event_interruptible(channel->rx_wait,
+					!list_empty(&channel->rx_msgs_queue));
+	if (ret < 0) {
+		clear_bit(HSC_CH_READ, &channel->flags);
+		hsi_flush(channel->cl);
+		return -EINTR;
+	}
 
-		if (!list_empty(&channel->rx_msgs_queue)) {
-			msg = list_first_entry(&channel->rx_msgs_queue,
-					struct hsi_msg, link);
-			HSI_CHST_RD_SET(channel, HSI_CHST_READOFF);
-			channel->poll_event &= ~(POLLIN | POLLRDNORM);
-			list_del(&msg->link);
-			spin_unlock_bh(&channel->lock);
-			if (msg->status == HSI_STATUS_ERROR) {
-				ret = -EIO;
-			} else {
-				ret = copy_to_user((void __user *)buf,
-						msg->context,
-						hsi_char_msg_len_get(msg));
-				if (ret)
-					ret = -EFAULT;
-				else
-					ret = hsi_char_msg_len_get(msg);
-			}
-			spin_lock_bh(&channel->lock);
-			break;
-		} else if (signal_pending(current)) {
-			spin_unlock_bh(&channel->lock);
-			hsi_char_rx_cancel(channel);
-			spin_lock_bh(&channel->lock);
-			HSI_CHST_RD_SET(channel, HSI_CHST_READOFF);
-			ret = -EINTR;
-			break;
-		} else if ((HSI_CHST_OC(channel) == HSI_CHST_CLOSING) ||
-				(HSI_CHST_OC(channel) == HSI_CHST_CLOSING)) {
+	msg = hsc_get_first_msg(channel, &channel->rx_msgs_queue);
+	if (msg) {
+		if (msg->status != HSI_STATUS_ERROR) {
+			ret = copy_to_user((void __user *)buf,
+			sg_virt(msg->sgt.sgl), hsc_msg_len_get(msg));
+			if (ret)
+				ret = -EFAULT;
+			else
+				ret = hsc_msg_len_get(msg);
+		} else {
 			ret = -EIO;
-			break;
 		}
-		prepare_to_wait(&channel->rx_wait, &wait, TASK_INTERRUPTIBLE);
-		spin_unlock_bh(&channel->lock);
-
-		schedule();
-
-		spin_lock_bh(&channel->lock);
-		finish_wait(&channel->rx_wait, &wait);
+		hsc_add_tail(channel, msg, &channel->free_msgs_list);
 	}
 out:
-	if (msg)
-		list_add_tail(&msg->link, &channel->free_msgs_list);
-	spin_unlock_bh(&channel->lock);
+	clear_bit(HSC_CH_READ, &channel->flags);
 
 	return ret;
 }
 
-static ssize_t hsi_char_write(struct file *file, const char __user *buf,
-						size_t len, loff_t *ppos)
+static ssize_t hsc_write(struct file *file, const char __user *buf, size_t len,
+						loff_t *ppos __maybe_unused)
 {
-	struct hsi_char_channel *channel = file->private_data;
-	struct hsi_msg *msg = NULL;
+	struct hsc_channel *channel = file->private_data;
+	struct hsi_msg *msg;
 	ssize_t ret;
 
 	if ((len == 0) || !IS_ALIGNED(len, sizeof(u32)))
 		return -EINVAL;
-
 	if (len > max_data_size)
 		len = max_data_size;
-
-	spin_lock_bh(&channel->lock);
-	if (HSI_CHST_OC(channel) != HSI_CHST_OPENED) {
-		ret = -ENODEV;
-		goto out;
+	if (channel->ch >= channel->cl->tx_cfg.channels)
+		return -ECHRNG;
+	if (test_and_set_bit(HSC_CH_WRITE, &channel->flags))
+		return -EBUSY;
+	msg = hsc_get_first_msg(channel, &channel->free_msgs_list);
+	if (!msg) {
+		clear_bit(HSC_CH_WRITE, &channel->flags);
+		return -ENOSPC;
 	}
-	if (HSI_CHST_WR(channel) != HSI_CHST_WRITEOFF) {
-		ret = -EBUSY;
-		goto out;
-	}
-	if (channel->ch >= channel->cl->tx_cfg.channels) {
-		ret = -ENODEV;
-		goto out;
-	}
-	if (list_empty(&channel->free_msgs_list)) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	msg = list_first_entry(&channel->free_msgs_list, struct hsi_msg, link);
-	list_del(&msg->link);
-	HSI_CHST_WR_SET(channel, HSI_CHST_WRITEON);
-	spin_unlock_bh(&channel->lock);
-
-	if (copy_from_user(msg->context, (void __user *)buf, len)) {
-		spin_lock_bh(&channel->lock);
-		HSI_CHST_WR_SET(channel, HSI_CHST_WRITEOFF);
+	if (copy_from_user(sg_virt(msg->sgt.sgl), (void __user *)buf, len)) {
 		ret = -EFAULT;
 		goto out;
 	}
-
-	hsi_char_msg_len_set(msg, len);
-	msg->complete = hsi_char_tx_completed;
-	msg->destructor = hsi_char_tx_msg_destructor;
-	channel->poll_event &= ~(POLLOUT | POLLWRNORM);
+	hsc_msg_len_set(msg, len);
+	msg->complete = hsc_tx_completed;
+	msg->destructor = hsc_msg_destructor;
 	ret = hsi_async_write(channel->cl, msg);
-	spin_lock_bh(&channel->lock);
-	if (ret < 0) {
-		channel->poll_event |= (POLLOUT | POLLWRNORM);
-		HSI_CHST_WR_SET(channel, HSI_CHST_WRITEOFF);
+	if (ret < 0)
 		goto out;
+
+	ret = wait_event_interruptible(channel->tx_wait,
+					!list_empty(&channel->tx_msgs_queue));
+	if (ret < 0) {
+		clear_bit(HSC_CH_WRITE, &channel->flags);
+		hsi_flush(channel->cl);
+		return -EINTR;
 	}
-	HSI_CHST_WR_SET(channel, HSI_CHST_WRITING);
-	msg = NULL;
 
-	for ( ; ; ) {
-		DEFINE_WAIT(wait);
-
-		if (!list_empty(&channel->tx_msgs_queue)) {
-			msg = list_first_entry(&channel->tx_msgs_queue,
-					struct hsi_msg, link);
-			list_del(&msg->link);
-			HSI_CHST_WR_SET(channel, HSI_CHST_WRITEOFF);
-			if (msg->status == HSI_STATUS_ERROR)
-				ret = -EIO;
-			else
-				ret = hsi_char_msg_len_get(msg);
-			break;
-		} else if (signal_pending(current)) {
-			spin_unlock_bh(&channel->lock);
-			hsi_char_tx_cancel(channel);
-			spin_lock_bh(&channel->lock);
-			HSI_CHST_WR_SET(channel, HSI_CHST_WRITEOFF);
-			ret = -EINTR;
-			break;
-		} else if ((HSI_CHST_OC(channel) == HSI_CHST_CLOSING) ||
-				(HSI_CHST_OC(channel) == HSI_CHST_CLOSING)) {
+	msg = hsc_get_first_msg(channel, &channel->tx_msgs_queue);
+	if (msg) {
+		if (msg->status == HSI_STATUS_ERROR)
 			ret = -EIO;
-			break;
-		}
-		prepare_to_wait(&channel->tx_wait, &wait, TASK_INTERRUPTIBLE);
-		spin_unlock_bh(&channel->lock);
+		else
+			ret = hsc_msg_len_get(msg);
 
-		schedule();
-
-		spin_lock_bh(&channel->lock);
-		finish_wait(&channel->tx_wait, &wait);
+		hsc_add_tail(channel, msg, &channel->free_msgs_list);
 	}
 out:
-	if (msg)
-		list_add_tail(&msg->link, &channel->free_msgs_list);
-
-	spin_unlock_bh(&channel->lock);
+	clear_bit(HSC_CH_WRITE, &channel->flags);
 
 	return ret;
 }
 
-static unsigned int hsi_char_poll(struct file *file, poll_table *wait)
+static long hsc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	struct hsi_char_channel *channel = file->private_data;
-	unsigned int ret;
-
-	spin_lock_bh(&channel->lock);
-	if ((HSI_CHST_OC(channel) != HSI_CHST_OPENED) ||
-		(channel->ch >= channel->cl->rx_cfg.channels)) {
-		spin_unlock_bh(&channel->lock);
-		return -ENODEV;
-	}
-	poll_wait(file, &channel->rx_wait, wait);
-	poll_wait(file, &channel->tx_wait, wait);
-	ret = channel->poll_event;
-	spin_unlock_bh(&channel->lock);
-	hsi_char_rx_poll(channel);
-
-	return ret;
-}
-
-static long hsi_char_ioctl(struct file *file, unsigned int cmd,
-							unsigned long arg)
-{
-	struct hsi_char_channel *channel = file->private_data;
+	struct hsc_channel *channel = file->private_data;
 	unsigned int state;
-	struct hsi_config cfg;
-	struct hsc_rx_config rx_cfg;
-	struct hsc_tx_config tx_cfg;
+	struct hsc_rx_config rxc;
+	struct hsc_tx_config txc;
 	long ret = 0;
-
-	if (HSI_CHST_OC(channel) != HSI_CHST_OPENED)
-		return -ENODEV;
 
 	switch (cmd) {
 	case HSC_RESET:
-		hsi_char_reset(channel->cl);
+		hsi_flush(channel->cl);
 		break;
 	case HSC_SET_PM:
 		if (copy_from_user(&state, (void __user *)arg, sizeof(state)))
 			return -EFAULT;
 		if (state == HSC_PM_DISABLE) {
+			if (test_and_set_bit(HSC_CH_WLINE, &channel->flags))
+				return -EINVAL;
 			ret = hsi_start_tx(channel->cl);
-			if (!ret)
-				channel->wlrefcnt++;
-		} else if ((state == HSC_PM_ENABLE)
-				&& (channel->wlrefcnt > 0)) {
+		} else if (state == HSC_PM_ENABLE) {
+			if (!test_and_clear_bit(HSC_CH_WLINE, &channel->flags))
+				return -EINVAL;
 			ret = hsi_stop_tx(channel->cl);
-			if (!ret)
-				channel->wlrefcnt--;
 		} else {
 			ret = -EINVAL;
 		}
 		break;
 	case HSC_SEND_BREAK:
-		return hsi_char_break_send(channel->cl);
+		return hsc_break_send(channel->cl);
 	case HSC_SET_RX:
-		if (copy_from_user(&rx_cfg, (void __user *)arg, sizeof(rx_cfg)))
+		if (copy_from_user(&rxc, (void __user *)arg, sizeof(rxc)))
 			return -EFAULT;
-		hsi_char_rx2icfg(&cfg, &rx_cfg);
-		return hsi_char_cfg_set(channel->cl, &cfg, HSI_CHAR_RX);
+		return hsc_rx_set(channel->cl, &rxc);
 	case HSC_GET_RX:
-		hsi_char_cfg_get(channel->cl, &cfg, HSI_CHAR_RX);
-		hsi_char_rx2ecfg(&rx_cfg, &cfg);
-		if (copy_to_user((void __user *)arg, &rx_cfg, sizeof(rx_cfg)))
+		hsc_rx_get(channel->cl, &rxc);
+		if (copy_to_user((void __user *)arg, &rxc, sizeof(rxc)))
 			return -EFAULT;
 		break;
 	case HSC_SET_TX:
-		if (copy_from_user(&tx_cfg, (void __user *)arg, sizeof(tx_cfg)))
+		if (copy_from_user(&txc, (void __user *)arg, sizeof(txc)))
 			return -EFAULT;
-		hsi_char_tx2icfg(&cfg, &tx_cfg);
-		return hsi_char_cfg_set(channel->cl, &cfg, HSI_CHAR_TX);
+		return hsc_tx_set(channel->cl, &txc);
 	case HSC_GET_TX:
-		hsi_char_cfg_get(channel->cl, &cfg, HSI_CHAR_TX);
-		hsi_char_tx2ecfg(&tx_cfg, &cfg);
-		if (copy_to_user((void __user *)arg, &tx_cfg, sizeof(tx_cfg)))
+		hsc_tx_get(channel->cl, &txc);
+		if (copy_to_user((void __user *)arg, &txc, sizeof(txc)))
 			return -EFAULT;
 		break;
 	default:
@@ -939,127 +602,245 @@ static long hsi_char_ioctl(struct file *file, unsigned int cmd,
 	return ret;
 }
 
-static int hsi_char_open(struct inode *inode, struct file *file)
+static ssize_t hsc_poll_read(struct hsc_channel *channel)
 {
-	struct hsi_char_client_data *cl_data = &hsi_char_cl_data;
-	struct hsi_char_channel *channel = cl_data->channels + iminor(inode);
-	int ret = 0, refcnt;
+	struct hsi_msg *msg;
+	ssize_t ret;
 
-	spin_lock_bh(&channel->lock);
-	if ((channel->state == HSI_CHST_UNAVAIL) || (!channel->cl)) {
-		ret = -ENODEV;
+	if (test_and_set_bit(HSC_CH_POLL, &channel->flags))
+		return -EBUSY;
+	msg = hsc_get_first_msg(channel, &channel->free_msgs_list);
+	if (!msg) {
+		ret = -ENOSPC;
 		goto out;
 	}
-	if (HSI_CHST_OC(channel) != HSI_CHST_CLOSED) {
-		ret = -EBUSY;
-		goto out;
-	}
-	HSI_CHST_OC_SET(channel, HSI_CHST_OPENING);
-	spin_unlock_bh(&channel->lock);
 
-	refcnt = atomic_inc_return(&cl_data->refcnt);
-	if (refcnt == 1) {
-		if (cl_data->attached) {
-			atomic_dec(&cl_data->refcnt);
-			spin_lock_bh(&channel->lock);
-			HSI_CHST_OC_SET(channel, HSI_CHST_CLOSED);
-			ret = -EBUSY;
-			goto out;
-		}
-		ret = hsi_claim_port(channel->cl, 0);
-		if (ret < 0) {
-			atomic_dec(&cl_data->refcnt);
-			spin_lock_bh(&channel->lock);
-			HSI_CHST_OC_SET(channel, HSI_CHST_CLOSED);
-			goto out;
-		}
-		hsi_setup(channel->cl);
-	} else if (!cl_data->attached) {
-		atomic_dec(&cl_data->refcnt);
-		spin_lock_bh(&channel->lock);
-		HSI_CHST_OC_SET(channel, HSI_CHST_CLOSED);
-		ret = -ENODEV;
-		goto out;
-	}
-	ret = hsi_char_msgs_alloc(channel);
-
+	hsc_msg_len_set(msg, 0);
+	msg->complete = hsc_poll_completed;
+	msg->destructor = hsc_msg_destructor;
+	ret = hsi_async_read(channel->cl, msg);
 	if (ret < 0) {
-		refcnt = atomic_dec_return(&cl_data->refcnt);
-		if (!refcnt)
-			hsi_release_port(channel->cl);
-		spin_lock_bh(&channel->lock);
-		HSI_CHST_OC_SET(channel, HSI_CHST_CLOSED);
+		hsc_add_tail(channel, msg, &channel->free_msgs_list);
 		goto out;
 	}
-	if (refcnt == 1)
-		cl_data->attached = 1;
-	channel->wlrefcnt = 0;
-	channel->rxpoll = HSI_CHAR_POLL_OFF;
-	channel->poll_event = (POLLOUT | POLLWRNORM);
-	file->private_data = channel;
-	spin_lock_bh(&channel->lock);
-	HSI_CHST_OC_SET(channel, HSI_CHST_OPENED);
+	return 0;
+
 out:
-	spin_unlock_bh(&channel->lock);
+	clear_bit(HSC_CH_POLL, &channel->flags);
 
 	return ret;
 }
 
-static int hsi_char_release(struct inode *inode, struct file *file)
+static unsigned int hsc_poll(struct file *file, poll_table *wait)
 {
-	struct hsi_char_channel *channel = file->private_data;
-	return _hsi_char_release(channel, 0);
+	struct hsc_channel *channel = file->private_data;
+	unsigned int ret;
+
+	if (channel->ch >= channel->cl->rx_cfg.channels)
+		return -ECHRNG;
+
+	spin_lock_bh(&channel->lock);
+	poll_wait(file, &channel->rx_wait, wait);
+	poll_wait(file, &channel->tx_wait, wait);
+	ret = channel->poll_event | POLLOUT | POLLWRNORM;
+	spin_unlock_bh(&channel->lock);
+	hsc_poll_read(channel);
+
+	return ret;
 }
 
-static int hsi_char_fasync(int fd, struct file *file, int on)
+static inline void __hsc_port_release(struct hsc_client_data *cl_data)
 {
-	struct hsi_char_channel *channel = file->private_data;
+	BUG_ON(cl_data->usecnt == 0);
 
-	if (fasync_helper(fd, file, on, &channel->async_queue) < 0)
-		return -EIO;
+	if (--cl_data->usecnt == 0) {
+		hsi_flush(cl_data->cl);
+		hsi_release_port(cl_data->cl);
+	}
+}
+
+static int hsc_open(struct inode *inode, struct file *file)
+{
+	struct hsc_client_data *cl_data;
+	struct hsc_channel *channel;
+	int ret = 0;
+
+	pr_debug("open, minor = %d\n", iminor(inode));
+
+	cl_data = container_of(inode->i_cdev, struct hsc_client_data, cdev);
+	mutex_lock(&cl_data->lock);
+	channel = cl_data->channels + (iminor(inode) & HSC_CH_MASK);
+
+	if (test_and_set_bit(HSC_CH_OPEN, &channel->flags)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	/*
+	 * Check if we have already claimed the port associated to the HSI
+	 * client. If not then try to claim it, else increase its refcount
+	 */
+	if (cl_data->usecnt == 0) {
+		ret = hsi_claim_port(cl_data->cl, 0);
+		if (ret < 0)
+			goto out;
+		hsi_setup(cl_data->cl);
+	}
+	cl_data->usecnt++;
+
+	ret = hsc_msgs_alloc(channel);
+	if (ret < 0) {
+		__hsc_port_release(cl_data);
+		goto out;
+	}
+
+	file->private_data = channel;
+	mutex_unlock(&cl_data->lock);
+
+	return ret;
+out:
+	mutex_unlock(&cl_data->lock);
+
+	return ret;
+}
+
+static int hsc_release(struct inode *inode __maybe_unused, struct file *file)
+{
+	struct hsc_channel *channel = file->private_data;
+	struct hsc_client_data *cl_data = channel->cl_data;
+
+	mutex_lock(&cl_data->lock);
+	file->private_data = NULL;
+	if (test_and_clear_bit(HSC_CH_WLINE, &channel->flags))
+		hsi_stop_tx(channel->cl);
+	__hsc_port_release(cl_data);
+	hsc_reset_list(channel, &channel->rx_msgs_queue);
+	hsc_reset_list(channel, &channel->tx_msgs_queue);
+	hsc_reset_list(channel, &channel->free_msgs_list);
+	clear_bit(HSC_CH_READ, &channel->flags);
+	clear_bit(HSC_CH_POLL, &channel->flags);
+	clear_bit(HSC_CH_WRITE, &channel->flags);
+	clear_bit(HSC_CH_OPEN, &channel->flags);
+	wake_up(&channel->rx_wait);
+	wake_up(&channel->tx_wait);
+	mutex_unlock(&cl_data->lock);
 
 	return 0;
 }
 
-static const struct file_operations hsi_char_fops = {
+static const struct file_operations hsc_fops = {
 	.owner		= THIS_MODULE,
-	.read		= hsi_char_read,
-	.write		= hsi_char_write,
-	.poll		= hsi_char_poll,
-	.unlocked_ioctl	= hsi_char_ioctl,
-	.open		= hsi_char_open,
-	.release	= hsi_char_release,
-	.fasync		= hsi_char_fasync,
+	.read		= hsc_read,
+	.write		= hsc_write,
+	.unlocked_ioctl	= hsc_ioctl,
+	.poll		= hsc_poll,
+	.open		= hsc_open,
+	.release	= hsc_release,
 };
 
-static struct hsi_client_driver hsi_char_driver = {
-	.driver = {
-		.name	= "hsi_char",
-		.owner	= THIS_MODULE,
-		.probe	= hsi_char_probe,
-		.remove	= hsi_char_remove,
-	},
-};
-
-static inline void hsi_char_channel_init(struct hsi_char_channel *channel)
+static void __devinit hsc_channel_init(struct hsc_channel *channel)
 {
-	channel->state = HSI_CHST_AVAIL;
-	INIT_LIST_HEAD(&channel->free_msgs_list);
 	init_waitqueue_head(&channel->rx_wait);
 	init_waitqueue_head(&channel->tx_wait);
 	spin_lock_init(&channel->lock);
+	INIT_LIST_HEAD(&channel->free_msgs_list);
 	INIT_LIST_HEAD(&channel->rx_msgs_queue);
 	INIT_LIST_HEAD(&channel->tx_msgs_queue);
 }
 
-static struct cdev hsi_char_cdev;
+static dev_t hsc_char_dev;
+static struct cdev hsc_char_cdev;
+static struct class *hsc_char_class;
 
-static int __init hsi_char_init(void)
+static int __devinit hsc_probe(struct device *dev)
 {
-	struct hsi_char_client_data *cl_data = &hsi_char_cl_data;
-	struct hsi_char_channel *channel = cl_data->channels;
-	unsigned long ch_mask = 0;
-	unsigned int i;
+	const char devname[] = "hsi_char";
+	struct hsc_client_data *cl_data;
+	struct hsc_channel *channel;
+	struct hsi_client *cl = to_hsi_client(dev);
+	unsigned int hsc_baseminor;
+	int ret;
+	int i;
+
+	cl_data = kzalloc(sizeof(*cl_data), GFP_KERNEL);
+	if (!cl_data) {
+		dev_err(dev, "Could not allocate hsc_client_data\n");
+		return -ENOMEM;
+	}
+	hsc_baseminor = HSC_BASEMINOR(hsi_id(cl), hsi_port_id(cl));
+	if (!hsc_major) {
+		ret = alloc_chrdev_region(&hsc_char_dev, hsc_baseminor,
+						HSC_DEVS, devname);
+		if (ret > 0)
+			hsc_major = MAJOR(hsc_char_dev);
+	} else {
+		hsc_char_dev = MKDEV(hsc_major, hsc_baseminor);
+		ret = register_chrdev_region(hsc_char_dev, HSC_DEVS, devname);
+	}
+	if (ret < 0) {
+		dev_err(dev, "Device %s allocation failed %d\n",
+					hsc_major ? "minor" : "major", ret);
+		goto out1;
+	}
+	mutex_init(&cl_data->lock);
+	hsi_client_set_drvdata(cl, cl_data);
+	cdev_init(&cl_data->cdev, &hsc_fops);
+	cl_data->cdev.owner = THIS_MODULE;
+	cl_data->cl = cl;
+	for (i = 0, channel = cl_data->channels; i < HSC_DEVS; i++, channel++) {
+		hsc_channel_init(channel);
+		channel->ch = i;
+		channel->cl = cl;
+		channel->cl_data = cl_data;
+	}
+
+	/* 1 hsi client -> N char devices (one for each channel) */
+	ret = cdev_add(&cl_data->cdev, hsc_char_dev, HSC_DEVS);
+	hsc_char_cdev = cl_data->cdev;
+	if (ret) {
+		dev_err(dev, "Could not add char device %d\n", ret);
+		goto out2;
+	}
+
+	hsc_char_class = class_create(THIS_MODULE, "hsi");
+	if (IS_ERR(hsc_char_class))
+		pr_err("ERROR: hsi class creation failed!\n");
+
+	device_create(hsc_char_class, NULL, cl_data->cdev.dev, NULL, devname);
+	return 0;
+
+out2:
+	unregister_chrdev_region(hsc_char_dev, HSC_DEVS);
+out1:
+	kfree(cl_data);
+
+	return ret;
+}
+
+static int __devexit hsc_remove(struct device *dev)
+{
+	struct hsi_client *cl = to_hsi_client(dev);
+	struct hsc_client_data *cl_data = hsi_client_drvdata(cl);
+	dev_t hsc_dev = cl_data->cdev.dev;
+
+	cdev_del(&cl_data->cdev);
+	unregister_chrdev_region(hsc_dev, HSC_DEVS);
+	hsi_client_set_drvdata(cl, NULL);
+	kfree(cl_data);
+
+	return 0;
+}
+
+static struct hsi_client_driver hsc_driver = {
+	.driver = {
+		.name	= "hsi_char",
+		.owner	= THIS_MODULE,
+		.probe	= hsc_probe,
+		.remove	= __devexit_p(hsc_remove),
+	},
+};
+
+static int __init hsc_init(void)
+{
 	int ret;
 
 	if ((max_data_size < 4) || (max_data_size > 0x10000) ||
@@ -1068,28 +849,7 @@ static int __init hsi_char_init(void)
 		return -EINVAL;
 	}
 
-	for (i = 0; i < HSI_CHAR_DEVS && channels_map[i] >= 0; i++) {
-		if (channels_map[i] >= HSI_CHAR_DEVS) {
-			pr_err("Invalid HSI/SSI channel specified");
-			return -EINVAL;
-		}
-		set_bit(channels_map[i], &ch_mask);
-	}
-
-	if (i == 0) {
-		pr_err("No HSI channels available");
-		return -EINVAL;
-	}
-
-	memset(cl_data->channels, 0, sizeof(cl_data->channels));
-	for (i = 0; i < HSI_CHAR_DEVS; i++, channel++) {
-		channel->ch = i;
-		channel->state = HSI_CHST_UNAVAIL;
-		if (test_bit(i, &ch_mask))
-			hsi_char_channel_init(channel);
-	}
-
-	ret = hsi_register_client_driver(&hsi_char_driver);
+	ret = hsi_register_client_driver(&hsc_driver);
 	if (ret) {
 		pr_err("Error while registering HSI/SSI driver %d", ret);
 		return ret;
@@ -1099,18 +859,16 @@ static int __init hsi_char_init(void)
 
 	return 0;
 }
-module_init(hsi_char_init);
+module_init(hsc_init);
 
-static void __exit hsi_char_exit(void)
+static void __exit hsc_exit(void)
 {
-	device_destroy(hsi_char_class, hsi_char_cdev.dev);
-	class_destroy(hsi_char_class);
-	cdev_del(&hsi_char_cdev);
-	unregister_chrdev_region(hsi_char_dev, HSI_CHAR_DEVS);
-	hsi_unregister_client_driver(&hsi_char_driver);
+	device_destroy(hsc_char_class, hsc_char_cdev.dev);
+	class_destroy(hsc_char_class);
+	hsi_unregister_client_driver(&hsc_driver);
 	pr_info("HSI char device removed\n");
 }
-module_exit(hsi_char_exit);
+module_exit(hsc_exit);
 
 MODULE_AUTHOR("Andras Domokos <andras.domokos@nokia.com>");
 MODULE_ALIAS("hsi:hsi_char");

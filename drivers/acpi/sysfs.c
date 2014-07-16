@@ -149,12 +149,12 @@ static int param_get_debug_level(char *buffer, const struct kernel_param *kp)
 	return result;
 }
 
-static struct kernel_param_ops param_ops_debug_layer = {
+static const struct kernel_param_ops param_ops_debug_layer = {
 	.set = param_set_uint,
 	.get = param_get_debug_layer,
 };
 
-static struct kernel_param_ops param_ops_debug_level = {
+static const struct kernel_param_ops param_ops_debug_level = {
 	.set = param_set_uint,
 	.get = param_get_debug_level,
 };
@@ -169,11 +169,11 @@ module_param(trace_debug_layer, uint, 0644);
 static unsigned int trace_debug_level;
 module_param(trace_debug_level, uint, 0644);
 
-static int param_set_trace_state(const char *val, const struct kernel_param *kp)
+static int param_set_trace_state(const char *val, struct kernel_param *kp)
 {
 	int result = 0;
 
-	if (!strncmp(val, "enable", strlen("enable"))) {
+	if (!strncmp(val, "enable", strlen("enable") - 1)) {
 		result = acpi_debug_trace(trace_method_name, trace_debug_level,
 					  trace_debug_layer, 0);
 		if (result)
@@ -181,7 +181,7 @@ static int param_set_trace_state(const char *val, const struct kernel_param *kp)
 		goto exit;
 	}
 
-	if (!strncmp(val, "disable", strlen("disable"))) {
+	if (!strncmp(val, "disable", strlen("disable") - 1)) {
 		int name = 0;
 		result = acpi_debug_trace((char *)&name, trace_debug_level,
 					  trace_debug_layer, 0);
@@ -203,7 +203,7 @@ exit:
 	return result;
 }
 
-static int param_get_trace_state(char *buffer, const struct kernel_param *kp)
+static int param_get_trace_state(char *buffer, struct kernel_param *kp)
 {
 	if (!acpi_gbl_trace_method_name)
 		return sprintf(buffer, "disable");
@@ -229,7 +229,7 @@ MODULE_PARM_DESC(aml_debug_output,
 		 "To enable/disable the ACPI Debug Object output.");
 
 /* /sys/module/acpi/parameters/acpica_version */
-static int param_get_acpica_version(char *buffer, const struct kernel_param *kp)
+static int param_get_acpica_version(char *buffer, struct kernel_param *kp)
 {
 	int result;
 
@@ -706,11 +706,23 @@ static void __exit interrupt_stats_exit(void)
 	return;
 }
 
+static ssize_t
+acpi_show_profile(struct device *dev, struct device_attribute *attr,
+		  char *buf)
+{
+	return sprintf(buf, "%d\n", acpi_gbl_FADT.preferred_profile);
+}
+
+static const struct device_attribute pm_profile_attr =
+	__ATTR(pm_profile, S_IRUGO, acpi_show_profile, NULL);
+
 int __init acpi_sysfs_init(void)
 {
 	int result;
 
 	result = acpi_tables_sysfs_init();
-
+	if (result)
+		return result;
+	result = sysfs_create_file(acpi_kobj, &pm_profile_attr.attr);
 	return result;
 }

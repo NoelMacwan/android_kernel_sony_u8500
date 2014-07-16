@@ -11,7 +11,6 @@
 #include <linux/io.h>
 #include <linux/amba/bus.h>
 
-#include <mach/crypto-ux500.h>
 #include <mach/hardware.h>
 #include <mach/setup.h>
 

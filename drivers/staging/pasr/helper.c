@@ -9,34 +9,21 @@
 
 struct pasr_die *pasr_addr2die(struct pasr_map *map, phys_addr_t addr)
 {
-	unsigned int left, right, mid;
+	int i;
 
 	if (!map)
 		return NULL;
 
-	left = 0;
-	right = map->nr_dies;
-
-	addr &= ~(PASR_SECTION_SZ - 1);
-
-	while (left != right) {
-		struct pasr_die *d;
+	for (i = 0; i < map->nr_dies; i++) {
 		phys_addr_t start;
+		struct pasr_die *d = &map->die[i];
 
-		mid = (left + right) >> 1;
-		d = &map->die[mid];
 		start = addr & ~((PASR_SECTION_SZ * d->nr_sections) - 1);
 
 		if (start == d->start)
 			return d;
-		else if (start > d->start)
-			left = mid;
-		else
-			right = mid;
 	}
 
-	pr_err("%s: No die found for address %#x",
-			__func__, addr);
 	return NULL;
 }
 

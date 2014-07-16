@@ -2,7 +2,9 @@
  * Architecture specific OF callbacks.
  */
 #include <linux/bootmem.h>
+#include <linux/export.h>
 #include <linux/io.h>
+#include <linux/irqdomain.h>
 #include <linux/interrupt.h>
 #include <linux/list.h>
 #include <linux/of.h>
@@ -84,6 +86,24 @@ static int __init add_bus_probe(void)
 module_init(add_bus_probe);
 
 #ifdef CONFIG_PCI
+struct device_node *pcibios_get_phb_of_node(struct pci_bus *bus)
+{
+	struct device_node *np;
+
+	for_each_node_by_type(np, "pci") {
+		const void *prop;
+		unsigned int bus_min;
+
+		prop = of_get_property(np, "bus-range", NULL);
+		if (!prop)
+			continue;
+		bus_min = be32_to_cpup(prop);
+		if (bus->number == bus_min)
+			return np;
+	}
+	return NULL;
+}
+
 static int x86_of_pci_irq_enable(struct pci_dev *dev)
 {
 	struct of_irq oirq;
@@ -115,50 +135,8 @@ static void x86_of_pci_irq_disable(struct pci_dev *dev)
 
 void __cpuinit x86_of_pci_init(void)
 {
-	struct device_node *np;
-
 	pcibios_enable_irq = x86_of_pci_irq_enable;
 	pcibios_disable_irq = x86_of_pci_irq_disable;
-
-	for_each_node_by_type(np, "pci") {
-		const void *prop;
-		struct pci_bus *bus;
-		unsigned int bus_min;
-		struct device_node *child;
-
-		prop = of_get_property(np, "bus-range", NULL);
-		if (!prop)
-			continue;
-		bus_min = be32_to_cpup(prop);
-
-		bus = pci_find_bus(0, bus_min);
-		if (!bus) {
-			printk(KERN_ERR "Can't find a node for bus %s.\n",
-					np->full_name);
-			continue;
-		}
-
-		if (bus->self)
-			bus->self->dev.of_node = np;
-		else
-			bus->dev.of_node = np;
-
-		for_each_child_of_node(np, child) {
-			struct pci_dev *dev;
-			u32 devfn;
-
-			prop = of_get_property(child, "reg", NULL);
-			if (!prop)
-				continue;
-
-			devfn = (be32_to_cpup(prop) >> 8) & 0xff;
-			dev = pci_get_slot(bus, devfn);
-			if (!dev)
-				continue;
-			dev->dev.of_node = child;
-			pci_dev_put(dev);
-		}
-	}
 }
 #endif
 
@@ -327,20 +305,17 @@ static struct of_ioapic_type of_ioapic_type[] =
 	},
 };
 
-static int ioapic_dt_translate(struct irq_domain *domain,
-				struct device_node *controller,
-				const u32 *intspec, u32 intsize,
-				irq_hw_number_t *out_hwirq, u32 *out_type)
+static int ioapic_xlate(struct irq_domain *domain,
+			struct device_node *controller,
+			const u32 *intspec, u32 intsize,
+			irq_hw_number_t *out_hwirq, u32 *out_type)
 {
 	struct io_apic_irq_attr attr;
 	struct of_ioapic_type *it;
-	u32 line, idx, type;
+	u32 line, idx;
 	int rc;
 
-	if (controller != domain->of_node)
-		return -EINVAL;
-
-	if (intsize < 2)
+	if (WARN_ON(intsize < 2))
 		return -EINVAL;
 
 	line = intspec[0];
@@ -348,26 +323,23 @@ static int ioapic_dt_translate(struct irq_domain *domain,
 	if (intspec[1] >= ARRAY_SIZE(of_ioapic_type))
 		return -EINVAL;
 
-	it = of_ioapic_type + intspec[1];
-	type = it->out_type;
+	it = &of_ioapic_type[intspec[1]];
 
-	idx = (u32) domain->priv;
+	idx = (u32) domain->host_data;
 	set_io_apic_irq_attr(&attr, idx, line, it->trigger, it->polarity);
 
-	rc = io_apic_setup_irq_pin_once(irq_domain_to_irq(domain, line),
+	rc = io_apic_setup_irq_pin_once(irq_find_mapping(domain, line),
 					cpu_to_node(0), &attr);
 	if (rc)
 		return rc;
 
-	if (out_hwirq)
-		*out_hwirq = line;
-	if (out_type)
-		*out_type = type;
+	*out_hwirq = line;
+	*out_type = it->out_type;
 	return 0;
 }
 
 const struct irq_domain_ops ioapic_irq_domain_ops = {
-	.dt_translate = ioapic_dt_translate,
+	.xlate = ioapic_xlate,
 };
 
 static void __init ioapic_add_ofnode(struct device_node *np)
@@ -389,13 +361,10 @@ static void __init ioapic_add_ofnode(struct device_node *np)
 
 			gsi_cfg = mp_ioapic_gsi_routing(i);
 
-			id = kzalloc(sizeof(*id), GFP_KERNEL);
+			id = irq_domain_add_legacy(np, 32, gsi_cfg->gsi_base, 0,
+						   &ioapic_irq_domain_ops,
+						   (void*)i);
 			BUG_ON(!id);
-			id->ops = &ioapic_irq_domain_ops;
-			id->irq_base = gsi_cfg->gsi_base;
-			id->of_node = np;
-			id->priv = (void *)i;
-			irq_domain_add(id);
 			return;
 		}
 	}

@@ -34,6 +34,7 @@
 
 /**
  * struct shrm_dev - shrm device information
+ * @clk_enabled:		flag to keep track of sysclk enable/disable
  * @ca_wake_irq:		CMT wake interrupt number
  * @ac_read_notif_0_irq:	ape-cmt common channel read notify interrupt
  * @ac_read_notif_1_irq:	ape-cmt audio channel read notify interrupt
@@ -62,7 +63,9 @@
  * @ac_audio_shared_rptr:	ape-cmt audio channel read pointer
  * @ca_audio_shared_wptr:	cmt-ape audio channel write pointer
  * @ca_audio_shared_rptr:	cmt-ape audio channel read pointer
+ * @ca_reset_status_rptr:	cmt-ape modem reset status pointer
  * @dev:			pointer to the driver device
+ * @clk:			pointer to the struct clk for holding sysclk
  * @ndev:			pointer to the network device structure
  * @modem:			poiner to struct modem
  * @isa_context:		pointer to t_isa_driver_sontext dtructure
@@ -88,8 +91,10 @@
  * @shm_ac_sleep_req:		work to send ape-cmt sleep request
  * @shm_mod_reset_req:		work to send a reset request to modem
  * @shm_print_dbg_info:		work function to print all prcmu/abb registers
+ * @shm_clk_disable_req:	work function to disable sysclk
  */
 struct shrm_dev {
+	bool clk_enabled;
 	u8 ca_wake_irq;
 	u8 ac_read_notif_0_irq;
 	u8 ac_read_notif_1_irq;
@@ -123,7 +128,10 @@ struct shrm_dev {
 	void __iomem *ca_audio_shared_wptr;
 	void __iomem *ca_audio_shared_rptr;
 
+	void __iomem *ca_reset_status_rptr;
+
 	struct device *dev;
+	struct clk *clk;
 	struct net_device *ndev;
 	struct modem *modem;
 	struct isa_driver_context *isa_context;
@@ -147,6 +155,7 @@ struct shrm_dev {
 	struct kthread_work shm_ac_sleep_req;
 	struct kthread_work shm_mod_reset_req;
 	struct kthread_work shm_print_dbg_info;
+	struct kthread_work shm_clk_disable_req;
 };
 
 /**

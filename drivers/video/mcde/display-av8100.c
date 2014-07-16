@@ -10,6 +10,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/device.h>
 #include <linux/delay.h>
 #include <linux/err.h>
@@ -529,10 +530,10 @@ static struct mcde_video_mode video_modes_supp_hdmi[] = {
 	},
 	/* 23 VESA #81 1366_768_60_P */
 	{
-		.xres = 1366,	.yres = 768,
-		.pixclock = 11662,
-		.hbp = 213,	.hfp = 213,
-		.vbp = 24,	.vfp = 6,
+		.xres = 1360,	.yres = 768,
+		.pixclock = 11764,
+		.hbp = 208,	.hfp = 208,
+		.vbp = 25,	.vfp = 5,
 		.interlaced = false,
 	},
 };
@@ -1186,6 +1187,8 @@ static int hdmi_set_video_mode(
 		goto hdmi_set_video_mode_end;
 	}
 
+	av8100_video_mode_changed();
+
 	dev->update_flags |= UPDATE_FLAG_VIDEO_MODE;
 	dev->first_update = true;
 
@@ -1381,8 +1384,8 @@ static int hdmi_set_power_mode(struct mcde_display_device *ddev,
 			return -EFAULT;
 		else if (get_res > 1)
 			av8100_hdmi_video_on();
-		else
-			hdmi_set_port_pixel_format(ddev);
+
+		hdmi_set_port_pixel_format(ddev);
 	}
 	/* STANDBY -> ON */
 	if (ddev->power_mode == MCDE_DISPLAY_PM_STANDBY &&
@@ -1629,4 +1632,3 @@ module_exit(mcde_display_hdmi_exit);
 MODULE_AUTHOR("Per Persson <per.xb.persson@stericsson.com>");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("ST-Ericsson hdmi display driver");
-

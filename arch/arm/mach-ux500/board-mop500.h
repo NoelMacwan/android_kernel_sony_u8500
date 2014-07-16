@@ -11,6 +11,8 @@
 #include <linux/mfd/abx500/ab8500-gpio.h>
 #include <mach/gpio.h>
 
+#include "board-common-uib.h"
+
 /* Snowball GPIO for MMC card */
 #define SNOWBALL_SDMMC_EN_GPIO		217
 #define SNOWBALL_SDMMC_1V8_3V_GPIO	228
@@ -22,7 +24,8 @@
 #define SNOWBALL_MAGNET_DRDY_GPIO	165
 
 /* HREFv60-specific GPIO assignments, this board has no GPIO expander */
-#define HREFV60_TOUCH_RST_GPIO		143
+//#define HREFV60_TOUCH_RST_GPIO		143
+#define HREFV60_TOUCH_RST_GPIO          216
 #define HREFV60_PROX_SENSE_GPIO		217
 #define HREFV60_HAL_SW_GPIO		145
 #define HREFV60_SDMMC_EN_GPIO		169
@@ -37,10 +40,12 @@
 #define HREFV60_XSHUTDOWN_SECONDARY_SENSOR 140
 #define HREFV60_CAMERA_FLASH_ENABLE	21
 #define XSHUTDOWN_PRIMARY_SENSOR	141
-#define XSHUTDOWN_SECONDARY_SENSOR	142
+#define XSHUTDOWN_SECONDARY_SENSOR	140
 #define CAMERA_FLASH_INT_PIN		7
 #define CYPRESS_TOUCH_INT_PIN 84
 #define CYPRESS_TOUCH_RST_GPIO 143
+#define CYPRESS_TOUCH_9540_INT_PIN 146
+#define CYPRESS_TOUCH_9540_RST_GPIO 145
 #define CYPRESS_SLAVE_SELECT_GPIO 216
 
 /* U8520-specific GPIO assignments */
@@ -78,27 +83,31 @@
 /* U9540 GPIO */
 #define UIB_9540_DISP1_RST_GPIO		143
 
+#define BBS1_DISP_RST_GPIO		    139
+
 struct i2c_board_info;
 
-extern void mop500_sdi_init(void);
-extern void mop500_sdi_tc35892_init(void);
+extern void mop500_sdi_init(struct device *parent);
+extern void mop500_sdi_tc35892_init(struct device *parent);
 extern int mop500_get_acc_id(void);
 void __init mop500_u8500uib_init(void);
 void __init mop500_stuib_init(void);
-void __init mop500_msp_init(void);
-void __init mop500_pins_init(void);
+void __init mop500_msp_init(struct device *parent);
+void __init mop500_pinmaps_init(void);
 void __init mop500_vibra_init(void);
 void mop500_cyttsp_init(void);
 void __init mop500_u8500uib_r3_init(void);
+void __init mop500_u9540uibs_v1_init(void);
+void __init mop500_u9540uibs_v2_init(void);
+void __init mop500_u9540uibs_v3_init(void);
+void __init mop500_u9540uibt_v1_init(void);
+void __init mop500_u8540uibs_v2_init(void);
+void __init mop500_u8540uibs_v3_init(void);
 
 void mop500_uib_i2c_add(int busnum, struct i2c_board_info const *info,
 		unsigned n);
 
 int msp13_i2s_init(void);
 int msp13_i2s_exit(void);
-
-int uib_is_stuib(void);
-int uib_is_u8500uib(void);
-int uib_is_u8500uibr3(void);
 
 #endif

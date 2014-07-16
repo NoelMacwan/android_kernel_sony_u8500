@@ -36,6 +36,9 @@
 /* The defined bits of the Interrupt Status Register */
 #define B2R2_ITS_MASK 0x0FFFF0FF
 
+/* The maximum possible number of blits */
+#define MAX_LAST_REQUEST 5
+
 /**
  * b2r2_op_type - the type of B2R2 operation to configure
  */
@@ -536,13 +539,18 @@ struct b2r2_mem_dump {
  * @data: Used to store a reference to b2r2_core
  * @id: The id of the b2r2 instance
  * @ref: The b2r2 control reference count
+ * @tmp_buf_ref: The temporary b2r2 control reference count
+ * @tmp_buf_lock: Lock protecting the temporary b2r2 buffer
  * @enabled: Indicated if the b2r2 core is enabled
  * @bypass: Indicates if the blitter operation should be omitted (aka dryrun)
  * @tmp_bufs: Temporary buffers needed in the node splitter
  * @filters_initialized: Indicating of filters has been
  *                       initialized for this b2r2 instance
  * @mem_heap: The b2r2 heap, e.g. used to allocate nodes
- * @debugfs_latest_request: Copy of the latest request issued
+ * @last_req_lock: Lock protecting request array and index
+ * @latest_request: Array with copies of previous requests issued
+ * @latest_request_count: Count of previous requests required
+ * @buf_index: Index were the next request will be stored
  * @debugfs_root_dir: The debugfs root directory, e.g. /debugfs/b2r2
  * @debugfs_debug_root_dir: The b2r2 debug root directory,
  *                          e.g. /debugfs/b2r2/debug
@@ -571,13 +579,18 @@ struct b2r2_control {
 	void                            *data;
 	int                             id;
 	struct kref                     ref;
+	struct kref                     tmp_buf_ref;
+	struct mutex                    tmp_buf_lock;
 	bool                            enabled;
 	bool                            bypass;
 	struct tmp_buf                  tmp_bufs[MAX_TMP_BUFS_NEEDED];
 	int                             filters_initialized;
 	struct b2r2_mem_heap            mem_heap;
 #ifdef CONFIG_DEBUG_FS
-	struct b2r2_blt_request         debugfs_latest_request;
+	struct mutex                    last_req_lock;
+	struct b2r2_blt_request         latest_request[MAX_LAST_REQUEST];
+	unsigned int                    last_request_count;
+	int                             buf_index;
 	struct dentry                   *debugfs_root_dir;
 	struct dentry                   *debugfs_debug_root_dir;
 #endif

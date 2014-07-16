@@ -128,20 +128,18 @@ in the bash (as said, 1000 is default), do:
 echo `$(($(cat cpuinfo_transition_latency) * 750 / 1000)) \
     >ondemand/sampling_rate
 
-show_sampling_rate_min:
+sampling_rate_min:
 The sampling rate is limited by the HW transition latency:
 transition_latency * 100
 Or by kernel restrictions:
 If CONFIG_NO_HZ is set, the limit is 10ms fixed.
-If CONFIG_NO_HZ is not set or no_hz=off boot parameter is used, the
+If CONFIG_NO_HZ is not set or nohz=off boot parameter is used, the
 limits depend on the CONFIG_HZ option:
 HZ=1000: min=20000us  (20ms)
 HZ=250:  min=80000us  (80ms)
 HZ=100:  min=200000us (200ms)
 The highest value of kernel and HW latency restrictions is shown and
 used as the minimum sampling rate.
-
-show_sampling_rate_max: THIS INTERFACE IS DEPRECATED, DON'T USE IT.
 
 up_threshold: defines what the average CPU usage between the samplings
 of 'sampling_rate' needs to be for the kernel to make a decision on
@@ -225,38 +223,21 @@ frequency before ramping down. This is to ensure that the governor has
 seen enough historic cpu load data to determine the appropriate
 workload.  Default is 80000 uS.
 
-go_maxspeed_load: The CPU load at which to ramp to max speed.  Default
-is 85.
+hispeed_freq: An intermediate "hi speed" at which to initially ramp
+when CPU load hits the value specified in go_hispeed_load.  If load
+stays high for the amount of time specified in above_hispeed_delay,
+then speed may be bumped higher.  Default is maximum speed.
+
+go_hispeed_load: The CPU load at which to ramp to the intermediate "hi
+speed".  Default is 85%.
+
+above_hispeed_delay: Once speed is set to hispeed_freq, wait for this
+long before bumping speed higher in response to continued high load.
+Default is 20000 uS.
 
 timer_rate: Sample rate for reevaluating cpu load when the system is
-not idle.  Default is 30000 uS.
+not idle.  Default is 20000 uS.
 
-2.6 Hotplug
------------
-
-The CPUfreq governor "hotplug" operates similary to "ondemand" and
-"conservative".  It's decisions are based primarily on CPU load.  Like
-"ondemand" the "hotplug" governor will ramp up to the highest frequency
-once the run-time tunable "up_threshold" parameter is crossed.  Like
-"conservative", the "hotplug" governor exports a "down_threshold"
-parameter that is also tunable at run-time.  When the "down_threshold"
-is crossed the CPU transitions to the next lowest frequency in the
-CPUfreq frequency table instead of decrementing the frequency based on a
-percentage of maximum load.
-
-The main reason "hotplug" governor exists is for architectures requiring
-that only the master CPU be online in order to hit low-power states
-(C-states).  OMAP4 is one such example of this.  The "hotplug" governor
-is also helpful in reducing thermal output in devices with tight thermal
-constraints.
-
-Auxillary CPUs are onlined/offline based on CPU load, but the decision
-to do so is made after averaging several sampling windows.  This is to
-reduce CPU hotplug "thrashing", which can be caused by normal system
-entropy and leads to lots of spurious plug-in and plug-out transitions.
-The number of sampling periods averaged together is tunable via the
-"hotplug_in_sampling_periods" and "hotplug_out_sampling_periods"
-run-time tunable parameters.
 
 3. The Governor Interface in the CPUfreq Core
 =============================================

@@ -2,23 +2,13 @@
 # Misc strange devices
 #
 
-# This one has to live outside of the MISC_DEVICES conditional,
-# because it may be selected by drivers/platform/x86/hp_accel.
+menu "Misc devices"
+
 config SENSORS_LIS3LV02D
 	tristate
 	depends on INPUT
 	select INPUT_POLLDEV
 	default n
-
-menuconfig MISC_DEVICES
-	bool "Misc devices"
-	---help---
-	  Say Y here to get to see options for device drivers from various
-	  different categories. This option alone does not add any kernel code.
-
-	  If you say N, all options in this submenu will be skipped and disabled.
-
-if MISC_DEVICES
 
 config AD525X_DPOT
 	tristate "Analog Devices Digital Potentiometers"
@@ -61,18 +51,9 @@ config AD525X_DPOT_SPI
 	  To compile this driver as a module, choose M here: the
 	  module will be called ad525x_dpot-spi.
 
-config ANDROID_PMEM
-	bool "Android pmem allocator"
-	default y
-
-config ANDROID_U8500_PMEM
-	bool "Android u8500 pmem allocator"
-	---help---
-	  Sony Xperia U8500 pmem allocator. Say Y here to enable.
-
 config ATMEL_PWM
 	tristate "Atmel AT32/AT91 PWM support"
-	depends on AVR32 || ARCH_AT91SAM9263 || ARCH_AT91SAM9RL || ARCH_AT91CAP9
+	depends on HAVE_CLK
 	help
 	  This option enables device driver support for the PWM channels
 	  on certain Atmel processors.  Pulse Width Modulation is used for
@@ -155,6 +136,7 @@ config PHANTOM
 
 config INTEL_MID_PTI
 	tristate "Parallel Trace Interface for MIPI P1149.7 cJTAG standard"
+	depends on PCI
 	default n
 	help
 	  The PTI (Parallel Trace Interface) driver directs
@@ -237,13 +219,6 @@ config ENCLOSURE_SERVICES
 	  contain storage devices).  You also need either a host
 	  driver (SCSI/ATA) which supports enclosures
 	  or a SCSI enclosure device (SES) to use these services.
-
-config KERNEL_DEBUGGER_CORE
-	bool "Kernel Debugger Core"
-	default n
-	---help---
-	  Generic kernel debugging command processor used by low level
-	  (interrupt context) platform-specific debuggers.
 
 config SGI_XP
 	tristate "Support communication between SGI SSIs"
@@ -407,6 +382,12 @@ config HMC6352
 	  This driver provides support for the Honeywell HMC6352 compass,
 	  providing configuration and heading data via sysfs.
 
+config TSL27713_PLSENSOR
+	tristate "TAOS tsl27713 P/L senosr"
+	depends on I2C
+	---help---
+	  This option enables support for the TAOS tsl27713 P/L sensor.
+
 config SENSORS_AK8975
 	tristate "AK8975 compass support"
 	default n
@@ -498,7 +479,7 @@ config STE_TRACE_MODEM
 config DBX500_MLOADER
 	tristate "Modem firmware loader for db8500"
 	default n
-	depends on UX500_SOC_DB8500 || UX500_SOC_DB5500
+	depends on UX500_SOC_DB8500
 	help
 	  Provides a user interface to load modem firmware on dbx500 SOCs
 
@@ -511,6 +492,40 @@ config BMP085
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called bmp085.
+
+config DISPDEV
+	bool "Display overlay device"
+	depends on FB_MCDE
+	default n
+	help
+	  This driver provides a way to use a second overlay for a display (in
+	  addition to the framebuffer). The device allows for registration of
+	  userspace buffers to be used with the overlay.
+
+config COMPDEV
+	bool "Display composition device"
+	depends on FB_MCDE && HWMEM
+	default n
+	help
+	  This driver provides a way to use several overlays for a display.
+	  This driver replaces the use of the framebuffer The device allows
+	  for posting userspace buffers to be used with the overlays.
+
+config CLONEDEV
+	bool "Display cloning device"
+	depends on FB_MCDE && HWMEM && COMPDEV
+	default n
+	help
+	  This driver provides a way to clone content between two compdev
+	  devices.
+
+config CLONEDEV_DEBUG
+	bool "Display cloning device debug"
+	depends on CLONEDEV
+	default n
+	help
+	  This driver provides a way to clone content between two compdev
+	  devices.
 
 config PCH_PHUB
 	tristate "Intel EG20T PCH/LAPIS Semicon IOH(ML7213/ML7223/ML7831) PHUB"
@@ -532,29 +547,6 @@ config PCH_PHUB
 	  To compile this driver as a module, choose M here: the module will
 	  be called pch_phub.
 
-config WL127X_RFKILL
-	tristate "Bluetooth power control driver for TI wl127x"
-	depends on RFKILL
-	default n
-	---help---
-	 Creates an rfkill entry in sysfs for power control of Bluetooth
-	 TI wl127x chips.
-
-config APANIC
-	bool "Android kernel panic diagnostics driver"
-	default n
-	---help---
-	 Driver which handles kernel panics and attempts to write
-	 critical debugging data to flash.
-
-config APANIC_PLABEL
-	string "Android panic dump flash partition label"
-	depends on APANIC
-	default "kpanic"
-	---help---
-	 If your platform uses a different flash partition label for storing
- 	 crashdumps, enter it here.
-
 config HWMEM
 	bool "Hardware memory driver"
 	default n
@@ -562,54 +554,6 @@ config HWMEM
 	  This driver provides a way to allocate contiguous system memory which
 	  can be used by hardware. It also enables accessing hwmem allocated
 	  memory buffers through a secure id which can be shared across processes.
-
-config DISPDEV
-	bool "Display overlay device"
-	depends on FB_MCDE
-	default n
-	help
-	  This driver provides a way to use a second overlay for a display (in
-	  addition to the framebuffer). The device allows for registration of
-	  userspace buffers to be used with the overlay.
-
-config COMPDEV
-	bool "Display composition device"
-	depends on FB_MCDE && HWMEM
-	default n
-	help
-	  This driver provides a way to use several overlays for a display.
-	  This driver replaces the use of the framebuffer The device allows
-	  for posting userspace buffers to be used with the overlays.
-
-config COMPDEV_DEBUG
-	bool "Display composition device debug"
-	depends on COMPDEV
-	default n
-	help
-	  Debug help for compdev.
-
-config CLONEDEV
-	bool "Display cloning device"
-	depends on FB_MCDE && HWMEM && COMPDEV
-	default n
-	help
-	  This driver provides a way to clone content between two compdev
-	  devices.
-
-config CLONEDEV_DEBUG
-	bool "Display cloning device debug"
-	depends on CLONEDEV
-	default n
-	help
-	  This driver provides a way to clone content between two compdev
-	  devices.
-
-config U5500_MBOX
-	bool "Mailbox support"
-	depends on (UX500_SOC_DB5500 && U5500_MODEM_IRQ)
-	default y
-	help
-	  Add support for U5500 mailbox communication with modem side
 
 config U8500_SIM_DETECT
 	bool "Sim hot swap detection support"
@@ -620,28 +564,100 @@ config U8500_SIM_DETECT
 	  basically wakes up the modem if its sleeping when sim hot plug
 	  in/out has happened.
 
-config LM3560
-        tristate "LED driver for LM3560"
-        default n
-        depends on I2C
-        help
-          This option enables support for LM3560
-          led controller.
+config USB_SWITCH_FSA9480
+	tristate "FSA9480 USB Switch"
+	depends on I2C
+	help
+	  The FSA9480 is a USB port accessory detector and switch.
+	  The FSA9480 is fully controlled using I2C and enables USB data,
+	  stereo and mono audio, video, microphone and UART data to use
+	  a common connector port.
 
-config LM3561
-        tristate "LED driver for LM3561"
-        default n
-        depends on I2C
-        help
-          This option enables support for LM3561
-          led controller.
+config MAX8997_MUIC
+	tristate "MAX8997 MUIC Support"
+	depends on MFD_MAX8997
+	help
+	  If you say yes here you get support for the MUIC device of
+	  Maxim MAX8997 PMIC.
+	  The MAX8997 MUIC is a USB port accessory detector and switch.
 
-config NFC_PN544
-        tristate "NFC driver for PN544"
-        default n
-        depends on I2C
-        help
-          This option enables support for PN544.
+config WL127X_RFKILL
+	tristate "Bluetooth power control driver for TI wl127x"
+	depends on RFKILL
+	default n
+	---help---
+	 Creates an rfkill entry in sysfs for power control of Bluetooth
+	 TI wl127x chips.
+
+config DEEP_DEBUG
+	bool "Deep Debug"
+	depends on DEBUG_FS
+	help
+	  Deep Debug interface provides an access to all registers.
+	  It allows to read or write directly drivers registers.
+	  Say Y to include support for Deep Debug.
+	  If unsure, say N.
+
+config DDR_DEEP_DEBUG
+	bool "DDR Deep Debug stress test"
+	depends on DEEP_DEBUG
+	help
+	  Deep Debug interface to execute DDR memory stress test
+	  for performance and power management purpose.
+	  Say Y to include support for DDR memory test.
+	  If unsure, say N.
+
+config C2C
+	bool "Support IPC over C2C GENI/GENO services."
+	default n
+	help
+	  Support IPC over C2C GENI/GENO services.
+	  Say Y to include support for C2C.
+	  If unsure, say N.
+
+config C2C_AP9540
+	tristate "C2C support for AP9540"
+	depends on (C2C && ARCH_U8500)
+	select GENIO_IPC
+	default n
+	help
+	  Support IPC over C2C GENI/GENO services for AP9540.
+	  Say Y to include support for C2C_AP9540.
+	  If unsure, say N.
+
+config C2C_DEEP_DEBUG
+	bool "C2C Deep Debug"
+	depends on (C2C && DEEP_DEBUG)
+	default y
+	help
+	  Deep Debug interface provides an access to all registers.
+	  It allows to read or write directly a register.
+	  Say Y to include support for Deep Debug.
+	  If unsure, say N.
+
+config GENIO_IPC
+	bool "GENIO based IPC driver wrapper"
+	default n
+	help
+	  Wrapper required for GENIO based Modem IPC drivers.
+	  If unsure, say N.
+
+config UX500_MODEM_CONTROL
+	bool "UX500 Modem Control"
+	depends on ARCH_U8500
+	default n
+	help
+	  This driver exports sysfs entries to enable/disable/monitor
+	  Modem boot/crash/reboot in ux500 platforms.
+
+config STE_XMIP
+	bool "Support IPC over XMIP MODAPP/APPMOD services."
+	select GENIO_IPC
+	default n
+	help
+	  Support IPC over XMIP MODAPP/APPMOD services.
+	  This driver offers an API to XSHM to set/clear the appmod/modapp
+	  bits to handle the transaction over shared memory.
 
 source "drivers/misc/Kconfig.stm"
 source "drivers/misc/c2port/Kconfig"
@@ -651,7 +667,5 @@ source "drivers/misc/iwmc3200top/Kconfig"
 source "drivers/misc/ti-st/Kconfig"
 source "drivers/misc/lis3lv02d/Kconfig"
 source "drivers/misc/carma/Kconfig"
-source "drivers/misc/modem_audio/Kconfig"
-source "drivers/misc/kexec_mod/Kconfig"
-
-endif # MISC_DEVICES
+source "drivers/misc/altera-stapl/Kconfig"
+endmenu

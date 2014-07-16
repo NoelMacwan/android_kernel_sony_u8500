@@ -1,6 +1,4 @@
 /*
- * hsi_core.h
- *
  * HSI framework internal interfaces,
  *
  * Copyright (C) 2010 Nokia Corporation. All rights reserved.

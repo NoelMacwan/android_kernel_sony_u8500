@@ -30,7 +30,7 @@ struct switch_dev {
 
 struct gpio_switch_platform_data {
 	const char *name;
-	unsigned 	gpio;
+	unsigned	gpio;
 
 	/* if NULL, switch_dev.name will be printed */
 	const char *name_on;
@@ -59,14 +59,14 @@ static inline int switch_dev_register(struct switch_dev *sdev)
 	return 0;
 }
 
-static inline void switch_dev_unregister(struct switch_dev *sdev);
+static inline void switch_dev_unregister(struct switch_dev *sdev) { }
 
 static inline int switch_get_state(struct switch_dev *sdev)
 {
 	return 0;
 }
 
-static inline void switch_set_state(struct switch_dev *sdev, int state);
+static inline void switch_set_state(struct switch_dev *sdev, int state) { }
 
 #endif
 

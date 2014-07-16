@@ -10,6 +10,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/export.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/slab.h>
@@ -18,7 +19,7 @@
 
 #define to_overlay(x) container_of(x, struct mcde_overlay, kobj)
 
-static void overlay_relase(struct kobject *kobj)
+void overlay_release(struct kobject *kobj)
 {
 	struct mcde_overlay *ovly = to_overlay(kobj);
 
@@ -26,7 +27,7 @@ static void overlay_relase(struct kobject *kobj)
 }
 
 struct kobj_type ovly_type = {
-	.release = overlay_relase,
+	.release = overlay_release,
 };
 
 static int apply_overlay(struct mcde_overlay *ovly,
@@ -35,7 +36,7 @@ static int apply_overlay(struct mcde_overlay *ovly,
 	int ret = 0;
 
 	if (ovly->info.paddr != info->paddr || force)
-		mcde_ovly_set_source_buf(ovly->state, info->paddr);
+		mcde_ovly_set_source_buf(ovly->state, info->paddr, info->kaddr);
 
 	if (ovly->info.stride != info->stride || ovly->info.fmt != info->fmt ||
 									force)
@@ -239,7 +240,7 @@ void mcde_dss_disable_overlay(struct mcde_overlay *ovly)
 }
 EXPORT_SYMBOL(mcde_dss_disable_overlay);
 
-int mcde_dss_update_overlay(struct mcde_overlay *ovly, bool tripple_buffer)
+int mcde_dss_update_overlay(struct mcde_overlay *ovly)
 {
 	int ret;
 	dev_vdbg(&ovly->ddev->dev, "Overlay update, chnl=%d\n",
@@ -255,7 +256,7 @@ int mcde_dss_update_overlay(struct mcde_overlay *ovly, bool tripple_buffer)
 		goto power_mode_off;
 	}
 
-	ret = ovly->ddev->update(ovly->ddev, tripple_buffer);
+	ret = ovly->ddev->update(ovly->ddev);
 	if (ret)
 		goto update_failed;
 

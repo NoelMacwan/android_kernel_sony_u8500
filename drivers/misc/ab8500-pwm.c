@@ -9,8 +9,9 @@
 #include <linux/slab.h>
 #include <linux/pwm.h>
 #include <linux/clk.h>
-#include <linux/mfd/ab8500.h>
 #include <linux/mfd/abx500.h>
+#include <linux/mfd/abx500/ab8500.h>
+#include <linux/module.h>
 #include <linux/mfd/abx500/ab8500-pwmleds.h>
 
 /*
@@ -234,7 +235,7 @@ static ssize_t store_blink_status(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR(disable_blink, S_IWUGO, NULL, store_blink_status);
+static DEVICE_ATTR(disable_blink, S_IWUSR, NULL, store_blink_status);
 
 static struct attribute *pwmled_attributes[] = {
 	&dev_attr_disable_blink.attr,
@@ -291,14 +292,17 @@ static int __devinit ab8500_pwm_probe(struct platform_device *pdev)
 			break;
 		}
 	}
-	pwm->clk = clk_get(pwm->dev, NULL);
-	if (IS_ERR(pwm->clk)) {
-		dev_err(pwm->dev, "clock request failed\n");
-		ret = PTR_ERR(pwm->clk);
-		goto err_clk;
+	for (i = 0; i < pdata->num_pwm; i++) {
+		pwm[i].clk = clk_get(pwm[i].dev, NULL);
+		if (IS_ERR(pwm->clk)) {
+                	dev_err(pwm->dev, "clock request failed\n");
+                	ret = PTR_ERR(pwm->clk);
+        	        goto err_clk;
+	        }
+		pwm[i].clk_enabled = false;
+
 	}
 	platform_set_drvdata(pdev, pwm);
-	pwm->clk_enabled = false;
 	dev_dbg(pwm->dev, "pwm probe successful\n");
 	return ret;
 
@@ -358,5 +362,5 @@ subsys_initcall(ab8500_pwm_init);
 module_exit(ab8500_pwm_exit);
 MODULE_AUTHOR("Arun MURTHY <arun.murthy@stericsson.com>");
 MODULE_DESCRIPTION("AB8500 Pulse Width Modulation Driver");
-MODULE_ALIAS("AB8500 PWM driver");
+MODULE_ALIAS("platform:ab8500-pwm");
 MODULE_LICENSE("GPL v2");

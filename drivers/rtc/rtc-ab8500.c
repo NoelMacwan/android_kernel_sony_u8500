@@ -15,8 +15,9 @@
 #include <linux/platform_device.h>
 #include <linux/rtc.h>
 #include <linux/mfd/abx500.h>
-#include <linux/mfd/ab8500.h>
+#include <linux/mfd/abx500/ab8500.h>
 #include <linux/delay.h>
+#include <linux/earlysuspend.h>
 
 #define AB8500_RTC_SOFF_STAT_REG	0x00
 #define AB8500_RTC_CC_CONF_REG		0x01
@@ -48,7 +49,7 @@
 
 static struct rtc_device *ab8500_rtc;
 static struct delayed_work sync_work;
-static u32 resumed;
+static struct early_suspend ab8500_rtc_early_suspend;
 
 static const u8 ab8500_rtc_time_regs[] = {
 	AB8500_RTC_WATCH_TMIN_HI_REG, AB8500_RTC_WATCH_TMIN_MID_REG,
@@ -80,7 +81,7 @@ static unsigned long get_elapsed_seconds(int year)
 
 static int ab8500_rtc_read_time(struct device *dev, struct rtc_time *tm)
 {
-	unsigned long timeout = jiffies + HZ;
+	unsigned long timeout;
 	int retval, i;
 	unsigned long mins, secs;
 	unsigned char buf[ARRAY_SIZE(ab8500_rtc_time_regs)];
@@ -92,6 +93,8 @@ static int ab8500_rtc_read_time(struct device *dev, struct rtc_time *tm)
 	if (retval < 0)
 		return retval;
 
+	timeout = jiffies + HZ;
+
 	/* Wait for some cycles after enabling the rtc read in ab8500 */
 	while (time_before(jiffies, timeout)) {
 		retval = abx500_get_register_interruptible(dev,
@@ -102,7 +105,7 @@ static int ab8500_rtc_read_time(struct device *dev, struct rtc_time *tm)
 		if (!(value & RTC_READ_REQUEST))
 			break;
 
-		mdelay(1);
+		usleep_range(1000, 5000);
 	}
 
 	/* Read the Watchtime registers */
@@ -169,8 +172,11 @@ static int ab8500_rtc_set_time(struct device *dev, struct rtc_time *tm)
 	}
 
 	/* Request a data write */
-	return abx500_set_register_interruptible(dev, AB8500_RTC,
+	retval =  abx500_set_register_interruptible(dev, AB8500_RTC,
 		AB8500_RTC_READ_REQ_REG, RTC_WRITE_REQUEST);
+
+	usleep_range(300, 1500);
+	return retval;
 }
 
 static int ab8500_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alarm)
@@ -224,7 +230,10 @@ static int ab8500_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alarm)
 	int retval, i;
 	unsigned char buf[ARRAY_SIZE(ab8500_rtc_alarm_regs)];
 	unsigned long mins, secs = 0;
-
+#ifndef CONFIG_ANDROID
+	unsigned long cursec=0;
+	struct rtc_time curtm;
+#endif
 	if (alarm->time.tm_year < (AB8500_RTC_EPOCH - 1900)) {
 		dev_dbg(dev, "year should be equal to or greater than %d\n",
 				AB8500_RTC_EPOCH);
@@ -233,6 +242,19 @@ static int ab8500_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alarm)
 
 	/* Get the number of seconds since 1970 */
 	rtc_tm_to_time(&alarm->time, &secs);
+
+#ifndef CONFIG_ANDROID
+	/* Check whether alarm is set less than 1min.
+	 * Since our RTC doesn't support alarm resolution less than 1min,
+	 * return -EINVAL, so UIE EMUL can take it up, incase of UIE_ON
+	 */
+	ab8500_rtc_read_time(dev, &curtm); /* Read current time */
+	rtc_tm_to_time(&curtm, &cursec);
+	if ((secs - cursec) < 59) {
+		dev_dbg(dev, "Alarm less than 1 minute not supported\n");
+		return -EINVAL;
+	}
+#endif
 
 	/*
 	 * Convert it to the number of seconds since 01-01-2000 00:00:00, since
@@ -276,8 +298,11 @@ static int ab8500_rtc_set_calibration(struct device *dev, int calibration)
 	u8  rtccal = 0;
 
 	/*
-	 * Check that the calibration value (which is in units of 0.5 parts-per-million)
-	 * is in the AB8500's range for RtcCalibration register.
+	 * Check that the calibration value (which is in units of 0.5
+	 * parts-per-million) is in the AB8500's range for RtcCalibration
+	 * register. -128 (0x80) is not permitted because the AB8500 uses
+	 * a sign-bit rather than two's complement, so 0x80 is just another
+	 * representation of zero.
 	 */
 	if ((calibration < -127) || (calibration > 127)) {
 		dev_err(dev, "RtcCalibration value outside permitted range\n");
@@ -292,7 +317,7 @@ static int ab8500_rtc_set_calibration(struct device *dev, int calibration)
 	if (calibration >= 0)
 		rtccal = 0x7F & calibration;
 	else
-		rtccal = ~(calibration -1) | 0x80;
+		rtccal = ~(calibration - 1) | 0x80;
 
 	retval = abx500_set_register_interruptible(dev, AB8500_RTC,
 			AB8500_RTC_CALIB_REG, rtccal);
@@ -410,20 +435,27 @@ static void ab8500_rtc_sync_work(struct work_struct *work)
 	 * when the drift is less than a second.
 	 * If diff is more then 60s then system time is considered changed
 	 * but not the rtc time and they should be kept different.
-	 */
+	 * */
 	if ((abs(ts.tv_sec - sys_ts.tv_sec) < 60) &&
-		(ts.tv_sec != sys_ts.tv_sec) && !resumed) {
+	    (ts.tv_sec != sys_ts.tv_sec)) {
 		adjust.offset = (ts.tv_sec - sys_ts.tv_sec) * 1000000;
 		adjust.modes = ADJ_OFFSET_SINGLESHOT;
 		do_adjtimex(&adjust);
-		rtc_hctohc(r);
-	} else if (resumed) {
-		do_settimeofday(&ts);
-		resumed = 0;
+
 		rtc_hctohc(r);
 	}
 	/* Once every minute to match calibration */
 	schedule_delayed_work(&sync_work, 60 * HZ);
+}
+
+static void ab8500_rtc_early_suspend_callback(struct early_suspend *h)
+{
+	cancel_delayed_work_sync(&sync_work);
+}
+
+static void ab8500_rtc_late_resume_callback(struct early_suspend *h)
+{
+	schedule_delayed_work(&sync_work, 0);
 }
 
 static int __devinit ab8500_rtc_probe(struct platform_device *pdev)
@@ -444,7 +476,7 @@ static int __devinit ab8500_rtc_probe(struct platform_device *pdev)
 		return err;
 
 	/* Wait for reset by the PorRtc */
-	mdelay(1);
+	usleep_range(1000, 5000);
 
 	err = abx500_get_register_interruptible(&pdev->dev, AB8500_RTC,
 		AB8500_RTC_STAT_REG, &rtc_ctrl);
@@ -484,6 +516,10 @@ static int __devinit ab8500_rtc_probe(struct platform_device *pdev)
 	}
 
 	ab8500_rtc = rtc;
+	ab8500_rtc_early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB + 50;
+	ab8500_rtc_early_suspend.suspend = ab8500_rtc_early_suspend_callback;
+	ab8500_rtc_early_suspend.resume = ab8500_rtc_late_resume_callback;
+	register_early_suspend(&ab8500_rtc_early_suspend);
 	INIT_DELAYED_WORK_DEFERRABLE(&sync_work, ab8500_rtc_sync_work);
 	/* Once every minute to match calibration */
 	schedule_delayed_work(&sync_work, 60 * HZ);
@@ -504,25 +540,6 @@ static int __devexit ab8500_rtc_remove(struct platform_device *pdev)
 	return 0;
 }
 
-#ifdef CONFIG_PM
-static int ab8500_rtc_suspend(struct platform_device *pdev, pm_message_t state)
-{
-	cancel_delayed_work_sync(&sync_work);
-	return 0;
-}
-
-static int ab8500_rtc_resume(struct platform_device *pdev)
-{
-	/* Delay by 300ms to let resume finnish */
-	resumed = 1;
-	schedule_delayed_work(&sync_work, 3 * HZ / 10);
-	return 0;
-}
-#else
-#define ab8500_rtc_suspend NULL
-#define ab8500_rtc_resume NULL
-#endif
-
 static struct platform_driver ab8500_rtc_driver = {
 	.driver = {
 		.name = "ab8500-rtc",
@@ -530,22 +547,10 @@ static struct platform_driver ab8500_rtc_driver = {
 	},
 	.probe	= ab8500_rtc_probe,
 	.remove = __devexit_p(ab8500_rtc_remove),
-	.suspend = ab8500_rtc_suspend,
-	.resume = ab8500_rtc_resume,
 };
 
-static int __init ab8500_rtc_init(void)
-{
-	return platform_driver_register(&ab8500_rtc_driver);
-}
+module_platform_driver(ab8500_rtc_driver);
 
-static void __exit ab8500_rtc_exit(void)
-{
-	platform_driver_unregister(&ab8500_rtc_driver);
-}
-
-module_init(ab8500_rtc_init);
-module_exit(ab8500_rtc_exit);
 MODULE_AUTHOR("Virupax Sadashivpetimath <virupax.sadashivpetimath@stericsson.com>");
 MODULE_DESCRIPTION("AB8500 RTC Driver");
 MODULE_LICENSE("GPL v2");

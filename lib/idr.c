@@ -29,13 +29,15 @@
 #ifndef TEST                        // to test in user space...
 #include <linux/slab.h>
 #include <linux/init.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #endif
 #include <linux/err.h>
 #include <linux/string.h>
 #include <linux/idr.h>
+#include <linux/spinlock.h>
 
 static struct kmem_cache *idr_layer_cache;
+static DEFINE_SPINLOCK(simple_ida_lock);
 
 static struct idr_layer *get_from_free_list(struct idr *idp)
 {
@@ -593,8 +595,10 @@ EXPORT_SYMBOL(idr_for_each);
  * Returns pointer to registered object with id, which is next number to
  * given id. After being looked up, *@nextidp will be updated for the next
  * iteration.
+ *
+ * This function can be called under rcu_read_lock(), given that the leaf
+ * pointers lifetimes are correctly managed.
  */
-
 void *idr_get_next(struct idr *idp, int *nextidp)
 {
 	struct idr_layer *p, *pa[MAX_LEVEL];
@@ -603,11 +607,11 @@ void *idr_get_next(struct idr *idp, int *nextidp)
 	int n, max;
 
 	/* find first ent */
-	n = idp->layers * IDR_BITS;
-	max = 1 << n;
 	p = rcu_dereference_raw(idp->top);
 	if (!p)
 		return NULL;
+	n = (p->layer + 1) * IDR_BITS;
+	max = 1 << n;
 
 	while (id < max) {
 		while (n > 0 && p) {
@@ -621,14 +625,7 @@ void *idr_get_next(struct idr *idp, int *nextidp)
 			return p;
 		}
 
-		/*
-		 * Proceed to the next layer at the current level.  Unlike
-		 * idr_for_each(), @id isn't guaranteed to be aligned to
-		 * layer boundary at this point and adding 1 << n may
-		 * incorrectly skip IDs.  Make sure we jump to the
-		 * beginning of the next layer using round_up().
-		 */
-		id = round_up(id + 1, 1 << n);
+		id += 1 << n;
 		while (n < fls(id)) {
 			n += IDR_BITS;
 			p = *--paa;
@@ -772,8 +769,8 @@ EXPORT_SYMBOL(ida_pre_get);
  * @starting_id: id to start search at
  * @p_id:	pointer to the allocated handle
  *
- * Allocate new ID above or equal to @ida.  It should be called with
- * any required locks.
+ * Allocate new ID above or equal to @starting_id.  It should be called
+ * with any required locks.
  *
  * If memory is required, it will return %-EAGAIN, you should unlock
  * and go back to the ida_pre_get() call.  If the ida is full, it will
@@ -865,7 +862,7 @@ EXPORT_SYMBOL(ida_get_new_above);
  * and go back to the idr_pre_get() call.  If the idr is full, it will
  * return %-ENOSPC.
  *
- * @id returns a value in the range %0 ... %0x7fffffff.
+ * @p_id returns a value in the range %0 ... %0x7fffffff.
  */
 int ida_get_new(struct ida *ida, int *p_id)
 {
@@ -933,36 +930,6 @@ void ida_destroy(struct ida *ida)
 EXPORT_SYMBOL(ida_destroy);
 
 /**
- * ida_init - initialize ida handle
- * @ida:	ida handle
- *
- * This function is use to set up the handle (@ida) that you will pass
- * to the rest of the functions.
- */
-void ida_init(struct ida *ida)
-{
-	memset(ida, 0, sizeof(struct ida));
-	idr_init(&ida->idr);
-
-}
-EXPORT_SYMBOL(ida_init);
-
-/*
- * Copyright 2012    Hauke Mehrtens <hauke@hauke-m.de>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * Backport functionality introduced in Linux 3.1.
- */
-
-#include <linux/idr.h>
-#include <linux/cpufreq.h>
-
-static DEFINE_SPINLOCK(compat_simple_ida_lock);
-
-/**
  * ida_simple_get - get a new id.
  * @ida: the (initialized) ida.
  * @start: the minimum id (inclusive, < 0x8000000)
@@ -995,7 +962,7 @@ again:
 	if (!ida_pre_get(ida, gfp_mask))
 		return -ENOMEM;
 
-	spin_lock_irqsave(&compat_simple_ida_lock, flags);
+	spin_lock_irqsave(&simple_ida_lock, flags);
 	ret = ida_get_new_above(ida, start, &id);
 	if (!ret) {
 		if (id > max) {
@@ -1005,14 +972,14 @@ again:
 			ret = id;
 		}
 	}
-	spin_unlock_irqrestore(&compat_simple_ida_lock, flags);
+	spin_unlock_irqrestore(&simple_ida_lock, flags);
 
 	if (unlikely(ret == -EAGAIN))
 		goto again;
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(ida_simple_get);
+EXPORT_SYMBOL(ida_simple_get);
 
 /**
  * ida_simple_remove - remove an allocated id.
@@ -1024,8 +991,23 @@ void ida_simple_remove(struct ida *ida, unsigned int id)
 	unsigned long flags;
 
 	BUG_ON((int)id < 0);
-	spin_lock_irqsave(&compat_simple_ida_lock, flags);
+	spin_lock_irqsave(&simple_ida_lock, flags);
 	ida_remove(ida, id);
-	spin_unlock_irqrestore(&compat_simple_ida_lock, flags);
+	spin_unlock_irqrestore(&simple_ida_lock, flags);
 }
-EXPORT_SYMBOL_GPL(ida_simple_remove);
+EXPORT_SYMBOL(ida_simple_remove);
+
+/**
+ * ida_init - initialize ida handle
+ * @ida:	ida handle
+ *
+ * This function is use to set up the handle (@ida) that you will pass
+ * to the rest of the functions.
+ */
+void ida_init(struct ida *ida)
+{
+	memset(ida, 0, sizeof(struct ida));
+	idr_init(&ida->idr);
+
+}
+EXPORT_SYMBOL(ida_init);

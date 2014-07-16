@@ -11,31 +11,16 @@
 #include <linux/platform_device.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
+#include <linux/mfd/abx500/ab8500.h>
 #include <linux/slab.h>
 #include <linux/mfd/abx500.h>
-#include <linux/mfd/abx500/ab5500.h>
-#include <linux/ab8500-ponkey.h>
 
 /* Ponkey time control bits */
-#define AB5500_MCB		0x2F
-#define AB5500_PONKEY_10SEC	0x0
-#define AB5500_PONKEY_5SEC	0x1
-#define AB5500_PONKEY_DISABLE	0x2
-#define AB5500_PONKEY_TMR_MASK	0x1
-#define AB5500_PONKEY_TR_MASK	0x2
-
-static int ab5500_ponkey_hw_init(struct platform_device *);
 
 struct ab8500_ponkey_variant {
 	const char *irq_falling;
 	const char *irq_rising;
 	int (*hw_init)(struct platform_device *);
-};
-
-static const struct ab8500_ponkey_variant ab5500_onswa = {
-	.irq_falling	= "ONSWAn_falling",
-	.irq_rising	= "ONSWAn_rising",
-	.hw_init	= ab5500_ponkey_hw_init,
 };
 
 static const struct ab8500_ponkey_variant ab8500_ponkey = {
@@ -55,49 +40,15 @@ struct ab8500_ponkey_info {
 	int			irq_dbr;
 };
 
-static int ab5500_ponkey_hw_init(struct platform_device *pdev)
-{
-	u8 val;
-	struct ab5500_ponkey_platform_data *pdata;
-
-	pdata = pdev->dev.platform_data;
-	if (pdata) {
-		switch (pdata->shutdown_secs) {
-		case 0:
-			val = AB5500_PONKEY_DISABLE;
-			break;
-		case 5:
-			val = AB5500_PONKEY_5SEC;
-			break;
-		case 10:
-			val = AB5500_PONKEY_10SEC;
-			break;
-		default:
-			val = AB5500_PONKEY_10SEC;
-		}
-	} else {
-		val = AB5500_PONKEY_10SEC;
-	}
-	return abx500_mask_and_set(
-		&pdev->dev,
-		AB5500_BANK_STARTUP,
-		AB5500_MCB,
-		AB5500_PONKEY_TMR_MASK | AB5500_PONKEY_TR_MASK,
-		val);
-}
-
 /* AB8500 gives us an interrupt when ONKEY is held */
 static irqreturn_t ab8500_ponkey_handler(int irq, void *data)
 {
 	struct ab8500_ponkey_info *info = data;
 
-	if (irq == info->irq_dbf) {
-		ab8500_forced_key_detect(AB8500_PON_PRESSED);
+	if (irq == info->irq_dbf)
 		input_report_key(info->idev, KEY_POWER, true);
-	} else if (irq == info->irq_dbr) {
-		ab8500_forced_key_detect(AB8500_PON_RELEASED);
+	else if (irq == info->irq_dbr)
 		input_report_key(info->idev, KEY_POWER, false);
-	}
 
 	input_sync(info->idev);
 
@@ -179,7 +130,6 @@ static int __devinit ab8500_ponkey_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, info);
-	ab8500_forcecrash_init(pdev);
 
 	return 0;
 
@@ -199,7 +149,6 @@ static int __devexit ab8500_ponkey_remove(struct platform_device *pdev)
 {
 	struct ab8500_ponkey_info *info = platform_get_drvdata(pdev);
 
-	ab8500_forcecrash_exit(pdev);
 	free_irq(info->irq_dbf, info);
 	free_irq(info->irq_dbr, info);
 	input_unregister_device(info->idev);
@@ -208,7 +157,6 @@ static int __devexit ab8500_ponkey_remove(struct platform_device *pdev)
 }
 
 static struct platform_device_id ab8500_ponkey_id_table[] = {
-	{ "ab5500-onswa", (kernel_ulong_t)&ab5500_onswa, },
 	{ "ab8500-poweron-key", (kernel_ulong_t)&ab8500_ponkey, },
 	{ },
 };
@@ -223,18 +171,7 @@ static struct platform_driver ab8500_ponkey_driver = {
 	.probe		= ab8500_ponkey_probe,
 	.remove		= __devexit_p(ab8500_ponkey_remove),
 };
-
-static int __init ab8500_ponkey_init(void)
-{
-	return platform_driver_register(&ab8500_ponkey_driver);
-}
-module_init(ab8500_ponkey_init);
-
-static void __exit ab8500_ponkey_exit(void)
-{
-	platform_driver_unregister(&ab8500_ponkey_driver);
-}
-module_exit(ab8500_ponkey_exit);
+module_platform_driver(ab8500_ponkey_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Sundar Iyer <sundar.iyer@stericsson.com>");

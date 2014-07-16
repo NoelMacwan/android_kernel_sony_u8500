@@ -2,7 +2,6 @@
  * drivers/usb/core/otg_whitelist.h
  *
  * Copyright (C) 2004 Texas Instruments
- * Copyright (C) 2012 Sony Mobile Communications AB.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -45,14 +44,10 @@ static struct usb_device_id whitelist_table [] = {
 #endif
 
 #ifdef CONFIG_USB_OTG_20
-{ USB_DEVICE_INFO(USB_CLASS_HID, 1, 1) },    /* Keyboard Devices */
-{ USB_DEVICE_INFO(USB_CLASS_HID, 1, 2) },    /* Mouse Devices */
-{ USB_DEVICE_INFO(USB_CLASS_HID, 0, 0) },    /* Gamepad Devices */
-
-#ifdef CONFIG_JOYSTICK_XPAD
-{ USB_DEVICE_INFO(USB_CLASS_VENDOR_SPEC, 0x5d, 0x81), },
-{ USB_DEVICE_INFO(USB_CLASS_VENDOR_SPEC, 0x5d, 0x01), },
-#endif
+{ USB_DEVICE_INFO(8, 6, 80) },/* Mass Storage Devices */
+{ USB_DEVICE_INFO(1, 1, 0) },/* Audio Devices */
+{ USB_DEVICE_INFO(3, 0, 0) },/* keyboard Devices */
+{ USB_DEVICE_INFO(3, 1, 2) },/* Mouse Devices */
 
 /* Test Devices */
 { USB_DEVICE(0x1A0A, 0x0101), },/* Test_SE0_NAK */
@@ -78,6 +73,7 @@ static struct usb_device_id whitelist_table [] = {
 #define USB_OTG_TEST_HS_HOST_PORT_SUSPEND_RESUME_PID   0x0106
 #define USB_OTG_TEST_SINGLE_STEP_GET_DEV_DESC_PID      0x0107
 #define USB_OTG_TEST_SINGLE_STEP_GET_DEV_DESC_DATA_PID 0x0108
+
 #define USB_OTG_TEST_SE0_NAK                           0x01
 #define USB_OTG_TEST_J		                       0x02
 #define USB_OTG_TEST_K		                       0x03
@@ -85,16 +81,15 @@ static struct usb_device_id whitelist_table [] = {
 /* For A_HNP and B_HNP test cases PET identifies itself
  * with a PID of 0x0200
  */
-#define USB_OTG_PET_TEST_HNP			       0x0200
-
+#define USB_OTG_PET_TEST_HNP                          0x0200
 #endif
 
 static int is_targeted(struct usb_device *dev)
 {
 	struct usb_device_id	*id = whitelist_table;
 #ifdef CONFIG_USB_OTG_20
-	u8 nifc = dev->config ? dev->config->desc.bNumInterfaces : 0;
-	u8 i;
+	u8 number_configs = 0;
+	u8 number_interface = 0;
 #endif
 
 	/* possible in developer configs only! */
@@ -140,43 +135,41 @@ static int is_targeted(struct usb_device *dev)
 		    (id->bDeviceProtocol != dev->descriptor.bDeviceProtocol))
 			continue;
 
-/* add other match criteria here ... */
-#ifdef CONFIG_USB_OTG_20
-		/* Checking class,subclass and protocal at interface level */
-		for (i = 0; i < nifc; i++) {
-			if (!dev->config->intf_cache[i])
-				continue;
-
-			if ((id->match_flags &
-				USB_DEVICE_ID_MATCH_INT_CLASS)
-				&& (id->bInterfaceClass !=
-				dev->config->intf_cache[i]
-				->altsetting[0].desc.bInterfaceClass))
-				continue;
-
-			if ((id->match_flags &
-				USB_DEVICE_ID_MATCH_INT_SUBCLASS)
-				&& (id->bInterfaceSubClass !=
-				dev->config->intf_cache[i]
-				->altsetting[0].desc.bInterfaceSubClass))
-				continue;
-
-			if ((id->match_flags &
-				USB_DEVICE_ID_MATCH_INT_PROTOCOL)
-				&& (id->bInterfaceProtocol !=
-				dev->config->intf_cache[i]
-				->altsetting[0].desc.bInterfaceProtocol))
-				continue;
-
-			break;
-		}
-
-		if (nifc && i == nifc)
-			continue;
-#endif
 		return 1;
 	}
 
+	/* add other match criteria here ... */
+
+#ifdef CONFIG_USB_OTG_20
+
+	/* Checking class,subclass and protocal at interface level */
+	for (number_configs = dev->descriptor.bNumConfigurations;
+					 number_configs > 0; number_configs--)
+		for (number_interface = dev->config->desc.bNumInterfaces;
+					 number_interface > 0;
+					 number_interface--)
+			for (id = whitelist_table; id->match_flags; id++) {
+				if ((id->match_flags &
+					 USB_DEVICE_ID_MATCH_DEV_CLASS) &&
+					(id->bDeviceClass !=
+					dev->config->intf_cache[number_interface-1]
+					->altsetting[0].desc.bInterfaceClass))
+					continue;
+				if ((id->match_flags &
+					USB_DEVICE_ID_MATCH_DEV_SUBCLASS)
+					&& (id->bDeviceSubClass !=
+					dev->config->intf_cache[number_interface-1]
+					->altsetting[0].desc.bInterfaceSubClass))
+					continue;
+				if ((id->match_flags &
+					USB_DEVICE_ID_MATCH_DEV_PROTOCOL)
+					&& (id->bDeviceProtocol !=
+					dev->config->intf_cache[number_interface-1]
+					->altsetting[0].desc.bInterfaceProtocol))
+					continue;
+			return 1;
+		}
+#endif
 
 	/* OTG MESSAGE: report errors here, customize to match your product */
 	dev_err(&dev->dev, "device v%04x p%04x is not supported\n",

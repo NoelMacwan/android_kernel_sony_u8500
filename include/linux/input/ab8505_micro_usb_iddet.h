@@ -6,6 +6,7 @@
 
 #include <linux/device.h>
 #include <linux/kthread.h>
+#include <linux/clk.h>
 
 enum usb_state {
 	USB_BOOT_ON_PLUGGED,
@@ -14,6 +15,10 @@ enum usb_state {
 	USB_BOOT_OFF_UNPLUGGED,
 	LEGACY_CHARGER_PLUGGED,
 	LEGACY_CHARGER_UNPLUGGED,
+	CARKIT_TYPE1_PLUGGED,
+	CARKIT_TYPE1_UNPLUGGED,
+	CARKIT_TYPE2_PLUGGED,
+	CARKIT_TYPE2_UNPLUGGED,
 };
 
 enum usbswitch_link {
@@ -32,7 +37,14 @@ enum usbswitch_link {
 	USBSWITCH_UART,
 	/* Vbus, No Id resistance */
 	USBSWITCH_LEGACY_CHARGER,
+	/* carkit 5-wire with 200kOhm ID resistance */
+	USBSWITCH_CARKIT_TYPE1,
+	/* carkit 5-wire with 440kOhm ID resistance */
+	USBSWITCH_CARKIT_TYPE2,
+	/* Phone powered device, 102kOhm resistance */
+	USBSWITCH_PPD,
 	USBSWITCH_UNKNOWN,
+	USBSWITCH_USBHOST,
 	USBSWITCH_NONE,
 };
 
@@ -40,7 +52,8 @@ struct usb_accessory_state {
 	struct device *dev;
 	struct ab8500_gpadc *gpadc;
 	struct kthread_worker kworker;
-	struct kthread_work read_adc_work;
+	struct kthread_work detect_button_work;
+	struct kthread_work detect_accessory_work;
 	struct task_struct *gpadc_read_thread;
 	struct hrtimer timer;
 	int cable_detected;
@@ -50,7 +63,16 @@ struct usb_accessory_state {
 	struct button_param_list *btn_param_list;
 	struct delayed_work detect_button;
 	struct delayed_work cable_detection;
+	struct work_struct cable_unplug_work;
+	struct work_struct legacy_unplug_work;
 	struct workqueue_struct *iddet_workqueue;
+	unsigned char usb_otg_ctrl;
+	unsigned char handle_plug_irq;
+	struct mutex usb_otg_ctrl_lock;
+	struct platform_device *pdev;
+	struct ab8500 *parent;
+	struct clk *micusb_sysclk;
+	struct clk *micusb_ph5clk;
 };
 
 struct cust_rid_adcid {
@@ -80,6 +102,8 @@ struct ab8505_iddet_platdata {
 	struct cust_rid_adcid *adc_id_list;
 	int (*uart_cable)(struct usb_accessory_state *, bool);
 	struct button_param_list *btn_list;
+	int (*gpio_enable)(void);
+	int (*gpio_disable)(void);
 };
 
 #define CUST_RID_ADCID(mn, mx, r, id) { .min = mn, .max = mx,	\
@@ -111,6 +135,7 @@ struct ab8505_iddet_platdata {
 #define AB8505_INTERRUPT		0x0E
 #define AB8505_AUDIO			0x0D
 #define AB8505_GPIO			0x10
+#define AB8505_SYS_CTRL			0x01
 
 extern struct ab8505_iddet_platdata iddet_adc_val_list;
 extern void set_android_switch_state(int state);

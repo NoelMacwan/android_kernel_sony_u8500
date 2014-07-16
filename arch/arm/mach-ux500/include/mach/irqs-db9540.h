@@ -55,4 +55,11 @@
 #define IRQ_AP9540_C2C_DDR1		(IRQ_SHPI_START + 165)
 #define IRQ_AP9540_C2C_SGX_IDLE	(IRQ_SHPI_START + 166)
 
+/* nb IRQs and nb GIC SHPI registers supported in ux540.
+ * The 32 first GIC IRQs are SGI and PPI. SHPI IRQs come next.
+ */
+#define U9540_GIC_DIST_SPI_NB		224
+#define U9540_GIC_DIST_SPI_REGS_NB	(U9540_GIC_DIST_SPI_NB / 32)
+#define U9540_GIC_DIST_REGS_NB		(U9540_GIC_DIST_SPI_REGS_NB + 1)
+
 #endif

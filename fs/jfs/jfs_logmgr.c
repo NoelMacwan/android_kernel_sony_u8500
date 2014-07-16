@@ -67,6 +67,7 @@
 #include <linux/buffer_head.h>		/* for sync_blockdev() */
 #include <linux/bio.h>
 #include <linux/freezer.h>
+#include <linux/export.h>
 #include <linux/delay.h>
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
@@ -1057,8 +1058,7 @@ static int lmLogSync(struct jfs_log * log, int hard_sync)
  */
 void jfs_syncpt(struct jfs_log *log, int hard_sync)
 {	LOG_LOCK(log);
-	if (!test_bit(log_QUIESCE, &log->flag))
-		lmLogSync(log, hard_sync);
+	lmLogSync(log, hard_sync);
 	LOG_UNLOCK(log);
 }
 
@@ -2349,7 +2349,7 @@ int jfsIOWait(void *arg)
 
 		if (freezing(current)) {
 			spin_unlock_irq(&log_redrive_lock);
-			refrigerator();
+			try_to_freeze();
 		} else {
 			set_current_state(TASK_INTERRUPTIBLE);
 			spin_unlock_irq(&log_redrive_lock);

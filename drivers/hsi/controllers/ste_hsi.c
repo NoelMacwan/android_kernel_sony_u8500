@@ -16,6 +16,8 @@
 #include <linux/regulator/consumer.h>
 #include <linux/gpio.h>
 #include <linux/mfd/dbx500-prcmu.h>
+#include <linux/wakelock.h>
+#include <linux/workqueue.h>
 
 #ifdef CONFIG_STE_DMA40
 #include <linux/dmaengine.h>
@@ -24,100 +26,7 @@
 
 #include <mach/hsi.h>
 
-/*
- * Copy of HSIR/HSIT context for restoring after HW reset (Vape power off).
- */
-struct ste_hsi_hw_context {
-	unsigned int tx_mode;
-	unsigned int tx_divisor;
-	unsigned int tx_channels;
-	unsigned int tx_priority;
-	unsigned int rx_mode;
-	unsigned int rx_channels;
-};
-
-/**
- * struct ste_hsi_controller - STE HSI controller data
- * @dev: device associated to STE HSI controller
- * @tx_dma_base: HSI TX peripheral physical address
- * @rx_dma_base: HSI RX peripheral physical address
- * @rx_base: HSI RX peripheral virtual address
- * @tx_base: HSI TX peripheral virtual address
- * @regulator: STE HSI Vape consumer regulator
- * @context: copy of client-configured HSI TX / HSI RX registers
- * @tx_clk: HSI TX core clock (HSITXCLK)
- * @rx_clk: HSI RX core clock (HSIRXCLK)
- * @ssitx_clk: HSI TX host clock (HCLK)
- * @ssirx_clk: HSI RX host clock (HCLK)
- * @clk_work: structure for delayed HSI clock disabling
- * @overrun_irq: HSI channels overrun IRQ table
- * @ck_refcount: reference count for clock enable operation
- * @ck_lock: locking primitive for HSI clocks
- * @lock: locking primitive for HSI controller
- * @use_dma: flag for DMA enabled
- * @ck_on: flag for HSI clocks enabled
- */
-struct ste_hsi_controller {
-	struct device *dev;
-	dma_addr_t tx_dma_base;
-	dma_addr_t rx_dma_base;
-	unsigned char __iomem *rx_base;
-	unsigned char __iomem *tx_base;
-	struct regulator *regulator;
-	struct ste_hsi_hw_context *context;
-	struct clk *tx_clk;
-	struct clk *rx_clk;
-	struct clk *ssitx_clk;
-	struct clk *ssirx_clk;
-	struct delayed_work clk_work;
-	int overrun_irq[STE_HSI_MAX_CHANNELS];
-	int ck_refcount;
-	spinlock_t ck_lock;
-	spinlock_t lock;
-	unsigned int use_dma:1;
-	unsigned int ck_on:1;
-};
-
-#ifdef CONFIG_STE_DMA40
-struct ste_hsi_channel_dma {
-	struct dma_chan *dma_chan;
-	struct dma_async_tx_descriptor *desc;
-	dma_cookie_t cookie;
-};
-#endif
-
-struct ste_hsi_port {
-	struct device *dev;
-	struct list_head txqueue[STE_HSI_MAX_CHANNELS];
-	struct list_head rxqueue[STE_HSI_MAX_CHANNELS];
-	struct list_head brkqueue;
-	int cawake_irq;
-	int acwake_gpio;
-	int tx_irq;
-	int rx_irq;
-	int excep_irq;
-	struct tasklet_struct cawake_tasklet;
-	struct tasklet_struct rx_tasklet;
-	struct tasklet_struct tx_tasklet;
-	struct tasklet_struct exception_tasklet;
-	struct tasklet_struct overrun_tasklet;
-	unsigned char channels;
-#ifdef CONFIG_STE_DMA40
-	struct ste_hsi_channel_dma tx_dma[STE_HSI_MAX_CHANNELS];
-	struct ste_hsi_channel_dma rx_dma[STE_HSI_MAX_CHANNELS];
-#endif
-};
-
-#define hsi_to_ste_port(port) (hsi_port_drvdata(port))
-#define hsi_to_ste_controller(con) (hsi_controller_drvdata(con))
-#define client_to_ste_port(cl) (hsi_port_drvdata(hsi_get_port(cl)))
-#define client_to_hsi(cl) \
-	(to_hsi_controller(hsi_get_port(cl)->device.parent))
-#define client_to_ste_controller(cl)  \
-	(hsi_controller_drvdata(client_to_hsi(cl)))
-#define ste_port_to_ste_controller(port) \
-	((struct ste_hsi_controller *)hsi_controller_drvdata(	\
-		to_hsi_controller(port->dev->parent)))
+#include "ste_hsi.h"
 
 static u32 ste_hsir_periphid[8] = { 0x2C, 0, 0x8, 0x18, 0xD, 0xF0, 0x5, 0xB1 };
 static u32 ste_hsit_periphid[8] = { 0x2B, 0, 0x8, 0x18, 0xD, 0xF0, 0x5, 0xB1 };
@@ -179,6 +88,7 @@ static void ste_hsi_init_registers(struct ste_hsi_controller *ste_hsi)
 	writel(2, ste_hsi->rx_base + STE_HSI_RX_STATE);
 
 	writel(0, ste_hsi->rx_base + STE_HSI_RX_EXCEPIM);
+
 }
 
 static void ste_hsi_setup_registers(struct ste_hsi_controller *ste_hsi)
@@ -192,8 +102,6 @@ static void ste_hsi_setup_registers(struct ste_hsi_controller *ste_hsi)
 	writel(pcontext->tx_mode, ste_hsi->tx_base + STE_HSI_TX_MODE);
 	writel(pcontext->tx_divisor, ste_hsi->tx_base + STE_HSI_TX_DIVISOR);
 	writel(pcontext->tx_channels, ste_hsi->tx_base + STE_HSI_TX_CHANNELS);
-	writel(pcontext->tx_priority, ste_hsi->tx_base + STE_HSI_TX_PRIORITY);
-
 	/* Calculate buffers number per channel */
 	buffers = STE_HSI_MAX_BUFFERS / pcontext->tx_channels;
 	for (i = 0; i < pcontext->tx_channels; i++) {
@@ -211,7 +119,7 @@ static void ste_hsi_setup_registers(struct ste_hsi_controller *ste_hsi)
 	 * The field value must be less than the corresponding SPAN value.
 	 */
 #ifdef CONFIG_STE_DMA40
-		writel(STE_HSI_DMA_MAX_BURST-1,
+		writel(ste_hsi->context->tx_dma_burst-1,
 			ste_hsi->tx_base + STE_HSI_TX_WATERMARKX + 4 * i);
 #else /* IRQ mode */
 		writel(0, ste_hsi->tx_base + STE_HSI_TX_WATERMARKX + 4 * i);
@@ -258,7 +166,7 @@ static void ste_hsi_setup_registers(struct ste_hsi_controller *ste_hsi)
 	 * The field value must be less than the corresponding SPAN value.
 	 */
 #ifdef CONFIG_STE_DMA40
-		writel(STE_HSI_DMA_MAX_BURST-1,
+		writel(ste_hsi->context->rx_dma_burst-1,
 			ste_hsi->rx_base + STE_HSI_RX_WATERMARKX + 4 * i);
 #else /* IRQ mode */
 		writel(0, ste_hsi->rx_base + STE_HSI_RX_WATERMARKX + 4 * i);
@@ -317,13 +225,13 @@ static void ste_hsi_clks_free(struct ste_hsi_controller *ste_hsi)
 	ste_hsi_clk_free(&ste_hsi->ssitx_clk);
 }
 
-static int ste_hsi_clock_enable(struct hsi_controller *hsi)
+int ste_hsi_clock_enable(struct hsi_controller *hsi)
 {
 	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
 	int err = 0;
 
 	spin_lock_bh(&ste_hsi->ck_lock);
-	if (ste_hsi->ck_refcount++ || ste_hsi->ck_on)
+	if (ste_hsi->ck_refcount || ste_hsi->ck_on)
 		goto out;
 
 	err = clk_enable(ste_hsi->ssirx_clk);
@@ -353,8 +261,8 @@ static int ste_hsi_clock_enable(struct hsi_controller *hsi)
 
 	ste_hsi->ck_on = 1;
 out:
-	if (err)
-		ste_hsi->ck_refcount--;
+	if (!err)
+		ste_hsi->ck_refcount++;
 
 	spin_unlock_bh(&ste_hsi->ck_lock);
 
@@ -397,7 +305,7 @@ out:
 	spin_unlock_bh(&ste_hsi->ck_lock);
 }
 
-static void ste_hsi_clock_disable(struct hsi_controller *hsi)
+void ste_hsi_clock_disable(struct hsi_controller *hsi)
 {
 	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
 
@@ -407,9 +315,10 @@ static void ste_hsi_clock_disable(struct hsi_controller *hsi)
 	if (ste_hsi->ck_refcount <= 0)
 		WARN_ON(ste_hsi->ck_refcount <= 0);
 
-	/* Need clock to be disable now? */
-	if (--ste_hsi->ck_refcount)
+	if (!ste_hsi->ck_refcount || !ste_hsi->ck_on)
 		goto out;
+
+	ste_hsi->ck_refcount--;
 
 	/*
 	 * If receiver or transmitter is in the middle something delay clock off
@@ -436,17 +345,80 @@ out:
 	spin_unlock_bh(&ste_hsi->ck_lock);
 }
 
+static int ste_hsi_set_ape_opp(struct hsi_controller *hsi,
+		unsigned int tx_speed, unsigned int rx_speed)
+{
+	int err;
+	s32 opp;
+
+	/*
+	 * If speed set is above 100Mbps, HSI clks need to be > 100MHz
+	 * This is only possible if APE OPP is set to 100%.
+	 * If speed is equal or below 100Mbps, then 50% OPP is acceptable.
+	 */
+	if ((tx_speed > STE_HSI_MIDDLE_SPEED) ||
+			((rx_speed) > STE_HSI_MIDDLE_SPEED))
+		opp = STE_HSI_HIGH_OPP;
+	else
+		opp = STE_HSI_MIDDLE_OPP;
+
+	err = prcmu_qos_update_requirement(PRCMU_QOS_APE_OPP,
+			(char *)dev_name(&hsi->device), opp);
+	if (err)
+		dev_err(&hsi->device, "HSI add APE OPP %d failed\n", opp);
+
+	return err;
+}
+
+static int ste_hsi_set_clk_rate(struct hsi_controller *hsi,
+		unsigned int speed, struct clk *clock)
+{
+	unsigned long rate, new_rate;
+	int err;
+
+	/*
+	 * If speed set is above 100Mbps, HSI clk has to be set at 200Mhz
+	 * If speed is equal or below 100Mbps, then HSI clk at 100Mhz is
+	 * acceptable.
+	 */
+
+	if (speed > STE_HSI_MIDDLE_SPEED)
+		rate =  STE_HSI_MAX_FREQ;
+	else
+		rate = STE_HSI_MIN_FREQ;
+
+	ste_hsi_clock_disable(hsi);
+	new_rate = clk_round_rate(clock, rate);
+	err = clk_set_rate(clock, new_rate);
+	if (unlikely(err))
+		dev_err(&hsi->device, "Couldn't set HSI clock rate: %d\n",
+				err);
+
+	err = ste_hsi_clock_enable(hsi);
+	if (unlikely(err))
+		dev_err(&hsi->device, "Couldn't enable HSI clock: %d\n", err);
+
+	return err;
+}
+
 static int ste_hsi_start_irq(struct hsi_msg *msg)
 {
 	struct hsi_port *port = hsi_get_port(msg->cl);
 	struct hsi_controller *hsi = to_hsi_controller(port->device.parent);
 	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
 	u32 val;
-	int err;
+	int err = 0;
 
-	err = ste_hsi_clock_enable(hsi);
-	if (unlikely(err))
-		return err;
+	if (ste_hsi->regulator) {
+		if (!regulator_is_enabled(ste_hsi->regulator))
+			regulator_enable(ste_hsi->regulator);
+	}
+
+	if (!ste_hsi->ck_refcount) {
+		err = ste_hsi_clock_enable(hsi);
+		if (unlikely(err))
+			return err;
+	}
 
 	ste_hsi_context(ste_hsi);
 
@@ -467,7 +439,7 @@ static int ste_hsi_start_irq(struct hsi_msg *msg)
 		writel(val, ste_hsi->rx_base + STE_HSI_RX_OVERRUNIM);
 	}
 
-	return 0;
+	return err;
 }
 
 static int ste_hsi_start_transfer(struct ste_hsi_port *ste_port,
@@ -521,7 +493,6 @@ static void ste_hsi_dma_callback(void *dma_async_param)
 
 	msg->complete(msg);
 
-	ste_hsi_clock_disable(hsi);
 
 	spin_lock_bh(&ste_hsi->lock);
 	ste_hsi_start_transfer(ste_port, queue);
@@ -564,11 +535,18 @@ static int ste_hsi_start_dma(struct hsi_msg *msg)
 	char *dma_enable_address;
 	enum dma_data_direction direction;
 	u32 dma_mask;
-	int err;
+	int err = 0;
 
-	err = ste_hsi_clock_enable(hsi);
-	if (unlikely(err))
-		return err;
+	if (ste_hsi->regulator) {
+		if (!regulator_is_enabled(ste_hsi->regulator))
+			regulator_enable(ste_hsi->regulator);
+	}
+
+	if (ste_hsi->ck_refcount == 0) {
+		err = ste_hsi_clock_enable(hsi);
+		if (unlikely(err))
+			return err;
+	}
 
 	ste_hsi_context(ste_hsi);
 
@@ -602,7 +580,8 @@ static int ste_hsi_start_dma(struct hsi_msg *msg)
 						  msg->sgt.nents,
 						  direction,
 						  DMA_PREP_INTERRUPT |
-						  DMA_CTRL_ACK);
+						  DMA_CTRL_ACK,
+						  NULL);
 
 	if (!desc) {
 		dma_unmap_sg(&hsi->device, msg->sgt.sgl, msg->sgt.nents,
@@ -646,7 +625,7 @@ static void __init ste_hsi_init_dma(struct ste_hsi_platform_data *data,
 	dma_cap_set(DMA_SLAVE, mask);
 
 	for (i = 0; i < hsi->num_ports; ++i) {
-		port = &hsi->port[i];
+		port = hsi->port[i];
 		ste_port = hsi_port_drvdata(port);
 
 		for (ch = 0; ch < STE_HSI_MAX_CHANNELS; ++ch) {
@@ -676,13 +655,13 @@ static int ste_hsi_setup_dma(struct hsi_client *cl)
 		.src_addr = 0,	/* dynamic data */
 		.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
 		.direction = DMA_FROM_DEVICE,
-		.src_maxburst = STE_HSI_DMA_MAX_BURST,
+		.src_maxburst = ste_hsi->context->rx_dma_burst,
 	};
 	struct dma_slave_config tx_conf = {
 		.dst_addr = 0,	/* dynamic data */
 		.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
 		.direction = DMA_TO_DEVICE,
-		.dst_maxburst = STE_HSI_DMA_MAX_BURST,
+		.dst_maxburst = ste_hsi->context->tx_dma_burst,
 	};
 
 	if (!ste_hsi->use_dma)
@@ -802,8 +781,6 @@ static void ste_hsi_receive_data(struct hsi_port *port, unsigned int channel)
 	spin_unlock_bh(&ste_hsi->lock);
 	msg->complete(msg);
 
-	ste_hsi_clock_disable(hsi);
-
 	spin_lock_bh(&ste_hsi->lock);
 
 	ste_hsi_start_transfer(ste_port, queue);
@@ -867,41 +844,68 @@ static void ste_hsi_transmit_data(struct hsi_port *port, unsigned int channel)
 	spin_unlock_bh(&ste_hsi->lock);
 	msg->complete(msg);
 
-	ste_hsi_clock_disable(hsi);
-
 	spin_lock_bh(&ste_hsi->lock);
 	ste_hsi_start_transfer(ste_port, queue);
 out:
 	spin_unlock_bh(&ste_hsi->lock);
 }
 
-static void ste_hsi_cawake_tasklet(unsigned long data)
+
+static void ste_hsi_cawake_work(struct work_struct *work)
 {
-	struct hsi_port *port = (struct hsi_port *)data;
-	struct hsi_controller *hsi = to_hsi_controller(port->device.parent);
-	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
-	struct ste_hsi_port *ste_port = hsi_port_drvdata(port);
 	u32 prcm_line_value;
 	int level;
+	struct ste_hsi_port *ste_hsi_port =
+		container_of(work, struct ste_hsi_port, ca_wake_work);
+	struct hsi_controller *hsi =
+		to_hsi_controller(ste_hsi_port->dev->parent);
+	struct ste_hsi_controller *ste_hsi =
+			hsi_controller_drvdata(hsi);
 
 	prcm_line_value = prcmu_read(DB8500_PRCM_LINE_VALUE);
 	level = (prcm_line_value & DB8500_PRCM_LINE_VALUE_HSI_CAWAKE0) ? 1 : 0;
 
-	dev_info(ste_hsi->dev, "cawake %s\n", level ? "HIGH" : "LOW");
-	hsi_event(hsi->port, level ? HSI_EVENT_START_RX : HSI_EVENT_STOP_RX);
-	enable_irq(ste_port->cawake_irq);
+
+	if (ste_hsi->ca_status == CA_SLEEP) {
+		hsi_event(*hsi->port, HSI_EVENT_STOP_RX);
+		ste_hsi->ca_status = CA_STOP_RX;
+		if (level == 0) {
+			enable_irq(ste_hsi_port->cawake_irq);
+			prcm_line_value = prcmu_read(DB8500_PRCM_LINE_VALUE);
+
+			if ((prcm_line_value &
+				DB8500_PRCM_LINE_VALUE_HSI_CAWAKE0) != 0) {
+				hsi_event(*hsi->port, HSI_EVENT_START_RX);
+				ste_hsi->ca_status = CA_START_RX;
+				disable_irq_nosync(ste_hsi_port->cawake_irq);
+			}
+		} else {
+			hsi_event(*hsi->port, HSI_EVENT_START_RX);
+			ste_hsi->ca_status = CA_START_RX;
+		}
+
+	} else if ((level == 1) && (ste_hsi->ca_status == CA_STOP_RX)) {
+		hsi_event(*hsi->port, HSI_EVENT_START_RX);
+		ste_hsi->ca_status = CA_START_RX;
+	}
 }
 
 static irqreturn_t ste_hsi_cawake_isr(int irq, void *data)
 {
 	struct hsi_port *port = data;
-
 	/* IRQ processed only if device initialized */
 	if ((port->device.parent) && (data)) {
 		struct ste_hsi_port *ste_port = hsi_port_drvdata(port);
+		struct hsi_controller *hsi =
+			to_hsi_controller(port->device.parent);
+		struct ste_hsi_controller *ste_hsi =
+			hsi_controller_drvdata(hsi);
 
 		disable_irq_nosync(irq);
-		tasklet_hi_schedule(&ste_port->cawake_tasklet);
+		if (ste_hsi->suspend_ongoing == 1)
+			ste_port->pending_ca_wake_isr = 1;
+		else
+			queue_work(system_nrt_wq, &ste_port->ca_wake_work);
 	}
 
 	return IRQ_HANDLED;
@@ -1075,7 +1079,7 @@ static void ste_hsi_overrun_tasklet(unsigned long data)
 {
 	struct hsi_controller *hsi = (struct hsi_controller *)data;
 	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
-	struct hsi_port *hsi_port = &hsi->port[0];
+	struct hsi_port *hsi_port = hsi->port[0];
 	struct ste_hsi_port *ste_port = hsi_port_drvdata(hsi_port);
 	struct hsi_msg *msg;
 
@@ -1190,15 +1194,19 @@ static int __init ste_hsi_acwake_gpio_init(struct platform_device *pdev,
 {
 	int err = 0;
 	const char *gpio_name = "hsi0_acwake";
-	struct resource *resource;
+	struct ste_hsi_platform_data *pdata = pdev->dev.platform_data;
 
-	resource = platform_get_resource_byname(pdev, IORESOURCE_IO, gpio_name);
-	if (unlikely(!resource)) {
+	if (!pdata) {
+		dev_err(&pdev->dev, "invalid hsi platform data\n");
+		return -EINVAL;
+	}
+
+	if (pdata->hsi0_acwake_gpio <= 0) {
 		dev_err(&pdev->dev, "hsi0_acwake does not exist\n");
 		return -EINVAL;
 	}
 
-	*gpio = resource->start;
+	*gpio = pdata->hsi0_acwake_gpio;
 	err = gpio_request(*gpio, gpio_name);
 	if (err < 0) {
 		dev_err(&pdev->dev, "Can't request GPIO %d\n", *gpio);
@@ -1230,7 +1238,8 @@ static int __init ste_hsi_get_irq(struct platform_device *pdev,
 	}
 
 	err = devm_request_irq(&pdev->dev, irq->start, isr,
-			       IRQF_DISABLED, irq->name, data);
+			       IRQF_DISABLED | IRQF_NO_SUSPEND,
+			       irq->name, data);
 	if (err)
 		dev_err(&pdev->dev, "%s IRQ request failed!\n", irq->name);
 
@@ -1306,8 +1315,7 @@ static int ste_hsi_async(struct hsi_msg *msg)
 	struct ste_hsi_controller *ste_hsi;
 	struct ste_hsi_port *ste_port;
 	struct list_head *queue;
-	int err = 0;
-
+	int err;
 	if (unlikely(!msg))
 		return -ENOSYS;
 
@@ -1350,13 +1358,25 @@ static int ste_hsi_setup(struct hsi_client *cl)
 	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
 	int err;
 	u32 div = 0;
-	int ch;
 
 	if (ste_hsi->regulator)
 		regulator_enable(ste_hsi->regulator);
 
 	err = ste_hsi_clock_enable(hsi);
 	if (unlikely(err))
+		return err;
+
+	err = ste_hsi_set_ape_opp(hsi, cl->tx_cfg.speed,
+				cl->rx_cfg.speed);
+	if (err)
+		return err;
+
+	err = ste_hsi_set_clk_rate(hsi, cl->tx_cfg.speed, ste_hsi->tx_clk);
+	if (err)
+		return err;
+
+	err = ste_hsi_set_clk_rate(hsi, cl->rx_cfg.speed, ste_hsi->rx_clk);
+	if (err)
 		return err;
 
 	if (cl->tx_cfg.speed) {
@@ -1376,12 +1396,6 @@ static int ste_hsi_setup(struct hsi_client *cl)
 		ste_hsi->context->tx_mode = cl->tx_cfg.mode;
 		ste_hsi->context->tx_divisor = div;
 		ste_hsi->context->tx_channels = cl->tx_cfg.channels;
-		ste_hsi->context->tx_priority = 0;
-		if (HSI_ARB_PRIO == cl->tx_cfg.arb_mode)
-			for (ch = 0; ch < STE_HSI_MAX_CHANNELS; ch++)
-				if (cl->tx_cfg.ch_prio[ch])
-					ste_hsi->context->tx_priority |=
-								(1 << ch);
 
 		if ((HSI_FLOW_PIPE == cl->rx_cfg.flow) &&
 			(HSI_MODE_FRAME == cl->rx_cfg.mode))
@@ -1390,6 +1404,9 @@ static int ste_hsi_setup(struct hsi_client *cl)
 			ste_hsi->context->rx_mode = cl->rx_cfg.mode;
 
 		ste_hsi->context->rx_channels = cl->rx_cfg.channels;
+
+		ste_hsi->context->rx_dma_burst = cl->rx_cfg.dma_burst;
+		ste_hsi->context->tx_dma_burst = cl->tx_cfg.dma_burst;
 	}
 
 	port->tx_cfg = cl->tx_cfg;
@@ -1416,8 +1433,20 @@ static int ste_hsi_flush(struct hsi_client *cl)
 	struct hsi_controller *hsi = to_hsi_controller(port->device.parent);
 	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
 	int i;
+	int err = 0;
 
-	ste_hsi_clock_enable(hsi);
+	spin_lock_bh(&ste_hsi->lock);
+
+	if (ste_hsi->regulator) {
+		if (!regulator_is_enabled(ste_hsi->regulator))
+			regulator_enable(ste_hsi->regulator);
+	}
+
+	if (!ste_hsi->ck_refcount) {
+		err = ste_hsi_clock_enable(hsi);
+		if (unlikely(err))
+			return err;
+	}
 
 	/* Enter sleep mode */
 	writel(STE_HSI_MODE_SLEEP, ste_hsi->rx_base + STE_HSI_RX_MODE);
@@ -1451,11 +1480,6 @@ static int ste_hsi_flush(struct hsi_client *cl)
 
 	/* Dequeue all pending requests */
 	for (i = 0; i < ste_port->channels; i++) {
-		/* Release write clocks */
-		if (!list_empty(&ste_port->txqueue[i]))
-			ste_hsi_clock_disable(hsi);
-		if (!list_empty(&ste_port->rxqueue[i]))
-			ste_hsi_clock_disable(hsi);
 		ste_hsi_flush_queue(&ste_port->txqueue[i], NULL);
 		ste_hsi_flush_queue(&ste_port->rxqueue[i], NULL);
 	}
@@ -1463,7 +1487,14 @@ static int ste_hsi_flush(struct hsi_client *cl)
 
 	ste_hsi_clock_disable(hsi);
 
-	return 0;
+	if (ste_hsi->regulator)
+		regulator_disable(ste_hsi->regulator);
+
+	spin_unlock_bh(&ste_hsi->lock);
+
+	wake_unlock(&ste_hsi->suspend_wakelock);
+
+	return err;
 }
 
 static int ste_hsi_start_tx(struct hsi_client *cl)
@@ -1472,13 +1503,20 @@ static int ste_hsi_start_tx(struct hsi_client *cl)
 	struct ste_hsi_port *ste_port = hsi_port_drvdata(port);
 	struct hsi_controller *hsi = to_hsi_controller(port->device.parent);
 	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
+	int err;
+
+	wake_lock(&ste_hsi->suspend_wakelock);
 
 	if (ste_hsi->regulator)
 		regulator_enable(ste_hsi->regulator);
 
 	gpio_set_value(ste_port->acwake_gpio, 1); /* HIGH */
 
-	return 0;
+	err = ste_hsi_clock_enable(hsi);
+	if (unlikely(err))
+		return err;
+
+	return err;
 }
 
 static int ste_hsi_stop_tx(struct hsi_client *cl)
@@ -1488,10 +1526,9 @@ static int ste_hsi_stop_tx(struct hsi_client *cl)
 	struct hsi_controller *hsi = to_hsi_controller(port->device.parent);
 	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
 
+	ste_hsi->ca_status = CA_SLEEP;
+	enable_irq(ste_port->cawake_irq);
 	gpio_set_value(ste_port->acwake_gpio, 0); /* LOW */
-
-	if (ste_hsi->regulator)
-		regulator_disable(ste_hsi->regulator);
 
 	return 0;
 }
@@ -1522,7 +1559,7 @@ static int ste_hsi_ports_init(struct hsi_controller *hsi,
 		if (!ste_port)
 			return -ENOMEM;
 
-		port = &hsi->port[i];
+		port = hsi->port[i];
 		port->async = ste_hsi_async;
 		port->setup = ste_hsi_setup;
 		port->flush = ste_hsi_flush;
@@ -1554,8 +1591,7 @@ static int ste_hsi_ports_init(struct hsi_controller *hsi,
 		if (err)
 			return err;
 
-		tasklet_init(&ste_port->cawake_tasklet, ste_hsi_cawake_tasklet,
-			     (unsigned long)port);
+		INIT_WORK(&ste_port->ca_wake_work, ste_hsi_cawake_work);
 
 		tasklet_init(&ste_port->rx_tasklet, ste_hsi_rx_tasklet,
 			     (unsigned long)port);
@@ -1692,6 +1728,7 @@ static int __init ste_hsi_add_controller(struct hsi_controller *hsi,
 		goto err_clk_free;
 	}
 
+
 	err = ste_hsi_clock_enable(hsi);
 	if (unlikely(err))
 		goto err_clk_free;
@@ -1741,10 +1778,28 @@ static int __init ste_hsi_add_controller(struct hsi_controller *hsi,
 	if (err)
 		goto err_clk_free;
 
+	wake_lock_init(&ste_hsi->suspend_wakelock, WAKE_LOCK_SUSPEND,
+			"ste-hsi-controller");
+
+	ste_hsi_deep_debug_init(hsi);
+
+	/* Add prcmu QoS requirement to be able to later change */
+	err = prcmu_qos_add_requirement(PRCMU_QOS_APE_OPP,
+				(char *)dev_name(ste_hsi->dev),
+				PRCMU_QOS_DEFAULT_VALUE);
+	if (err) {
+		dev_err(ste_hsi->dev, "HSI add ape prcmu qos failed\n");
+		goto err_prcmu_qos;
+	}
+
 	return 0;
 
+err_prcmu_qos:
+	prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP,
+			(char *)dev_name(ste_hsi->dev));
 err_clk_free:
 	ste_hsi_clks_free(ste_hsi);
+	wake_lock_destroy(&ste_hsi->suspend_wakelock);
 err_free_mem:
 	kfree(ste_hsi);
 	return err;
@@ -1756,6 +1811,11 @@ static int ste_hsi_remove_controller(struct hsi_controller *hsi,
 	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
 	struct hsi_port *port = to_hsi_port(&pdev->dev);
 	struct ste_hsi_port *ste_port = hsi_port_drvdata(port);
+
+	ste_hsi_deep_debug_exit();
+
+	prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP,
+			(char *)dev_name(ste_hsi->dev));
 
 	if (ste_hsi->regulator)
 		regulator_put(ste_hsi->regulator);
@@ -1802,7 +1862,7 @@ static int __init ste_hsi_probe(struct platform_device *pdev)
 
 err_free_controller:
 	platform_set_drvdata(pdev, NULL);
-	hsi_free_controller(hsi);
+	hsi_put_controller(hsi);
 
 	return err;
 }
@@ -1812,16 +1872,83 @@ static int __exit ste_hsi_remove(struct platform_device *pdev)
 	struct hsi_controller *hsi = platform_get_drvdata(pdev);
 
 	ste_hsi_remove_controller(hsi, pdev);
-	hsi_free_controller(hsi);
+	hsi_put_controller(hsi);
 
 	return 0;
 }
+
+
+static int ste_hsi_prepare(struct device *dev)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct hsi_controller *hsi = platform_get_drvdata(pdev);
+	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
+
+	ste_hsi->suspend_ongoing = 1;
+
+	return 0;
+}
+
+
+static void ste_hsi_complete(struct device *dev)
+{
+	struct hsi_controller *hsi = dev_get_drvdata(dev);
+	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
+	struct hsi_port *port = *hsi->port;
+	unsigned int i;
+
+	ste_hsi->suspend_ongoing = 0;
+
+	for (i = 0; i < hsi->num_ports ; i++) {
+		struct ste_hsi_port *ste_port = hsi_port_drvdata(port);
+
+		if (ste_port->pending_ca_wake_isr == 1) {
+			ste_port->pending_ca_wake_isr = 0;
+			queue_work(system_nrt_wq, &ste_port->ca_wake_work);
+		}
+
+		port++;
+	}
+
+	return;
+}
+
+static int ste_hsi_suspend_noirq(struct device *dev)
+{
+	struct hsi_controller *hsi = dev_get_drvdata(dev);
+	struct ste_hsi_controller *ste_hsi = hsi_controller_drvdata(hsi);
+	struct hsi_port *port = *hsi->port;
+	unsigned int i;
+
+
+	for (i = 0; i < hsi->num_ports ; i++) {
+		struct ste_hsi_port *ste_port = hsi_port_drvdata(port);
+	/*  if pending ca wake work then abort suspend */
+		if (ste_port->pending_ca_wake_isr == 1) {
+			ste_hsi->suspend_ongoing = 0;
+			return -EBUSY;
+		}
+
+		port++;
+	}
+
+	return 0;
+
+
+}
+
+const struct dev_pm_ops ste_hsi_pm =  {
+			.prepare = ste_hsi_prepare,
+			.complete = ste_hsi_complete,
+			.suspend_noirq = ste_hsi_suspend_noirq,
+};
 
 static struct platform_driver ste_hsi_driver __refdata = {
 	.driver = {
 		   .name = "ste_hsi",
 		   .owner = THIS_MODULE,
-		   },
+		   .pm = &ste_hsi_pm,
+	},
 	.remove = __exit_p(ste_hsi_remove),
 };
 

@@ -8,9 +8,17 @@
 
 #include <linux/mm.h>
 #include <linux/spinlock.h>
-#include <mach/memory.h>
 
 #ifdef CONFIG_PASR
+#include <mach/pasr.h>
+
+/**
+ * enum pasr_state - Represents the section state once mask is applied
+ */
+enum pasr_state {
+	PASR_REFRESH,
+	PASR_NO_REFRESH,
+};
 
 /**
  * struct pasr_section - Represent either a DDR Bank or Segment depending on
@@ -22,6 +30,8 @@
  * @free_size: Represents the free memory size in the segment.
  * @lock: Protect the free_size counter
  * @die: Pointer to the Die the segment is part of.
+ * @state: State of the section.
+ * @kobj: Pointer to kobject used in sysfs.
  */
 struct pasr_section {
 	phys_addr_t start;
@@ -29,6 +39,8 @@ struct pasr_section {
 	unsigned long free_size;
 	spinlock_t *lock;
 	struct pasr_die *die;
+	enum pasr_state state;
+	struct kobject *kobj;
 };
 
 /**
@@ -40,6 +52,7 @@ struct pasr_section {
  * @section: Table of the die's segments.
  * @mem_reg: Represents the PASR mask of the die. It is either MR16 or MR17,
  *	depending on the addressing configuration (RBC or BRC).
+ * @kobj: Pointer to kobject used in sysfs.
  * @apply_mask: Callback registred by the platform's PASR driver to apply the
  *	calculated PASR mask.
  * @cookie: Private data for the platform's PASR driver.
@@ -50,6 +63,7 @@ struct pasr_die {
 	int nr_sections;
 	struct pasr_section section[PASR_MAX_SECTION_NR_PER_DIE];
 	long unsigned int mem_reg; /* Either MR16 or MR17 */
+	struct kobject *kobj;
 
 	void (*apply_mask)(long unsigned int *mem_reg, void *cookie);
 	void *cookie;
@@ -85,6 +99,14 @@ struct pasr_map {
 int pasr_register_mask_function(phys_addr_t die_addr,
 		void *function, void *cookie);
 
+int __init early_pasr_setup(void);
+int __init late_pasr_setup(void);
+int __init pasr_init_core(struct pasr_map *);
+
+#endif /* CONFIG_PASR */
+
+#ifdef CONFIG_PASR_ENABLE
+
 /**
  * pasr_put()
  *
@@ -111,6 +133,12 @@ void pasr_put(phys_addr_t paddr, unsigned long size);
  */
 void pasr_get(phys_addr_t paddr, unsigned long size);
 
+/**
+ * pasr_get_map()
+ *
+ * This function returns the PASR map representation.
+ */
+struct pasr_map *pasr_get_map(void);
 
 static inline void pasr_kput(struct page *page, int order)
 {
@@ -128,16 +156,30 @@ static inline void pasr_kget(struct page *page, int order)
 	pasr_get(page_to_phys(page), PAGE_SIZE << (MAX_ORDER - 1));
 }
 
-int __init early_pasr_setup(void);
-int __init late_pasr_setup(void);
-int __init pasr_init_core(struct pasr_map *);
-
 #else
 #define pasr_kput(page, order) do {} while (0)
 #define pasr_kget(page, order) do {} while (0)
 
 #define pasr_put(paddr, size) do {} while (0)
 #define pasr_get(paddr, size) do {} while (0)
-#endif /* CONFIG_PASR */
+
+#endif /* CONFIG_PASR_ENABLE */
+
+#define GRANULARITY_NOT_SET 0xFFFF
+
+struct interleaved_area {
+	phys_addr_t addr1;
+	phys_addr_t addr2;
+	unsigned long size;
+	int granularity;
+};
+
+struct interleave_info {
+	int nr_int;
+	int granularity;
+	struct interleaved_area *int_area;
+};
+
+int pasr_get_interleave_info(struct interleave_info *info);
 
 #endif /* _LINUX_PASR_H */

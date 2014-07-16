@@ -14,7 +14,7 @@
 struct modem_dev;
 
 struct modem_ops {
-	void (*request)(struct modem_dev *);
+	int (*request)(struct modem_dev *);
 	void (*release)(struct modem_dev *);
 	int (*is_requested)(struct modem_dev *);
 };

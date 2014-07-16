@@ -30,7 +30,7 @@
 #include <crypto/scatterwalk.h>
 #include <crypto/algapi.h>
 
-#include <mach/crypto-ux500.h>
+#include <linux/platform_data/crypto-ux500.h>
 #include <mach/hardware.h>
 
 #include "hash_alg.h"
@@ -174,7 +174,7 @@ static int hash_set_dma_transfer(struct hash_ctx *ctx, struct scatterlist *sg,
 			"(TO_DEVICE)", __func__);
 	desc = channel->device->device_prep_slave_sg(channel,
 			ctx->device->dma.sg, ctx->device->dma.sg_len,
-			direction, DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
+			direction, DMA_CTRL_ACK | DMA_PREP_INTERRUPT, ctx);
 	if (!desc) {
 		dev_err(ctx->device->dev,
 			"[%s]: device_prep_slave_sg() failed!", __func__);
@@ -577,15 +577,6 @@ static int hash_init(struct ahash_request *req)
 	memset(&ctx->state, 0, sizeof(struct hash_state));
 	ctx->updated = 0;
 	if (hash_mode == HASH_MODE_DMA) {
-		if ((ctx->config.oper_mode == HASH_OPER_MODE_HMAC) &&
-				cpu_is_u5500()) {
-			pr_debug(DEV_DBG_NAME " [%s] HMAC and DMA not working "
-					"on u5500, directing to CPU mode.",
-					__func__);
-			ctx->dma_mode = false; /* Don't use DMA in this case */
-			goto out;
-		}
-
 		if (req->nbytes < HASH_DMA_ALIGN_SIZE) {
 			ctx->dma_mode = false; /* Don't use DMA in this case */
 
@@ -607,7 +598,6 @@ static int hash_init(struct ahash_request *req)
 			}
 		}
 	}
-out:
 	return 0;
 }
 
@@ -1795,6 +1785,12 @@ static int ux500_hash_probe(struct platform_device *pdev)
 		goto out_regulator;
 	}
 
+	ret = clk_prepare(device_data->clk);
+	if (ret) {
+		dev_err(&pdev->dev, "can't prepare clock\n");
+		goto out_clk_get;
+	}
+
 	/* Enable device power (and clock) */
 	ret = hash_enable_power(device_data, false);
 	if (ret) {
@@ -1835,6 +1831,9 @@ out_power:
 	hash_disable_power(device_data, false);
 
 out_clk:
+	clk_unprepare(device_data->clk);
+
+out_clk_get:
 	clk_put(device_data->clk);
 
 out_regulator:
@@ -1898,6 +1897,7 @@ static int ux500_hash_remove(struct platform_device *pdev)
 		dev_err(dev, "[%s]: hash_disable_power() failed",
 			__func__);
 
+	clk_unprepare(device_data->clk);
 	clk_put(device_data->clk);
 	ux500_regulator_put(device_data->regulator);
 

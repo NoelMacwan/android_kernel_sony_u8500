@@ -8,7 +8,9 @@
 #ifndef __LINUX_MFD_STMPE_H
 #define __LINUX_MFD_STMPE_H
 
-#include <linux/device.h>
+#include <linux/mutex.h>
+
+struct device;
 
 enum stmpe_block {
 	STMPE_BLOCK_GPIO	= 1 << 0,
@@ -24,6 +26,7 @@ enum stmpe_partnum {
 	STMPE801,
 	STMPE811,
 	STMPE1601,
+	STMPE1801,
 	STMPE2401,
 	STMPE2403,
 	STMPE_NBR_PARTS
@@ -37,6 +40,7 @@ enum {
 	STMPE_IDX_CHIP_ID,
 	STMPE_IDX_ICR_LSB,
 	STMPE_IDX_IER_LSB,
+	STMPE_IDX_ISR_LSB,
 	STMPE_IDX_ISR_MSB,
 	STMPE_IDX_GPMR_LSB,
 	STMPE_IDX_GPSR_LSB,
@@ -47,6 +51,7 @@ enum {
 	STMPE_IDX_GPFER_LSB,
 	STMPE_IDX_GPAFR_U_MSB,
 	STMPE_IDX_IEGPIOR_LSB,
+	STMPE_IDX_ISGPIOR_LSB,
 	STMPE_IDX_ISGPIOR_MSB,
 	STMPE_IDX_MAX,
 };

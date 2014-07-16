@@ -185,231 +185,231 @@ struct cm_debug_domain_cooky {
 };
 
 static ssize_t domain_read(struct file *file, char __user *userbuf,
-			   size_t count, loff_t *ppos)
+               size_t count, loff_t *ppos)
 {
-	t_cm_domain_id id =
-		(t_cm_domain_id)(long)file->f_dentry->d_inode->i_private;
-	t_cm_domain_desc *domain = &domainDesc[id];
+    t_cm_domain_id id =
+        (t_cm_domain_id)(long)file->f_dentry->d_inode->i_private;
+    t_cm_domain_desc *domain = &domainDesc[id];
 
-	char buf[640];
-	int ret=0;
+    char buf[640];
+    int ret=0;
 
-	OSAL_LOCK_API();
-	if ((domain->domain.coreId != MASK_ALL8)
-	    && (domain->dbgCooky != NULL)) {
-		t_cm_allocator_status status;
-		t_uint32 dOffset;
-		t_uint32 dSize;
-		if (domain->domain.coreId != ARM_CORE_ID) {
-			t_cm_domain_info info;
+    OSAL_LOCK_API();
+    if ((domain->domain.coreId != MASK_ALL8)
+        && (domain->dbgCooky != NULL)) {
+        t_cm_allocator_status status;
+        t_uint32 dOffset;
+        t_uint32 dSize;
+        if (domain->domain.coreId != ARM_CORE_ID) {
+            t_cm_domain_info info;
 
-			cm_DM_GetDomainAbsAdresses(id, &info);
-			cm_DSP_GetInternalMemoriesInfo(id, ESRAM_CODE,
-						       &dOffset, &dSize);
-			cm_MM_GetAllocatorStatus(
-				cm_DSP_GetAllocator(domain->domain.coreId,
-						    ESRAM_CODE),
-				dOffset, dSize, &status);
-			ret = snprintf(
-				buf, sizeof(buf),
-				"Core:\t%s\n\n"
-				"Memory    : Physical address  Logical address"
-				"     Size     Free     Used\n"
-				"---------------------------------------------"
-				"-----------------------------\n"
-				"ESRAM Code: %08x-%08lx %08x-%08lx\t%8lu %8lu "
-				"%8lu\n",
-				osalEnv.mpc[COREIDX(domain->domain.coreId)].name,
-				(unsigned int)info.esramCode.physical,
-				domain->domain.esramCode.size ?
-				info.esramCode.physical
-				+ domain->domain.esramCode.size - 1 : 0,
-				(unsigned int)info.esramCode.logical,
-				domain->domain.esramCode.size ?
-				info.esramCode.logical
-				+ domain->domain.esramCode.size - 1 : 0,
-				domain->domain.esramCode.size,
-				status.global.accumulate_free_memory,
-				status.global.accumulate_used_memory);
+            cm_DM_GetDomainAbsAdresses(id, &info);
+            cm_DSP_GetInternalMemoriesInfo(id, ESRAM_CODE,
+                               &dOffset, &dSize);
+            cm_MM_GetAllocatorStatus(
+                cm_DSP_GetAllocator(domain->domain.coreId,
+                            ESRAM_CODE),
+                dOffset, dSize, &status);
+            ret = snprintf(
+                buf, sizeof(buf),
+                "Core:\t%s\nDomainType:\t%u\nDomainID:\t%u\n\n"
+                "Memory    : Physical address  Logical address"
+                "     Size     Free     Used\n"
+                "---------------------------------------------"
+                "-----------------------------\n"
+                "ESRAM Code: %08x-%08lx %08x-%08lx\t%8lu %8lu "
+                "%8lu\n",
+                osalEnv.mpc[COREIDX(domain->domain.coreId)].name,(unsigned int)domain->type,(unsigned int)id,
+                (unsigned int)info.esramCode.physical,
+                domain->domain.esramCode.size ?
+                info.esramCode.physical
+                + domain->domain.esramCode.size - 1 : 0,
+                (unsigned int)info.esramCode.logical,
+                domain->domain.esramCode.size ?
+                info.esramCode.logical
+                + domain->domain.esramCode.size - 1 : 0,
+                domain->domain.esramCode.size,
+                status.global.accumulate_free_memory,
+                status.global.accumulate_used_memory);
 
-			cm_DSP_GetInternalMemoriesInfo(id, ESRAM_EXT24,
-						       &dOffset, &dSize);
-			cm_MM_GetAllocatorStatus(
-				cm_DSP_GetAllocator(domain->domain.coreId,
-						    ESRAM_EXT24),
-				dOffset, dSize, &status);
-			ret += snprintf(
-				&buf[ret], sizeof(buf)-ret,
-				"ESRAM Data: %08x-%08lx "
-				"%08x-%08lx\t%8lu %8lu %8lu\n",
-				(unsigned int)info.esramData.physical,
-				domain->domain.esramData.size ?
-				info.esramData.physical
-				+ domain->domain.esramData.size - 1 : 0,
-				(unsigned int)info.esramData.logical,
-				domain->domain.esramData.size ?
-				info.esramData.logical
-				+ domain->domain.esramData.size - 1 : 0,
-				domain->domain.esramData.size,
-				status.global.accumulate_free_memory,
-				status.global.accumulate_used_memory);
+            cm_DSP_GetInternalMemoriesInfo(id, ESRAM_EXT24,
+                               &dOffset, &dSize);
+            cm_MM_GetAllocatorStatus(
+                cm_DSP_GetAllocator(domain->domain.coreId,
+                            ESRAM_EXT24),
+                dOffset, dSize, &status);
+            ret += snprintf(
+                &buf[ret], sizeof(buf)-ret,
+                "ESRAM Data: %08x-%08lx "
+                "%08x-%08lx\t%8lu %8lu %8lu\n",
+                (unsigned int)info.esramData.physical,
+                domain->domain.esramData.size ?
+                info.esramData.physical
+                + domain->domain.esramData.size - 1 : 0,
+                (unsigned int)info.esramData.logical,
+                domain->domain.esramData.size ?
+                info.esramData.logical
+                + domain->domain.esramData.size - 1 : 0,
+                domain->domain.esramData.size,
+                status.global.accumulate_free_memory,
+                status.global.accumulate_used_memory);
 
-			cm_DSP_GetInternalMemoriesInfo(id, SDRAM_CODE,
-						       &dOffset, &dSize);
-			cm_MM_GetAllocatorStatus(
-				cm_DSP_GetAllocator(domain->domain.coreId,
-						    SDRAM_CODE),
-				dOffset, dSize, &status);
-			ret += snprintf(
-				&buf[ret], sizeof(buf)-ret,
-				"SDRAM Code: %08x-%08lx "
-				"%08x-%08lx\t%8lu %8lu %8lu\n",
-				(unsigned int)info.sdramCode.physical,
-				domain->domain.sdramCode.size ?
-				info.sdramCode.physical +
-				domain->domain.sdramCode.size - 1 : 0,
-				(unsigned int)info.sdramCode.logical,
-				domain->domain.sdramCode.size ?
-				info.sdramCode.logical +
-				domain->domain.sdramCode.size - 1 : 0,
-				domain->domain.sdramCode.size,
-				status.global.accumulate_free_memory,
-				status.global.accumulate_used_memory);
+            cm_DSP_GetInternalMemoriesInfo(id, SDRAM_CODE,
+                               &dOffset, &dSize);
+            cm_MM_GetAllocatorStatus(
+                cm_DSP_GetAllocator(domain->domain.coreId,
+                            SDRAM_CODE),
+                dOffset, dSize, &status);
+            ret += snprintf(
+                &buf[ret], sizeof(buf)-ret,
+                "SDRAM Code: %08x-%08lx "
+                "%08x-%08lx\t%8lu %8lu %8lu\n",
+                (unsigned int)info.sdramCode.physical,
+                domain->domain.sdramCode.size ?
+                info.sdramCode.physical +
+                domain->domain.sdramCode.size - 1 : 0,
+                (unsigned int)info.sdramCode.logical,
+                domain->domain.sdramCode.size ?
+                info.sdramCode.logical +
+                domain->domain.sdramCode.size - 1 : 0,
+                domain->domain.sdramCode.size,
+                status.global.accumulate_free_memory,
+                status.global.accumulate_used_memory);
 
-			cm_DSP_GetInternalMemoriesInfo(id, SDRAM_EXT24,
-						       &dOffset, &dSize);
-			cm_MM_GetAllocatorStatus(
-				cm_DSP_GetAllocator(domain->domain.coreId,
-						    SDRAM_EXT24),
-				dOffset, dSize, &status);
-			ret += snprintf(
-				&buf[ret], sizeof(buf)-ret,
-				"SDRAM Data: %08x-%08lx "
-				"%08x-%08lx\t%8lu %8lu %8lu\n",
-				(unsigned int)info.sdramData.physical,
-				domain->domain.sdramData.size ?
-				info.sdramData.physical +
-				domain->domain.sdramData.size - 1 : 0,
-				(unsigned int)info.sdramData.logical,
-				domain->domain.sdramData.size ?
-				info.sdramData.logical +
-				domain->domain.sdramData.size - 1 : 0,
-				domain->domain.sdramData.size,
-				status.global.accumulate_free_memory,
-				status.global.accumulate_used_memory);
-		} else {
-			t_cm_system_address addr;
-			ret = snprintf(
-				buf, sizeof(buf),
-				"Core:\tarm\n\n"
-				"Memory    : Physical address  Logical "
-				"address     Size     Free     Used\n"
-				"---------------------------------------"
-				"-----------------------------------\n");
-			if (domain->domain.esramCode.size &&
-			    cm_DSP_GetDspBaseAddress(ARM_CORE_ID,
-						     ESRAM_CODE,
-						     &addr) == CM_OK) {
-				cm_DSP_GetInternalMemoriesInfo(id, ESRAM_CODE,
-							       &dOffset,
-							       &dSize);
-				cm_MM_GetAllocatorStatus(
-					cm_DSP_GetAllocator(ARM_CORE_ID,
-							    ESRAM_CODE),
-					dOffset, dSize, &status);
-				ret += snprintf(
-					&buf[ret], sizeof(buf)-ret,
-					"ESRAM Code: %08x-%08lx "
-					"%08x-%08lx\t%8lu %8lu %8lu\n",
-					(unsigned int)addr.physical,
-					addr.physical +
-					domain->domain.esramCode.size - 1,
-					(unsigned int)addr.logical,
-					addr.logical +
-					domain->domain.esramCode.size - 1,
-					domain->domain.esramCode.size,
-					status.global.accumulate_free_memory,
-					status.global.accumulate_used_memory);
-			}
-			if (domain->domain.esramData.size &&
-			    cm_DSP_GetDspBaseAddress(ARM_CORE_ID,
-						     ESRAM_EXT24,
-						     &addr) == CM_OK) {
-				cm_DSP_GetInternalMemoriesInfo(id, ESRAM_EXT24,
-							       &dOffset,
-							       &dSize);
-				cm_MM_GetAllocatorStatus(
-					cm_DSP_GetAllocator(ARM_CORE_ID,
-							    ESRAM_EXT24),
-					dOffset, dSize, &status);
-				ret += snprintf(
-					&buf[ret], sizeof(buf)-ret,
-					"ESRAM Data: %08x-%08lx "
-					"%08x-%08lx\t%8lu %8lu %8lu\n",
-					(unsigned int)addr.physical,
-					addr.physical +
-					domain->domain.esramData.size - 1,
-					(unsigned int)addr.logical,
-					addr.logical +
-					domain->domain.esramData.size - 1,
-					domain->domain.esramData.size,
-					status.global.accumulate_free_memory,
-					status.global.accumulate_used_memory);
-			}
-			if (domain->domain.sdramCode.size &&
-			    cm_DSP_GetDspBaseAddress(ARM_CORE_ID,
-						     SDRAM_CODE,
-						     &addr) == CM_OK) {
-				cm_DSP_GetInternalMemoriesInfo(id, SDRAM_CODE,
-							       &dOffset,
-							       &dSize);
-				cm_MM_GetAllocatorStatus(
-					cm_DSP_GetAllocator(ARM_CORE_ID,
-							    SDRAM_CODE),
-					dOffset, dSize, &status);
-				ret += snprintf(
-					&buf[ret], sizeof(buf)-ret,
-					"SDRAM Code: %08x-%08lx %08x-%08lx\t"
-					"%8lu %8lu %8lu\n",
-					(unsigned int)addr.physical,
-					addr.physical +
-					domain->domain.sdramCode.size - 1,
-					(unsigned int)addr.logical,
-					addr.logical +
-					domain->domain.sdramCode.size - 1,
-					domain->domain.sdramCode.size,
-					status.global.accumulate_free_memory,
-					status.global.accumulate_used_memory);
-			}
-			if (domain->domain.sdramData.size &&
-			    cm_DSP_GetDspBaseAddress(ARM_CORE_ID,
-						     SDRAM_EXT24,
-						     &addr) == CM_OK) {
-				cm_DSP_GetInternalMemoriesInfo(id, SDRAM_EXT24,
-							       &dOffset,
-							       &dSize);
-				cm_MM_GetAllocatorStatus(
-					cm_DSP_GetAllocator(ARM_CORE_ID,
-							    SDRAM_EXT24),
-					dOffset, dSize, &status);
-				ret += snprintf(
-					&buf[ret], sizeof(buf)-ret,
-					"SDRAM Data: %08x-%08lx %08x-%08lx\t"
-					"%8lu %8lu %8lu\n",
-					(unsigned int)addr.physical,
-					addr.physical +
-					domain->domain.sdramData.size - 1,
-					(unsigned int)addr.logical,
-					addr.logical +
-					domain->domain.sdramData.size - 1,
-					domain->domain.sdramData.size,
-					status.global.accumulate_free_memory,
-					status.global.accumulate_used_memory);
-			}
-		}
-	}
-	OSAL_UNLOCK_API();
-	return simple_read_from_buffer(userbuf, count, ppos, buf, ret);;
+            cm_DSP_GetInternalMemoriesInfo(id, SDRAM_EXT24,
+                               &dOffset, &dSize);
+            cm_MM_GetAllocatorStatus(
+                cm_DSP_GetAllocator(domain->domain.coreId,
+                            SDRAM_EXT24),
+                dOffset, dSize, &status);
+            ret += snprintf(
+                &buf[ret], sizeof(buf)-ret,
+                "SDRAM Data: %08x-%08lx "
+                "%08x-%08lx\t%8lu %8lu %8lu\n",
+                (unsigned int)info.sdramData.physical,
+                domain->domain.sdramData.size ?
+                info.sdramData.physical +
+                domain->domain.sdramData.size - 1 : 0,
+                (unsigned int)info.sdramData.logical,
+                domain->domain.sdramData.size ?
+                info.sdramData.logical +
+                domain->domain.sdramData.size - 1 : 0,
+                domain->domain.sdramData.size,
+                status.global.accumulate_free_memory,
+                status.global.accumulate_used_memory);
+        } else {
+            t_cm_system_address addr;
+            ret = snprintf(
+                buf, sizeof(buf),
+                "Core:\tarm\n\n"
+                "Memory    : Physical address  Logical "
+                "address     Size     Free     Used\n"
+                "---------------------------------------"
+                "-----------------------------------\n");
+            if (domain->domain.esramCode.size &&
+                cm_DSP_GetDspBaseAddress(ARM_CORE_ID,
+                             ESRAM_CODE,
+                             &addr) == CM_OK) {
+                cm_DSP_GetInternalMemoriesInfo(id, ESRAM_CODE,
+                                   &dOffset,
+                                   &dSize);
+                cm_MM_GetAllocatorStatus(
+                    cm_DSP_GetAllocator(ARM_CORE_ID,
+                                ESRAM_CODE),
+                    dOffset, dSize, &status);
+                ret += snprintf(
+                    &buf[ret], sizeof(buf)-ret,
+                    "ESRAM Code: %08x-%08lx "
+                    "%08x-%08lx\t%8lu %8lu %8lu\n",
+                    (unsigned int)addr.physical,
+                    addr.physical +
+                    domain->domain.esramCode.size - 1,
+                    (unsigned int)addr.logical,
+                    addr.logical +
+                    domain->domain.esramCode.size - 1,
+                    domain->domain.esramCode.size,
+                    status.global.accumulate_free_memory,
+                    status.global.accumulate_used_memory);
+            }
+            if (domain->domain.esramData.size &&
+                cm_DSP_GetDspBaseAddress(ARM_CORE_ID,
+                             ESRAM_EXT24,
+                             &addr) == CM_OK) {
+                cm_DSP_GetInternalMemoriesInfo(id, ESRAM_EXT24,
+                                   &dOffset,
+                                   &dSize);
+                cm_MM_GetAllocatorStatus(
+                    cm_DSP_GetAllocator(ARM_CORE_ID,
+                                ESRAM_EXT24),
+                    dOffset, dSize, &status);
+                ret += snprintf(
+                    &buf[ret], sizeof(buf)-ret,
+                    "ESRAM Data: %08x-%08lx "
+                    "%08x-%08lx\t%8lu %8lu %8lu\n",
+                    (unsigned int)addr.physical,
+                    addr.physical +
+                    domain->domain.esramData.size - 1,
+                    (unsigned int)addr.logical,
+                    addr.logical +
+                    domain->domain.esramData.size - 1,
+                    domain->domain.esramData.size,
+                    status.global.accumulate_free_memory,
+                    status.global.accumulate_used_memory);
+            }
+            if (domain->domain.sdramCode.size &&
+                cm_DSP_GetDspBaseAddress(ARM_CORE_ID,
+                             SDRAM_CODE,
+                             &addr) == CM_OK) {
+                cm_DSP_GetInternalMemoriesInfo(id, SDRAM_CODE,
+                                   &dOffset,
+                                   &dSize);
+                cm_MM_GetAllocatorStatus(
+                    cm_DSP_GetAllocator(ARM_CORE_ID,
+                                SDRAM_CODE),
+                    dOffset, dSize, &status);
+                ret += snprintf(
+                    &buf[ret], sizeof(buf)-ret,
+                    "SDRAM Code: %08x-%08lx %08x-%08lx\t"
+                    "%8lu %8lu %8lu\n",
+                    (unsigned int)addr.physical,
+                    addr.physical +
+                    domain->domain.sdramCode.size - 1,
+                    (unsigned int)addr.logical,
+                    addr.logical +
+                    domain->domain.sdramCode.size - 1,
+                    domain->domain.sdramCode.size,
+                    status.global.accumulate_free_memory,
+                    status.global.accumulate_used_memory);
+            }
+            if (domain->domain.sdramData.size &&
+                cm_DSP_GetDspBaseAddress(ARM_CORE_ID,
+                             SDRAM_EXT24,
+                             &addr) == CM_OK) {
+                cm_DSP_GetInternalMemoriesInfo(id, SDRAM_EXT24,
+                                   &dOffset,
+                                   &dSize);
+                cm_MM_GetAllocatorStatus(
+                    cm_DSP_GetAllocator(ARM_CORE_ID,
+                                SDRAM_EXT24),
+                    dOffset, dSize, &status);
+                ret += snprintf(
+                    &buf[ret], sizeof(buf)-ret,
+                    "SDRAM Data: %08x-%08lx %08x-%08lx\t"
+                    "%8lu %8lu %8lu\n",
+                    (unsigned int)addr.physical,
+                    addr.physical +
+                    domain->domain.sdramData.size - 1,
+                    (unsigned int)addr.logical,
+                    addr.logical +
+                    domain->domain.sdramData.size - 1,
+                    domain->domain.sdramData.size,
+                    status.global.accumulate_free_memory,
+                    status.global.accumulate_used_memory);
+            }
+        }
+    }
+    OSAL_UNLOCK_API();
+    return simple_read_from_buffer(userbuf, count, ppos, buf, ret);;
 }
 
 static const struct file_operations domain_fops = {
@@ -504,8 +504,9 @@ static void cm_debug_domain_destroy(t_cm_domain_id id)
 /* proc directory */
 void cm_debug_proc_init(struct cm_process_priv *entry)
 {
-        char tmp[PROC_NUMBUF];
-        sprintf(tmp, "%d", entry->pid);
+	char tmp[PROC_NUMBUF];
+	sprintf(tmp, "%d", entry->pid);
+
 	entry->dir = debugfs_create_dir(tmp, proc_dir);
 	if (IS_ERR(entry->dir)) {
 		if (PTR_ERR(entry->dir) != -ENODEV)
@@ -538,7 +539,7 @@ static ssize_t meminfo_read(struct file *file, char __user *userbuf,
 {
 	const t_nmf_core_id id =
 		*(t_nmf_core_id *)file->f_dentry->d_inode->i_private;
-	char buf[640];
+	char buf[720];
 	int ret=0;
 	t_cm_allocator_status status;
 	t_cm_system_address addr;
@@ -549,84 +550,91 @@ static ssize_t meminfo_read(struct file *file, char __user *userbuf,
 	cm_DSP_GetDspBaseAddress(id, ESRAM_CODE,  &addr);
 	ret = snprintf(buf, sizeof(buf),
 		       "Memory    : Physical address  Logical address     Size "
-		       "    Free     Used\n"
+		       "    Free     Used     MaxUsed\n"
 		       "-------------------------------------------------------"
-		       "-------------------\n"
-		       "ESRAM Code: %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu\n",
+		       "------------------------------\n"
+		       "ESRAM Code: %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu %8lu\n",
 		       (unsigned int)addr.physical,
 		       addr.physical + status.global.size - 1,
 		       (unsigned int)addr.logical,
 		       addr.logical + status.global.size - 1,
 		       status.global.size,
 		       status.global.accumulate_free_memory,
-		       status.global.accumulate_used_memory);
+		       status.global.accumulate_used_memory,
+		       status.global.max_used_memory);
 
 	cm_MM_GetAllocatorStatus(cm_DSP_GetAllocator(id, ESRAM_EXT24),
 				 0, 0, &status);
 	cm_DSP_GetDspBaseAddress(id, ESRAM_EXT24, &addr);
 	ret += snprintf(&buf[ret], sizeof(buf)-ret,
-			"ESRAM Data: %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu\n",
+			"ESRAM Data: %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu %8lu\n",
 			(unsigned int)addr.physical,
 			addr.physical + status.global.size - 1,
 			(unsigned int)addr.logical,
 			addr.logical + status.global.size - 1,
 			status.global.size,
 			status.global.accumulate_free_memory,
-			status.global.accumulate_used_memory);
+			status.global.accumulate_used_memory,
+			status.global.max_used_memory);
 
 	cm_MM_GetAllocatorStatus(cm_DSP_GetAllocator(id, SDRAM_CODE),
 				 0, 0, &status);
 	cm_DSP_GetDspBaseAddress(id, SDRAM_CODE,  &addr);
 	ret += snprintf(&buf[ret], sizeof(buf)-ret,
-			"SDRAM Code: %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu\n",
+			"SDRAM Code: %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu %8lu\n",
 			(unsigned int)addr.physical,
 			addr.physical + status.global.size - 1,
 			(unsigned int)addr.logical,
 			addr.logical + status.global.size - 1,
 			status.global.size,
 			status.global.accumulate_free_memory,
-			status.global.accumulate_used_memory);
+			status.global.accumulate_used_memory,
+			status.global.max_used_memory);
 
 	cm_MM_GetAllocatorStatus(cm_DSP_GetAllocator(id, SDRAM_EXT24),
 				 0, 0, &status);
 	cm_DSP_GetDspBaseAddress(id, SDRAM_EXT24, &addr);
 	ret += snprintf(&buf[ret], sizeof(buf)-ret,
-			"SDRAM Data: %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu\n",
+			"SDRAM Data: %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu %8lu\n",
 			(unsigned int)addr.physical,
 			addr.physical + status.global.size - 1,
 			(unsigned int)addr.logical,
 			addr.logical + status.global.size - 1,
 			status.global.size,
 			status.global.accumulate_free_memory,
-			status.global.accumulate_used_memory);
+			status.global.accumulate_used_memory,
+			status.global.max_used_memory);
 
 	cm_MM_GetAllocatorStatus(cm_DSP_GetAllocator(id, INTERNAL_XRAM24),
 				 0, 0, &status);
 	cm_DSP_GetDspBaseAddress(id, INTERNAL_XRAM24, &addr);
 	ret += snprintf(&buf[ret], sizeof(buf)-ret,
-			"TCM XRAM  : %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu\n",
+			"TCM XRAM  : %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu %8lu\n",
 			(unsigned int)addr.physical,
 			addr.physical + status.global.size - 1,
 			(unsigned int)addr.logical,
 			addr.logical + status.global.size - 1,
 			status.global.size,
 			status.global.accumulate_free_memory,
-			status.global.accumulate_used_memory);
+			status.global.accumulate_used_memory,
+			status.global.max_used_memory);
 
 	cm_MM_GetAllocatorStatus(cm_DSP_GetAllocator(id, INTERNAL_YRAM24),
 				 0, 0, &status);
 	cm_DSP_GetDspBaseAddress(id, INTERNAL_YRAM24, &addr);
 	ret += snprintf(&buf[ret], sizeof(buf)-ret,
-			"TCM YRAM  : %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu\n",
+			"TCM YRAM  : %08x-%08lx %08x-%08lx\t%8lu %8lu %8lu %8lu\n",
 			(unsigned int)addr.physical,
 			addr.physical + status.global.size - 1,
 			(unsigned int)addr.logical,
 			addr.logical + status.global.size - 1,
 			status.global.size,
 			status.global.accumulate_free_memory,
-			status.global.accumulate_used_memory);
+			status.global.accumulate_used_memory,
+			status.global.max_used_memory);
 
 	OSAL_UNLOCK_API();
+
 	return simple_read_from_buffer(userbuf, count, ppos, buf, ret);;
 }
 
@@ -700,10 +708,57 @@ void cm_debug_destroy_tcm_file(unsigned mpc_index)
 	debugfs_remove(osalEnv.mpc[mpc_index].tcm_file);
 }
 
+static ssize_t reset_max_write(struct file *file, const char __user *user_buf,
+			  size_t count, loff_t *ppos)
+{
+	t_nmf_core_id coreId=*(t_nmf_core_id *)file->f_dentry->d_inode->i_private;
+	t_cm_allocator_desc* alloc=NULL;
+
+	OSAL_LOCK_API();
+
+	osalEnv.mpc[coreId-1].max_mips = 0;
+
+	alloc = cm_DSP_GetAllocator(coreId, ESRAM_CODE);
+	alloc->maxUsedMemory = alloc->currentUsedMemory;
+
+	alloc = cm_DSP_GetAllocator(coreId, ESRAM_EXT24);
+	alloc->maxUsedMemory = alloc->currentUsedMemory;
+
+	alloc = cm_DSP_GetAllocator(coreId, SDRAM_CODE);
+	alloc->maxUsedMemory = alloc->currentUsedMemory;
+
+	alloc = cm_DSP_GetAllocator(coreId, SDRAM_EXT24);
+	alloc->maxUsedMemory = alloc->currentUsedMemory;
+
+	alloc = cm_DSP_GetAllocator(coreId, INTERNAL_XRAM24);
+	alloc->maxUsedMemory = alloc->currentUsedMemory;
+
+	alloc = cm_DSP_GetAllocator(coreId, INTERNAL_YRAM24);
+	alloc->maxUsedMemory = alloc->currentUsedMemory;
+
+	OSAL_UNLOCK_API();
+
+	return 1;
+}
+//Dummy function, to avoid the error.
+static ssize_t reset_max_read(struct file *file, char __user *user_buf,
+			  size_t count, loff_t *ppos)
+{
+	return 0;
+}
+static const struct file_operations reset_max_fops = {
+	.read    =  reset_max_read,
+	.write   =  reset_max_write,
+};
 /* Global init */
 void cm_debug_init(void)
 {
 	int i;
+	unsigned int coreId;
+	for(coreId=0;coreId<NB_MPC;coreId++)
+	{
+		osalEnv.mpc[coreId].max_mips=0;
+	}
 
 	cm_dir = debugfs_create_dir(DEBUGFS_ROOT, NULL);
 	if (IS_ERR(cm_dir)) {
@@ -826,6 +881,12 @@ void cm_debug_init(void)
 			debugfs_create_u8("requested_opp", S_IRUSR|S_IRGRP,
 					  osalEnv.mpc[i].dir,
 					  &osalEnv.mpc[i].opp_request);
+			debugfs_create_file("reset-max-values", S_IWUSR|S_IWGRP|S_IWOTH,
+					  osalEnv.mpc[i].dir,(void*)&osalEnv.mpc[i].coreId,
+					  &reset_max_fops);
+			debugfs_create_u32("max-mips", S_IRUSR|S_IRGRP,
+					  osalEnv.mpc[i].dir,
+					  &osalEnv.mpc[i].max_mips);
 		}
 	}
 	osal_debug_ops.component_create  = cm_debug_component_create;

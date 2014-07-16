@@ -2448,6 +2448,12 @@ static void configure_src(struct b2r2_control *cont,
 		}
 
 		set_src_3(node, src->addr, src);
+		/*
+		 * The VMXs are restrained by the semi planar input
+		 * order. And since the internal format of b2r2 is 32-bit
+		 * AYUV we need to supply same order of components on
+		 * the b2r2 bus for the planar input formats.
+		 */
 		if (b2r2_is_yvu_fmt(src->fmt)) {
 			set_src_1(node, tmp_buf.chroma_addr, &tmp_buf);
 			set_src_2(node, tmp_buf.chroma_cr_addr, &tmp_buf);
@@ -2591,7 +2597,6 @@ static int configure_dst(struct b2r2_control *cont, struct b2r2_node *node,
 
 			memcpy(&dst_planes[2], &dst_planes[1],
 				sizeof(dst_planes[2]));
-
 			dst_planes[2].addr = dst->chroma_cr_addr;
 
 			/*
@@ -2601,12 +2606,6 @@ static int configure_dst(struct b2r2_control *cont, struct b2r2_node *node,
 			 * B2R2_TTY_CR_NOT_CB.
 			 */
 			dst_planes[2].chroma_selection = B2R2_TTY_CB_NOT_CR;
-
-			/* switch the U and V planes for YVU formats */
-			if (b2r2_is_yvu420_fmt(dst->fmt)) {
-				dst_planes[2].addr = dst->chroma_addr;
-				dst_planes[1].addr = dst->chroma_cr_addr;
-			}
 		}
 
 	}

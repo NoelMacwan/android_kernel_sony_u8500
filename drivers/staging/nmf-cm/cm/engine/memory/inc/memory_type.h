@@ -131,6 +131,8 @@ typedef struct
         /* Accumulation of free and used memory */
         t_uint32 accumulate_free_memory; //!< accumulate free memory
         t_uint32 accumulate_used_memory; //!< accumulate used memory
+        t_uint32 max_used_memory;	 //!< max used memory
+        t_uint32 current_used_memory;	 //!< current used memory
     } global;
 
     struct {

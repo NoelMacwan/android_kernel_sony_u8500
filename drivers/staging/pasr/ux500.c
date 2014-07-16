@@ -38,7 +38,7 @@ static int ux500_pasr_probe(struct platform_device *pdev)
 		if (pasr_register_mask_function(base,
 				&ux500_pasr_apply_mask,
 				cookie))
-			dev_err(&pdev->dev, "Pasr register failed (%s)\n",
+			dev_dbg(&pdev->dev, "Pasr register failed (%s)\n",
 					pasr_data[i].name);
 	}
 

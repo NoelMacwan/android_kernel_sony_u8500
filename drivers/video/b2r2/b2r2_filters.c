@@ -251,9 +251,8 @@ int b2r2_filters_init(struct b2r2_control *cont)
 	if (cont->filters_initialized)
 		return 0;
 
-	for (i = 0; i < filters_size; i++) {
+	for (i = 0; i < filters_size; i++)
 		alloc_filter_coeffs(cont->dev, &filters[i]);
-	}
 
 	alloc_filter_coeffs(cont->dev, &bilinear_filter);
 	alloc_filter_coeffs(cont->dev, &default_downscale_filter);
@@ -271,9 +270,8 @@ void b2r2_filters_exit(struct b2r2_control *cont)
 	if (!cont->filters_initialized)
 		return;
 
-	for (i = 0; i < filters_size; i++) {
+	for (i = 0; i < filters_size; i++)
 		free_filter_coeffs(cont->dev, &filters[i]);
-	}
 
 	free_filter_coeffs(cont->dev, &bilinear_filter);
 	free_filter_coeffs(cont->dev, &default_downscale_filter);

@@ -1,32 +1,28 @@
 /*
  * Copyright (C) ST-Ericsson SA 2011
- * Modified 2013 Sony Mobile Communications AB.
  *
  * License Terms: GNU General Public License v2
  *
+ * Author: Mathieu Poirier <mathieu.poirier@linaro.org> for ST-Ericsson
  * Author: Jonas Aaberg <jonas.aberg@stericsson.com> for ST-Ericsson
  *
- * Heavily based upon geodewdt.c
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/moduleparam.h>
 #include <linux/debugfs.h>
-#include <linux/seq_file.h>
 #include <linux/err.h>
 #include <linux/uaccess.h>
-#include <linux/miscdevice.h>
 #include <linux/watchdog.h>
 #include <linux/platform_device.h>
-#include <linux/mfd/ux500_wdt.h>
-#include <mach/id.h>
+#include <linux/platform_data/ux500_wdt.h>
+
+#include <linux/mfd/dbx500-prcmu.h>
 
 #define WATCHDOG_TIMEOUT 600 /* 10 minutes */
-
-#define WDT_FLAGS_OPEN 1
-#define WDT_FLAGS_ORPHAN 2
-
-static unsigned long wdt_flags;
+#define WATCHDOG_MIN	0
+#define WATCHDOG_MAX28	268435  /* 28 bit resolution in ms == 268435.455 s */
+#define WATCHDOG_MAX32  4294967 /* 32 bit resolution in ms == 4294967.295 s */
 
 static int timeout = WATCHDOG_TIMEOUT;
 module_param(timeout, int, 0);
@@ -41,170 +37,54 @@ MODULE_PARM_DESC(nowayout,
 				__MODULE_STRING(WATCHDOG_NOWAYOUT) ")");
 static u8 wdog_id;
 static bool wdt_en;
-static bool wdt_auto_off = false;
-static bool safe_close;
-static struct ux500_wdt_ops *ux500_wdt_ops;
+static bool wdt_auto_off;
 
-static int ux500_wdt_open(struct inode *inode, struct file *file)
+static int ux500_wdt_start(struct watchdog_device *wdd)
 {
-	if (!timeout)
-		return -ENODEV;
-
-	if (test_and_set_bit(WDT_FLAGS_OPEN, &wdt_flags))
-		return -EBUSY;
-
-	if (!test_and_clear_bit(WDT_FLAGS_ORPHAN, &wdt_flags))
-		__module_get(THIS_MODULE);
-
-	ux500_wdt_ops->enable(wdog_id);
 	wdt_en = true;
-
-	return nonseekable_open(inode, file);
+	return prcmu_enable_a9wdog(0);
 }
 
-static int ux500_wdt_release(struct inode *inode, struct file *file)
+static int ux500_wdt_stop(struct watchdog_device *wdd)
 {
-	if (safe_close) {
-		ux500_wdt_ops->disable(wdog_id);
-		module_put(THIS_MODULE);
-	} else {
-		pr_crit("Unexpected close - watchdog is not stopping.\n");
-		ux500_wdt_ops->kick(wdog_id);
-
-		set_bit(WDT_FLAGS_ORPHAN, &wdt_flags);
-	}
-
-	clear_bit(WDT_FLAGS_OPEN, &wdt_flags);
-	safe_close = false;
-	return 0;
+	wdt_en = false;
+	return	prcmu_disable_a9wdog(0);
 }
 
-static ssize_t ux500_wdt_write(struct file *file, const char __user *data,
-			       size_t len, loff_t *ppos)
+static int ux500_wdt_keepalive(struct watchdog_device *wdd)
 {
-	if (!len)
-		return len;
-
-	if (!nowayout) {
-		size_t i;
-		safe_close = false;
-
-		for (i = 0; i != len; i++) {
-			char c;
-
-			if (get_user(c, data + i))
-				return -EFAULT;
-
-			if (c == 'V')
-				safe_close = true;
-		}
-	}
-
-	ux500_wdt_ops->kick(wdog_id);
-
-	pr_info("ux500_wdt: hwwd - kick\n");
-
-	return len;
+	return prcmu_kick_a9wdog(0);
 }
 
-static long ux500_wdt_ioctl(struct file *file, unsigned int cmd,
-			   unsigned long arg)
+static int ux500_wdt_set_timeout(struct watchdog_device *wdd,
+						unsigned int timeout)
 {
-
-	void __user *argp = (void __user *)arg;
-	int __user *p = argp;
-	int interval;
-
-	static const struct watchdog_info ident = {
-		.options =	WDIOF_SETTIMEOUT |
-				WDIOF_KEEPALIVEPING |
-				WDIOF_MAGICCLOSE,
-		.firmware_version =     1,
-		.identity	= "Ux500 WDT",
-	};
-
-	switch (cmd) {
-	case WDIOC_GETSUPPORT:
-		return copy_to_user(argp, &ident,
-				    sizeof(ident)) ? -EFAULT : 0;
-
-	case WDIOC_GETSTATUS:
-	case WDIOC_GETBOOTSTATUS:
-		return put_user(0, p);
-
-	case WDIOC_SETOPTIONS:
-	{
-		int options;
-		int ret = -EINVAL;
-
-		if (get_user(options, p))
-			return -EFAULT;
-
-		if (options & WDIOS_DISABLECARD) {
-			ux500_wdt_ops->disable(wdog_id);
-			wdt_en = false;
-			ret = 0;
-		}
-
-		if (options & WDIOS_ENABLECARD) {
-			ux500_wdt_ops->enable(wdog_id);
-			wdt_en = true;
-			ret = 0;
-		}
-
-		return ret;
-	}
-	case WDIOC_KEEPALIVE:
-	{
-		int ret = ux500_wdt_ops->kick(wdog_id);
-		pr_info("ux500_wdt: hwwd - keepalive\n");
-		return ret;
-	}
-
-	case WDIOC_SETTIMEOUT:
-		if (get_user(interval, p))
-			return -EFAULT;
-
-		if (cpu_is_u8500()) {
-			/* 28 bit resolution in ms, becomes 268435.455 s */
-			if (interval > 268435 || interval < 0)
-				return -EINVAL;
-		} else if (cpu_is_u5500()) {
-			/* 32 bit resolution in ms, becomes 4294967.295 s */
-			if (interval > 4294967 || interval < 0)
-				return -EINVAL;
-		} else
-			return -EINVAL;
-
-		timeout = interval;
-		ux500_wdt_ops->disable(wdog_id);
-		ux500_wdt_ops->load(wdog_id, timeout * 1000);
-		ux500_wdt_ops->enable(wdog_id);
-
-	/* Fall through */
-	case WDIOC_GETTIMEOUT:
-		return put_user(timeout, p);
-
-	default:
-		return -ENOTTY;
-	}
+	ux500_wdt_stop(wdd);
+	prcmu_load_a9wdog(0, timeout * 1000);
+	ux500_wdt_start(wdd);
 
 	return 0;
 }
 
-static const struct file_operations ux500_wdt_fops = {
-	.owner		= THIS_MODULE,
-	.llseek		= no_llseek,
-	.write		= ux500_wdt_write,
-	.unlocked_ioctl = ux500_wdt_ioctl,
-	.open		= ux500_wdt_open,
-	.release	= ux500_wdt_release,
+static const struct watchdog_info ux500_wdt_info = {
+	.options = WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING | WDIOF_MAGICCLOSE,
+	.identity = "Ux500 WDT",
+	.firmware_version = 1,
 };
 
-static struct miscdevice ux500_wdt_miscdev = {
-	.minor = WATCHDOG_MINOR,
-	.name = "watchdog",
-	.fops = &ux500_wdt_fops,
+static struct watchdog_ops ux500_wdt_ops = {
+	.owner = THIS_MODULE,
+	.start = ux500_wdt_start,
+	.stop  = ux500_wdt_stop,
+	.ping  = ux500_wdt_keepalive,
+	.set_timeout = ux500_wdt_set_timeout,
+};
+
+static struct watchdog_device ux500_wdt = {
+	.info = &ux500_wdt_info,
+	.ops = &ux500_wdt_ops,
+	.min_timeout = WATCHDOG_MIN,
+	.max_timeout = WATCHDOG_MAX32,
 };
 
 #ifdef CONFIG_UX500_WATCHDOG_DEBUG
@@ -231,7 +111,7 @@ static ssize_t wdog_dbg_write(struct file *file,
 
 		if (!err) {
 			wdt_auto_off = val != 0;
-			(void) ux500_wdt_ops->config(1, wdt_auto_off);
+			prcmu_config_a9wdog(1, wdt_auto_off);
 		}
 		else {
 			pr_err("ux500_wdt:dbg: unknown value\n");
@@ -243,24 +123,24 @@ static ssize_t wdog_dbg_write(struct file *file,
 		if (!err) {
 			timeout = val;
 			/* Convert seconds to ms */
-			ux500_wdt_ops->disable(wdog_id);
-			ux500_wdt_ops->load(wdog_id, timeout * 1000);
-			ux500_wdt_ops->enable(wdog_id);
+			prcmu_disable_a9wdog(wdog_id);
+			prcmu_load_a9wdog(wdog_id, timeout * 1000);
+			prcmu_enable_a9wdog(wdog_id);
 		}
 		else {
 			pr_err("ux500_wdt:dbg: unknown value\n");
 		}
 		break;
 	case WDOG_DBG_KICK:
-		(void) ux500_wdt_ops->kick(wdog_id);
+		prcmu_kick_a9wdog(wdog_id);
 		break;
 	case WDOG_DBG_EN:
 		wdt_en = true;
-		(void) ux500_wdt_ops->enable(wdog_id);
+		prcmu_enable_a9wdog(wdog_id);
 		break;
 	case WDOG_DBG_DIS:
 		wdt_en = false;
-		(void) ux500_wdt_ops->disable(wdog_id);
+		prcmu_disable_a9wdog(wdog_id);
 		break;
 	}
 
@@ -369,24 +249,32 @@ static inline int __init wdog_dbg_init(void)
 static int __init ux500_wdt_probe(struct platform_device *pdev)
 {
 	int ret;
-	/* retrieve prcmu fops from plat data */
-	ux500_wdt_ops = dev_get_platdata(&pdev->dev);
+	struct ux500_wdt_data *pdata = pdev->dev.platform_data;
+	bool has_28bit_resolution = false;
 
-	if (!ux500_wdt_ops) {
-		dev_err(&pdev->dev, "plat dat incorrect\n");
-		return -EIO;
+	if (pdata) {
+		if (pdata->timeout > 0)
+			timeout = pdata->timeout;
+		if(pdata->nowayout >= 0)
+			nowayout = pdata->nowayout;
+		has_28bit_resolution = pdata->has_28_bits_resolution;
 	}
-	/* Number of watch dogs */
 
-	ux500_wdt_ops->config(1, wdt_auto_off);
-	/* convert to ms */
-	ux500_wdt_ops->load(wdog_id, timeout * 1000);
+	watchdog_set_nowayout(&ux500_wdt, nowayout);
 
-	ret = misc_register(&ux500_wdt_miscdev);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "failed to register misc\n");
+	/* update max timeout according to platform capabilities */
+	if (has_28bit_resolution)
+		ux500_wdt.max_timeout = WATCHDOG_MAX28;
+
+	/* auto off on sleep */
+	prcmu_config_a9wdog(1, wdt_auto_off);
+
+	/* set HW initial value */
+	prcmu_load_a9wdog(0, timeout * 1000);
+
+	ret = watchdog_register_device(&ux500_wdt);
+	if (ret)
 		return ret;
-	}
 
 	ret = wdog_dbg_init();
 	if (ret < 0)
@@ -396,55 +284,39 @@ static int __init ux500_wdt_probe(struct platform_device *pdev)
 
 	return 0;
 fail:
-	misc_deregister(&ux500_wdt_miscdev);
+	watchdog_unregister_device(&ux500_wdt);
 	return ret;
 }
 
 static int __exit ux500_wdt_remove(struct platform_device *dev)
 {
-	ux500_wdt_ops->disable(wdog_id);
-	wdt_en = false;
-	ux500_wdt_ops = NULL;
-	misc_deregister(&ux500_wdt_miscdev);
+	watchdog_unregister_device(&ux500_wdt);
+
 	return 0;
 }
+
 #ifdef CONFIG_PM
 static int ux500_wdt_suspend(struct platform_device *pdev,
 			     pm_message_t state)
 {
-	pr_info("ux500_wdt: hwwd - suspend\n");
-
-	if (wdt_en && cpu_is_u5500()) {
-		ux500_wdt_ops->disable(wdog_id);
-		return 0;
-	}
-
 	if (wdt_en && !wdt_auto_off) {
-		ux500_wdt_ops->disable(wdog_id);
-		ux500_wdt_ops->config(1, true);
+		ux500_wdt_stop(&ux500_wdt);
+		prcmu_config_a9wdog(1, true);
 
-		ux500_wdt_ops->load(wdog_id, timeout * 1000);
-		ux500_wdt_ops->enable(wdog_id);
+		prcmu_load_a9wdog(0, timeout * 1000);
+		ux500_wdt_start(&ux500_wdt);
 	}
 	return 0;
 }
 
 static int ux500_wdt_resume(struct platform_device *pdev)
 {
-	pr_info("ux500_wdt: hwwd - resume\n");
-
-	if (wdt_en && cpu_is_u5500()) {
-		ux500_wdt_ops->load(wdog_id, timeout * 1000);
-		ux500_wdt_ops->enable(wdog_id);
-		return 0;
-	}
-
 	if (wdt_en && !wdt_auto_off) {
-		ux500_wdt_ops->disable(wdog_id);
-		ux500_wdt_ops->config(1, wdt_auto_off);
+		ux500_wdt_stop(&ux500_wdt);
+		prcmu_config_a9wdog(1, wdt_auto_off);
 
-		ux500_wdt_ops->load(wdog_id, timeout * 1000);
-		ux500_wdt_ops->enable(wdog_id);
+		prcmu_load_a9wdog(0, timeout * 1000);
+		ux500_wdt_start(&ux500_wdt);
 	}
 	return 0;
 }
@@ -472,4 +344,3 @@ module_init(ux500_wdt_init);
 MODULE_AUTHOR("Jonas Aaberg <jonas.aberg@stericsson.com>");
 MODULE_DESCRIPTION("Ux500 Watchdog Driver");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS_MISCDEV(WATCHDOG_MINOR);

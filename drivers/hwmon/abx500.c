@@ -43,8 +43,8 @@
 /*
  * Thresholds are considered inactive if set to 0.
  * To avoid confusion for user space applications,
- * the temp monitor delay is set to 0 if all thresholds
- * are 0.
+ * the temp monitor delay is set with the default value
+ * if all thresholds are 0.
  */
 static bool find_active_thresholds(struct abx500_temp *data)
 {
@@ -59,6 +59,7 @@ static bool find_active_thresholds(struct abx500_temp *data)
 		"and reset temp monitor delay\n");
 	cancel_delayed_work_sync(&data->work);
 	data->work_active = false;
+	data->gpadc_monitor_delay = DEFAULT_MONITOR_DELAY;
 	return false;
 }
 

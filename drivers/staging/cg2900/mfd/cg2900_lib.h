@@ -46,7 +46,8 @@ extern void cg2900_tx_to_chip(struct cg2900_user_data *user,
 extern void cg2900_tx_no_user(struct cg2900_chip_dev *dev, struct sk_buff *skb);
 extern void cg2900_send_bt_cmd(struct cg2900_user_data *user,
 			       struct cg2900_user_data *logger,
-			       void *data, int length);
+			       void *data, int length,
+			       u8 h4_channel);
 extern void cg2900_send_bt_cmd_no_user(struct cg2900_chip_dev *dev, void *data,
 				       int length);
 extern void cg2900_create_work_item(struct workqueue_struct *wq,
@@ -55,7 +56,8 @@ extern void cg2900_create_work_item(struct workqueue_struct *wq,
 extern int cg2900_read_and_send_file_part(struct cg2900_user_data *user,
 					  struct cg2900_user_data *logger,
 					  struct cg2900_file_info *info,
-					  const struct firmware *fw_file);
+					  const struct firmware *fw_file,
+					  u8 h4_channel);
 extern void cg2900_send_to_hci_logger(struct cg2900_user_data *logger,
 							struct sk_buff *skb,
 							u8 direction);

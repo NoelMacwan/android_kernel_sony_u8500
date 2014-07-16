@@ -115,6 +115,14 @@ typedef enum {
 
 PUBLIC IMPORT_SHARED t_cm_trace_type CM_ENGINE_GetNextTrace(
         t_nmf_core_id               coreId,
-        struct t_nmf_trace          *trace);
+        struct t_nmf_trace          *trace,
+        int *readIdx,
+        int *lastRev);
 
+PUBLIC IMPORT_SHARED t_cm_error CM_ENGINE_resizeTraceBuffer(
+	t_nmf_core_id coreId,
+	t_uint32 oldSize);
+
+PUBLIC IMPORT_SHARED void cm_EnableIntr_Osttrace(t_nmf_core_id coreId);
+PUBLIC IMPORT_SHARED void cm_DisableIntr_Osttrace(t_nmf_core_id coreId);
 #endif /* CONTROL_IRQ_ENGINE_H */

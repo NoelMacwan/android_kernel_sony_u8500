@@ -12,8 +12,10 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/clk.h>
+
 #include <mach/hardware.h>
 
+#include "id.h"
 #include "clock.h"
 
 struct clk_debug_info {
@@ -225,10 +227,8 @@ no_dir:
 
 static int __init clk_debug_init(void)
 {
-	if (cpu_is_u8500())
+	if (cpu_is_u8500_family() || cpu_is_ux540_family())
 		db8500_clk_debug_init();
-	else if (cpu_is_u5500())
-		db5500_clk_debug_init();
 
 	return 0;
 }

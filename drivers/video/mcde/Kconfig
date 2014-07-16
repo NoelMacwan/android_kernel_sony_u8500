@@ -46,69 +46,23 @@ config MCDE_DISPLAY_DSI
 menu "MCDE DSI displays"
 	depends on MCDE_DISPLAY_DSI
 
-config MCDE_DISPLAY_GENERIC_DSI
-	tristate "Generic DSI display driver"
-
-config MCDE_DISPLAY_PANEL_DSI
-	bool "Display panel driver"
-
 config MCDE_DISPLAY_SAMSUNG_S6D16D0
 	bool "Samsung S6D16D0 DSI display driver"
-	depends on !MCDE_DISPLAY_PANEL_DSI
 	---help---
 	  Say Y if you have a TPO Taal or Blackpearl display panel.
 
+config MCDE_DISPLAY_TOSHIBA_DSI2LVDS
+	bool "Toshiba DSI2LVDS display driver"
+	---help---
+	  Say Y if you have a DSI2LVDS bridge.
+
+config MCDE_DISPLAY_HIMAX_HX8392
+	bool "HIMAX_HX8392 display driver"
+	---help---
+	  Say Y if you have a chimei 990001267 display panel.
+
 config MCDE_DISPLAY_SONY_ACX424AKP_DSI
 	tristate "Sony acx424akp DSI display driver"
-	depends on !MCDE_DISPLAY_PANEL_DSI
-
-config MCDE_DISPLAY_NT35560_DSI_SONY_ACX424AKM
-	bool "Sony ACX424AKM display panel"
-	depends on MCDE_DISPLAY_PANEL_DSI
-
-config MCDE_DISPLAY_ROTATE_NT35560_DSI_SONY_ACX424AKM
-	bool "Rotate Sony ACX424AKM content 180 degrees"
-	depends on MCDE_DISPLAY_NT35560_DSI_SONY_ACX424AKM
-
-config MCDE_DISPLAY_NT35560_DSI_HITACHI_DX09D09VM
-	bool "Hitachi DX09D09VM display panel"
-	depends on MCDE_DISPLAY_PANEL_DSI
-
-config MCDE_DISPLAY_ROTATE_NT35560_DSI_HITACHI_DX09D09VM
-	bool "Rotate Hitachi DX09D09VM content 180 degrees"
-	depends on MCDE_DISPLAY_NT35560_DSI_HITACHI_DX09D09VM
-
-config MCDE_DISPLAY_R61408_DSI_SEIKO_RB443
-	bool "Seiko RB443 display panel"
-	depends on MCDE_DISPLAY_PANEL_DSI
-
-config MCDE_DISPLAY_R61408_DSI_SAMSUNG_LMS347TF01
-	bool "Samsung LMS347TF01 display panel"
-	depends on MCDE_DISPLAY_PANEL_DSI
-
-config MCDE_DISPLAY_R61529_DSI_SEIKO_RJ248
-	bool "Seiko RJ248 display panel"
-	depends on MCDE_DISPLAY_PANEL_DSI
-
-config MCDE_DISPLAY_R61529_DSI_HITACHI_TX09D115VM
-	bool "Hitachi TX09D115VM display panel"
-	depends on MCDE_DISPLAY_PANEL_DSI
-
-config MCDE_DISPLAY_OTM9601_DSI_SONY_ACX438AKM
-	bool "Sony ACX438AKM display panel"
-	depends on MCDE_DISPLAY_PANEL_DSI
-
-config MCDE_DISPLAY_R61408_DSI_HITACHI_TX09D113
-	bool "Hitachi tx09d113 display panel"
-	depends on MCDE_DISPLAY_PANEL_DSI
-
-config MCDE_DISPLAY_R61408_DSI_SONY_L5F31178
-	bool "Sony l5f31178 display panel"
-	depends on MCDE_DISPLAY_PANEL_DSI
-
-config MCDE_DISPLAY_ROTATE_180
-	bool "Rotate display content 180 degrees"
-	depends on !MCDE_DISPLAY_PANEL_DSI
 
 config MCDE_DISPLAY_AV8100
 	tristate "AV8100 HDMI/CVBS display driver"
@@ -122,6 +76,11 @@ config MCDE_DISPLAY_HDMI_FB_AUTO_CREATE
 	  Say Y if you want the HDMI frame buffer to be created on start
 	  Say N if you want the HDMI frame buffer to be created when HDMI
 	  cable is plugged (needs user space HDMIservice)
+
+config MCDE_DISPLAY_BAMBOOK
+	tristate "DSI display driver for the SNDA Bambook S1"
+	---help---
+	  The Bambook S1 is SNDA Phone.
 
 endmenu
 
@@ -145,9 +104,3 @@ config MCDE_DISPLAY_VUIB500_DPI
 
 endmenu
 
-config MCDE_DISPLAY_LOGO
-	bool "MCDE logo"
-	default n
-	depends on FB_MCDE
-	---help---
-	  Say Y here if you want to display the logo.

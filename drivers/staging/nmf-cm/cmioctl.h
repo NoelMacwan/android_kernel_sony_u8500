@@ -611,6 +611,7 @@ typedef struct{
 #define CM_PRIV_DEBUGFS_DUMP_DONE 		_IO('c', 106)
 
 enum board_version {
-	U8500_V2
+	U8500_V2,
+	U9540_V1
 };
 #endif

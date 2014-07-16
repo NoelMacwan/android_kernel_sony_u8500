@@ -103,6 +103,8 @@
 
 #include <mach/hardware.h>
 
+#include "id.h"
+
 /*
  * temporary definitions
  * The following declarations are to be removed
@@ -289,6 +291,12 @@ static struct hwreg_io_range hwreg_u9540_io_map[] = {
 
 	/* 0xA0100000 -> 0xA01FFFFF: Smart Video Acc. Data Memory space (SVA) */
 	{.base = U8500_SVA_BASE,	.size = 0x60000},
+
+	/* 0xA0320000 -> 0xA032FFFF: HW Video Acc. config. registers (HVA) */
+	{.base = U9540_HVA_BASE,	.size = SZ_64K},
+
+	/* 0xA0330000 -> 0xA033FFFF: G1 configuration registers */
+	{.base = U9540_G1_BASE,		.size = SZ_64K},
 
 	/* 0x81000000 -> 0x8103FFFF: Main ICN Crossbar configuration registers
 	 */
@@ -679,8 +687,8 @@ static int __init hwreg_initialize(void)
 {
 	static struct dentry *file;
 
-	if (cpu_is_u9540()) {
-		printk(KERN_INFO "hwreg: cpu is U9540\n");
+	if (cpu_is_ux540_family()) {
+		printk(KERN_INFO "hwreg: cpu is Ux540\n");
 		hwreg_io_current_map = hwreg_u9540_io_map;
 	} else {
 		printk(KERN_INFO "hwreg: cpu is U8500\n");

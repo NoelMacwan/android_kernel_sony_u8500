@@ -10,6 +10,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/idr.h>
 #include <linux/err.h>
@@ -211,8 +212,7 @@ static int dispdev_set_config(struct dispdev *dd, struct dispdev_config *cfg)
 				info.paddr = buf->paddr;
 				ret = mcde_dss_apply_overlay(dd->ovly, &info);
 				if (!ret)
-					mcde_dss_update_overlay(dd->ovly,
-									false);
+					mcde_dss_update_overlay(dd->ovly);
 			}
 		}
 	} else {
@@ -244,7 +244,7 @@ static int dispdev_register_buffer(struct dispdev *dd, s32 hwmem_name)
 	hwmem_get_info(buf->alloc, &buf->size, &memtype, &access);
 
 	if (!(access & HWMEM_ACCESS_READ) ||
-					memtype != HWMEM_MEM_CONTIGUOUS_SYS) {
+					memtype == HWMEM_MEM_SCATTERED_SYS) {
 		ret = -EACCES;
 		goto invalid_mem;
 	}
@@ -278,7 +278,7 @@ static int dispdev_unregister_buffer(struct dispdev *dd, u32 buf_idx)
 		/* TODO Wait for frame done */
 		get_ovly_info(&dd->config, &info);
 		mcde_dss_apply_overlay(dd->ovly, &info);
-		mcde_dss_update_overlay(dd->ovly, false);
+		mcde_dss_update_overlay(dd->ovly);
 		hwmem_unpin(dd->buffers[buf_idx].alloc);
 	}
 
@@ -379,7 +379,7 @@ static int dispdev_queue_buffer(struct dispdev *dd,
 			dd->config.stride == buffer->buf_cfg.stride) {
 		info.paddr = mem_chunk.paddr;
 		mcde_dss_apply_overlay(dd->ovly, &info);
-		mcde_dss_update_overlay(dd->ovly, false);
+		mcde_dss_update_overlay(dd->ovly);
 	} else if (buffer->display_update) {
 		dd->buffers_need_update = true;
 	}

@@ -19,7 +19,9 @@
 #include <linux/cpufreq.h>
 #include <linux/mfd/dbx500-prcmu.h>
 
-#define MAX_STATES 5
+#include "id.h"
+
+#define MAX_STATES 6
 #define MAX_NAMELEN 16
 #define U8500_PRCMU_TCDM_SIZE 4096
 
@@ -27,7 +29,7 @@ struct state_history {
 	ktime_t start;
 	u32 state;
 	u32 counter[MAX_STATES];
-	u8 opps[MAX_STATES];
+	u32 opps[MAX_STATES];
 	int max_states;
 	int req;
 	bool reqs[MAX_STATES];
@@ -35,6 +37,7 @@ struct state_history {
 	int state_names[MAX_STATES];
 	char name[MAX_NAMELEN];
 	spinlock_t lock;
+	bool init_done;
 };
 
 static struct state_history ape_sh = {
@@ -43,6 +46,7 @@ static struct state_history ape_sh = {
 	.opps = {APE_50_OPP, APE_100_OPP},
 	.state_names = {50, 100},
 	.max_states = 2,
+	.init_done = true,
 };
 
 static struct state_history ddr_sh = {
@@ -51,13 +55,29 @@ static struct state_history ddr_sh = {
 	.opps = {DDR_25_OPP, DDR_50_OPP, DDR_100_OPP},
 	.state_names = {25, 50, 100},
 	.max_states = 3,
+	.init_done = true,
+};
+
+static struct state_history vsafe_sh = {
+	.name = "VSAFE",
+	.req = PRCMU_QOS_VSAFE_OPP,
+	.opps = {VSAFE_50_OPP, VSAFE_100_OPP},
+	.state_names = {50, 100},
+	.max_states = 2,
+	.init_done = true,
 };
 
 static struct state_history arm_sh = {
 	.name = "ARM KHZ",
 	.req = PRCMU_QOS_ARM_KHZ,
-	.opps = {ARM_EXTCLK, ARM_50_OPP, ARM_100_OPP, ARM_MAX_OPP},
-	.max_states = 4,
+	.init_done = false,
+};
+
+static struct state_history arm_max_freq_sh = {
+	.name = "ARM MAX FREQ",
+	.req = PRCMU_QOS_ARM_MAX_FREQ,
+	.max_states = 1,
+	.init_done = true,
 };
 
 static const u16 u8500_prcmu_dump_regs[] = {
@@ -159,29 +179,30 @@ static const u16 u8500_prcmu_dump_regs[] = {
 	/*MDM_ACWAKE*/ 0x578,			/*MOD_MEM_REQ*/ 0x5a4,
 	/*MOD_MEM_ACK*/ 0x5a8,			/*ARM_PLLDIVPS_REQ*/ 0x5b0,
 	/*ARM_PLLDIVPS_ACK*/ 0x5b4,		/*SRPTIMER_VAL*/ 0x5d0,
-};
-
-/* Offsets from secure base which is U8500_PRCMU_BASE + SZ_4K */
-static const u16 u8500_prcmu_dump_secure_regs[] = {
-	/*SECNONSEWM*/ 0x00,		/*ESRAM0_INITN*/ 0x04,
-	/*ARMITMSKSEC_31TO0*/ 0x08,	/*ARMITMSKSEC_63TO32*/ 0x0C,
-	/*ARMITMSKSEC_95TO64*/ 0x10,	/*ARMITMSKSEC_127TO96*/ 0x14,
-	/*ARMIT_MASKXP70_IT*/ 0x18,	/*ESRAM0_EPOD_CFG*/ 0x1C,
-	/*ESRAM0_EPOD_C_VAL*/ 0x20,	/*ESRAM0_EPOD_VOK*/ 0x2C,
-	/*ESRAM0_LS_SLEEP*/ 0x30,	/*SECURE_ONGOING*/ 0x34,
-	/*I2C_SECURE*/ 0x38,		/*RESET_STATUS*/ 0x3C,
-	/*PERIPH4_RESETN_VAL*/ 0x48,	/*SPAREOUT_SEC*/ 0x4C,
-	/*PIPELINEDCR*/ 0xD8,
+	/*SECNONSEWM*/ 0x1000,			/*ESRAM0_INITN*/ 0x1004,
+	/*ARMITMSKSEC_31TO0*/ 0x1008,		/*ARMITMSKSEC_63TO32*/ 0x100C,
+	/*ARMITMSKSEC_95TO64*/ 0x1010,		/*ARMITMSKSEC_127TO96*/ 0x1014,
+	/*ARMIT_MASKXP70_IT*/ 0x1018,		/*ESRAM0_EPOD_CFG*/ 0x101C,
+	/*ESRAM0_EPOD_C_VAL*/ 0x1020,		/*ESRAM0_EPOD_VOK*/ 0x102C,
+	/*ESRAM0_LS_SLEEP*/ 0x1030,		/*SECURE_ONGOING*/ 0x1034,
+	/*I2C_SECURE*/ 0x1038,			/*RESET_STATUS*/ 0x103C,
+	/*PERIPH4_RESETN_VAL*/ 0x1048,		/*SPAREOUT_SEC*/ 0x104C,
+	/*PIPELINEDCR*/ 0x10D8,
 };
 
 static int ape_voltage_count;
+static u32 qos_req_verbose;
 
-static void log_set(struct state_history *sh, u8 opp)
+static void log_set(struct state_history *sh, u32 opp)
 {
 	ktime_t now;
 	ktime_t dtime;
 	unsigned long flags;
 	int state;
+
+	/* check if already initialized */
+	if (!sh->init_done)
+		return;
 
 	now = ktime_get();
 	spin_lock_irqsave(&sh->lock, flags);
@@ -212,9 +233,23 @@ void prcmu_debug_ddr_opp_log(u8 opp)
 	log_set(&ddr_sh, opp);
 }
 
-void prcmu_debug_arm_opp_log(u8 opp)
+
+void prcmu_debug_vsafe_opp_log(u8 opp)
 {
-	log_set(&arm_sh, opp);
+	log_set(&vsafe_sh, opp);
+}
+
+/*
+ * value is u32 freq in kHz
+ */
+void prcmu_debug_arm_opp_log(u32 value)
+{
+	log_set(&arm_sh, value);
+}
+
+void prcmu_debug_arm_max_freq_log(u32 value)
+{
+	log_set(&arm_max_freq_sh, value);
 }
 
 static void log_reset(struct state_history *sh)
@@ -251,11 +286,27 @@ static ssize_t ddr_stats_write(struct file *file,
 	return count;
 }
 
+static ssize_t vsafe_stats_write(struct file *file,
+			   const char __user *user_buf,
+			   size_t count, loff_t *ppos)
+{
+	log_reset(&vsafe_sh);
+	return count;
+}
+
 static ssize_t arm_stats_write(struct file *file,
 			   const char __user *user_buf,
 			   size_t count, loff_t *ppos)
 {
 	log_reset(&arm_sh);
+	return count;
+}
+
+static ssize_t arm_max_freq_stats_write(struct file *file,
+			   const char __user *user_buf,
+			   size_t count, loff_t *ppos)
+{
+	log_reset(&arm_max_freq_sh);
 	return count;
 }
 
@@ -310,9 +361,27 @@ static int ddr_stats_print(struct seq_file *s, void *p)
 	return 0;
 }
 
+static int vsafe_stats_print(struct seq_file *s, void *p)
+{
+	log_print(s, &vsafe_sh);
+	return 0;
+}
+
 static int arm_stats_print(struct seq_file *s, void *p)
 {
 	log_print(s, &arm_sh);
+	return 0;
+}
+
+static int arm_max_freq_stats_print(struct seq_file *s, void *p)
+{
+	log_print(s, &arm_max_freq_sh);
+	return 0;
+}
+
+static int qos_req_read(struct seq_file *s, void *p)
+{
+	prcmu_qos_show_requirement(s, qos_req_verbose);
 	return 0;
 }
 
@@ -323,18 +392,47 @@ static int opp_read(struct seq_file *s, void *p)
 
 	switch (sh->req) {
 	case PRCMU_QOS_DDR_OPP:
-		opp = prcmu_get_ddr_opp();
+		opp = prcmu_get_ddr_opp(DDR_OPP);
 		seq_printf(s, "%s (%d)\n",
-			   (opp == DDR_100_OPP) ? "100%" :
-			   (opp == DDR_50_OPP) ? "50%" :
-			   (opp == DDR_25_OPP) ? "25%" :
-			   "unknown", opp);
+			(opp == DDR_100_OPP) ? "100%" :
+			(opp == DDR_50_OPP) ? "50%" :
+			(opp == DDR_25_OPP) ? "25%" :
+			"unknown", opp);
+		opp = prcmu_get_ddr_opp(EFF_DDR_OPP);
+		seq_printf(s, "Effective DDR OPP: %s (%d)\n",
+			(opp == DDR_100_OPP) ? "100%" :
+			(opp == DDR_50_OPP) ? "50%" :
+			(opp == DDR_25_OPP) ? "25%" :
+			"unknown", opp);
+
+		opp = prcmu_get_ddr_opp(DDR1_OPP);
+		if (opp >= 0) {
+			seq_printf(s, "ddr1 %s (%d)\n",
+				(opp == DDR_100_OPP) ? "100%" :
+				(opp == DDR_50_OPP) ? "50%" :
+				(opp == DDR_25_OPP) ? "25%" :
+				"unknown", opp);
+			opp = prcmu_get_ddr_opp(EFF_DDR1_OPP);
+			seq_printf(s, "Effective DDR1 OPP: %s (%d)\n",
+				(opp == DDR_100_OPP) ? "100%" :
+				(opp == DDR_50_OPP) ? "50%" :
+				(opp == DDR_25_OPP) ? "25%" :
+				"unknown", opp);
+
+		}
 		break;
 	case PRCMU_QOS_APE_OPP:
 		opp = prcmu_get_ape_opp();
 		seq_printf(s, "%s (%d)\n",
 			   (opp == APE_100_OPP) ? "100%" :
 			   (opp == APE_50_OPP) ? "50%" :
+			   "unknown", opp);
+		break;
+	case PRCMU_QOS_VSAFE_OPP:
+		opp = prcmu_get_vsafe_opp();
+		seq_printf(s, "%s (%d)\n",
+			   (opp == VSAFE_100_OPP) ? "100%" :
+			   (opp == VSAFE_50_OPP) ? "50%" :
 			   "unknown", opp);
 		break;
 	case PRCMU_QOS_ARM_KHZ:
@@ -347,11 +445,32 @@ static int opp_read(struct seq_file *s, void *p)
 			   (opp == ARM_EXTCLK) ? "25% (extclk)" :
 			   "unknown", opp);
 		break;
+	case PRCMU_QOS_ARM_MAX_FREQ:
+			opp = prcmu_qos_requirement(PRCMU_QOS_ARM_MAX_FREQ);
+			seq_printf(s, "QOS max freq : %d\n", opp);
+
 	default:
 		break;
 	}
 	return 0;
 
+}
+
+static ssize_t qos_req_write(struct file *file,
+				   const char __user *user_buf,
+				   size_t count, loff_t *ppos)
+{
+	long unsigned i;
+	int err;
+
+	err = kstrtoul_from_user(user_buf, count, 0, &i);
+
+	if (err)
+		return err;
+
+	qos_req_verbose = i ;
+
+	return count;
 }
 
 static ssize_t opp_write(struct file *file,
@@ -469,7 +588,7 @@ static int avs_read(struct seq_file *s, void *p)
 	u8 avs[AVS_SIZE];
 	void __iomem *tcdm_base;
 
-	if (cpu_is_u8500()) {
+	if (cpu_is_u8500_family()) {
 		tcdm_base = __io_address(U8500_PRCMU_TCDM_BASE);
 
 		memcpy_fromio(avs, tcdm_base + PRCM_AVS_BASE, AVS_SIZE);
@@ -502,7 +621,7 @@ static void prcmu_data_mem_print(struct seq_file *s)
 	void __iomem *tcdm_base;
 	u32 dmem[4];
 
-	if (cpu_is_u8500()) {
+	if (cpu_is_u8500_family()) {
 		tcdm_base = __io_address(U8500_PRCMU_TCDM_BASE);
 
 		for (i = 0; i < U8500_PRCMU_TCDM_SIZE; i += 16) {
@@ -553,7 +672,7 @@ static void prcmu_regs_print(struct seq_file *s)
 	void __iomem *prcmu_base;
 	u32 reg_val;
 
-	if (cpu_is_u8500()) {
+	if (cpu_is_u8500_family()) {
 		prcmu_base = __io_address(U8500_PRCMU_BASE);
 
 		for (i = 0; i < ARRAY_SIZE(u8500_prcmu_dump_regs); i++) {
@@ -579,63 +698,16 @@ static void prcmu_regs_print(struct seq_file *s)
 	}
 }
 
-static void prcmu_secure_regs_print(struct seq_file *s)
-{
-	int i;
-	int err;
-	void __iomem *prcmu_sec_base;
-	u32 reg_val;
-
-	if (cpu_is_u8500()) {
-		/* PRCMU secure base starts after SZ_4K */
-		prcmu_sec_base = ioremap(U8500_PRCMU_BASE + SZ_4K, SZ_4K);
-		if (!prcmu_sec_base) {
-			pr_err("%s: ioremap faild\n", __func__);
-			return;
-		}
-
-		for (i = 0; i < ARRAY_SIZE(u8500_prcmu_dump_secure_regs); i++) {
-			reg_val = readl(prcmu_sec_base +
-				u8500_prcmu_dump_secure_regs[i]);
-
-			if (s) {
-				err = seq_printf(s, "0x%04x: 0x%08x\n",
-					u8500_prcmu_dump_secure_regs[i] +
-					SZ_4K,
-					reg_val);
-				if (err < 0) {
-					pr_err("%s: seq_printf overflow,"
-					"offset=%x\n", __func__,
-					u8500_prcmu_dump_secure_regs[i] +
-					SZ_4K);
-					/* Can't do much here */
-					break;
-				}
-			} else {
-				printk(KERN_INFO
-					"0x%04x: 0x%08x\n",
-					u8500_prcmu_dump_secure_regs[i] +
-					SZ_4K,
-					reg_val);
-			}
-		}
-
-		iounmap(prcmu_sec_base);
-	}
-}
-
 void prcmu_debug_dump_regs(void)
 {
 	printk(KERN_INFO "PRCMU registers dump:\n");
 	prcmu_regs_print(NULL);
-	prcmu_secure_regs_print(NULL);
 }
 
 static int prcmu_debugfs_regs_read(struct seq_file *s, void *p)
 {
 	seq_printf(s, "PRCMU registers:\n");
 	prcmu_regs_print(s);
-	prcmu_secure_regs_print(s);
 	return 0;
 }
 
@@ -644,14 +716,25 @@ static int prcmu_debugfs_regs_read(struct seq_file *s, void *p)
 /* There are eight mailboxes */
 #define NUM_MAILBOXES 8
 #define NUM_MAILBOX0_EVENTS 32
+#define WAKEUP_ABB 7
 static u32 num_mailbox_interrupts[NUM_MAILBOXES];
 static u32 num_mailbox0_events[NUM_MAILBOX0_EVENTS];
+static u32 num_mailbox0_events_wake[NUM_MAILBOX0_EVENTS];
 static u32 num_mailbox0_events_garbage[NUM_MAILBOX0_EVENTS];
+static u32 num_mailbox_wake_interrupts[NUM_MAILBOXES];
+
+bool __attribute__((weak)) suspend_test_wake_cause_interrupt_is_mine(u32 my_int)
+{
+	return false;
+}
 
 void prcmu_debug_register_interrupt(u32 mailbox)
 {
-	if (mailbox < NUM_MAILBOXES)
+	if (mailbox < NUM_MAILBOXES) {
 		num_mailbox_interrupts[mailbox]++;
+		if (mailbox != 0 && suspend_test_wake_cause_interrupt_is_mine(IRQ_DB8500_PRCMU1))
+			num_mailbox_wake_interrupts[mailbox]++;
+	}
 }
 
 void prcmu_debug_register_mbox0_event(u32 ev, u32 mask)
@@ -660,10 +743,13 @@ void prcmu_debug_register_mbox0_event(u32 ev, u32 mask)
 
 	for (i = 0 ; i < NUM_MAILBOX0_EVENTS; i++)
 		if (ev & (1 << i)) {
-			if (mask & (1 << i))
-			    num_mailbox0_events[i]++;
-			else
-			    num_mailbox0_events_garbage[i]++;
+			if (mask & (1 << i)) {
+				num_mailbox0_events[i]++;
+				if (suspend_test_wake_cause_interrupt_is_mine(IRQ_DB8500_PRCMU1))
+					num_mailbox0_events_wake[i]++;
+			} else {
+				num_mailbox0_events_garbage[i]++;
+			}
 		}
 }
 
@@ -705,69 +791,57 @@ static int interrupt_read(struct seq_file *s, void *p)
 		"GPIO6",
 		"GPIO7",
 		"GPIO8"};
-	static char *mbox0names_u5500[] = {
-		"RTC",
-		"RTT0",
-		"RTT1",
-		"CD_IRQ",
-		"SRP_TIM",
-		"APE_REQ",
-		"USB",
-		"ABB",
-		"LOW_POWER_AUDIO",
-		"TEMP_SENSOR_LOW",
-		"ARM",
-		"AC_WAKE_ACK",
-		NULL,
-		"TEMP_SENSOR_HIGH",
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		"MODEM_SW_RESET_REQ",
-		NULL,
-		NULL,
-		"GPIO0",
-		"GPIO1",
-		"GPIO2",
-		"GPIO3",
-		"GPIO4",
-		"GPIO5",
-		"GPIO6",
-		"GPIO7",
-		"AC_REL_ACK"};
 
-	if (cpu_is_u8500()) {
+	if (cpu_is_u8500_family() || cpu_is_ux540_family()) {
 		mbox0names = mbox0names_u8500;
-	} else if (cpu_is_u5500()) {
-		mbox0names = mbox0names_u5500;
 	} else {
 		seq_printf(s, "Unknown ASIC!\n");
 		return 0;
 	}
 
-	seq_printf(s, "mailbox0: %d\n", num_mailbox_interrupts[0]);
+	seq_printf(s, "name\tno interrupts\tno wake-ups from suspend\n\n");
+	seq_printf(s, "mailbox0:\t%d\t\t%d\n",
+		   num_mailbox_interrupts[0],
+		   num_mailbox_wake_interrupts[0]);
 
 	for (i = 0; i < NUM_MAILBOX0_EVENTS; i++)
 		if (mbox0names[i]) {
-			seq_printf(s, " %20s %d ", mbox0names[i],
-				   num_mailbox0_events[i]
-				   );
+			seq_printf(s, " %20s %4d %d", mbox0names[i],
+				   num_mailbox0_events[i],
+				   num_mailbox0_events_wake[i]);
 			if (num_mailbox0_events_garbage[i])
 				seq_printf(s, "unwanted: %d",
 					   num_mailbox0_events_garbage[i]);
 			seq_printf(s, "\n");
 		} else if (num_mailbox0_events[i]) {
-			seq_printf(s, "         unknown (%d) %d\n",
-				   i, num_mailbox0_events[i]);
+			seq_printf(s, "         unknown (%d) %d %d\n",
+				   i, num_mailbox0_events[i],
+				   num_mailbox0_events_wake[i]);
 		}
 
 	for (i = 1 ; i < NUM_MAILBOXES; i++)
-		seq_printf(s, "mailbox%d: %d\n", i, num_mailbox_interrupts[i]);
+		seq_printf(s, "mailbox%d:\t%d\t\t%d\n", i,
+			   num_mailbox_interrupts[i],
+			   num_mailbox_wake_interrupts[i]);
 	return 0;
+}
+
+static int version_read(struct seq_file *s, void *p)
+{
+	/* FIXME: generic prcmu driver interface for fw version is missing */
+	struct prcmu_fw_version *fw_version = prcmu_get_fw_version();
+
+	seq_printf(s, "PRCMU firmware: %s, version %d.%d.%d\n",
+		   fw_version->project_name,
+		   fw_version->api_version,
+		   fw_version->func_version,
+		   fw_version->errata);
+	return 0;
+}
+
+static int qos_req_open_file(struct inode *inode, struct file *file)
+{
+	return single_open(file, qos_req_read, inode->i_private);
 }
 
 static int opp_open_file(struct inode *inode, struct file *file)
@@ -785,9 +859,19 @@ static int ddr_stats_open_file(struct inode *inode, struct file *file)
 	return single_open(file, ddr_stats_print, inode->i_private);
 }
 
+static int vsafe_stats_open_file(struct inode *inode, struct file *file)
+{
+	return single_open(file, vsafe_stats_print, inode->i_private);
+}
+
 static int arm_stats_open_file(struct inode *inode, struct file *file)
 {
 	return single_open(file, arm_stats_print, inode->i_private);
+}
+
+static int arm_max_freq_stats_open_file(struct inode *inode, struct file *file)
+{
+	return single_open(file, arm_max_freq_stats_print, inode->i_private);
 }
 
 static int cpufreq_delay_open_file(struct inode *inode, struct file *file)
@@ -848,9 +932,23 @@ static int interrupt_open_file(struct inode *inode, struct file *file)
 	return single_open(file, interrupt_read, inode->i_private);
 }
 
+static int version_open_file(struct inode *inode, struct file *file)
+{
+	return single_open(file, version_read, inode->i_private);
+}
+
 static const struct file_operations opp_fops = {
 	.open = opp_open_file,
 	.write = opp_write,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+	.owner = THIS_MODULE,
+};
+
+static const struct file_operations qos_req_fops = {
+	.open = qos_req_open_file,
+	.write = qos_req_write,
 	.read = seq_read,
 	.llseek = seq_lseek,
 	.release = single_release,
@@ -875,9 +973,27 @@ static const struct file_operations ddr_stats_fops = {
 	.owner = THIS_MODULE,
 };
 
+static const struct file_operations vsafe_stats_fops = {
+	.open = vsafe_stats_open_file,
+	.write = vsafe_stats_write,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+	.owner = THIS_MODULE,
+};
+
 static const struct file_operations arm_stats_fops = {
 	.open = arm_stats_open_file,
 	.write = arm_stats_write,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+	.owner = THIS_MODULE,
+};
+
+static const struct file_operations arm_max_freq_stats_fops = {
+	.open = arm_max_freq_stats_open_file,
+	.write = arm_max_freq_stats_write,
 	.read = seq_read,
 	.llseek = seq_lseek,
 	.release = single_release,
@@ -934,6 +1050,14 @@ static const struct file_operations interrupts_fops = {
 	.owner = THIS_MODULE,
 };
 
+static const struct file_operations version_fops = {
+	.open = version_open_file,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+	.owner = THIS_MODULE,
+};
+
 static int setup_debugfs(void)
 {
 	struct dentry *dir;
@@ -953,8 +1077,20 @@ static int setup_debugfs(void)
 	if (IS_ERR_OR_NULL(file))
 		goto fail;
 
+	if (cpu_is_u9540()) {
+		file = debugfs_create_file("vsafe_stats", (S_IRUGO | S_IWUGO),
+				dir, NULL, &vsafe_stats_fops);
+		if (IS_ERR_OR_NULL(file))
+			goto fail;
+	}
+
 	file = debugfs_create_file("arm_stats", (S_IRUGO | S_IWUGO),
 				   dir, NULL, &arm_stats_fops);
+	if (IS_ERR_OR_NULL(file))
+		goto fail;
+
+	file = debugfs_create_file("arm_max_freq_stats", (S_IRUGO | S_IWUGO),
+				   dir, NULL, &arm_max_freq_stats_fops);
 	if (IS_ERR_OR_NULL(file))
 		goto fail;
 
@@ -975,6 +1111,26 @@ static int setup_debugfs(void)
 				   &opp_fops);
 	if (IS_ERR_OR_NULL(file))
 		goto fail;
+
+	file = debugfs_create_file("qos_req", (S_IRUGO),
+				   dir, NULL,
+				   &qos_req_fops);
+	if (IS_ERR_OR_NULL(file))
+		goto fail;
+
+	file = debugfs_create_file("arm_max_freq", (S_IRUGO),
+				   dir, (void *)&arm_max_freq_sh,
+				   &opp_fops);
+	if (IS_ERR_OR_NULL(file))
+		goto fail;
+
+	if (cpu_is_u9540()) {
+		file = debugfs_create_file("vsafe_opp", (S_IRUGO),
+				dir, (void *)&vsafe_sh,
+				&opp_fops);
+		if (IS_ERR_OR_NULL(file))
+			goto fail;
+	}
 
 	file = debugfs_create_file("opp_cpufreq_delay", (S_IRUGO),
 				   dir, NULL, &cpufreq_delay_fops);
@@ -1010,6 +1166,12 @@ static int setup_debugfs(void)
 	if (IS_ERR_OR_NULL(file))
 		goto fail;
 
+	file = debugfs_create_file("version",
+				   (S_IRUGO),
+				   dir, NULL, &version_fops);
+	if (IS_ERR_OR_NULL(file))
+		goto fail;
+
 	return 0;
 fail:
 	if (!IS_ERR_OR_NULL(dir))
@@ -1023,10 +1185,15 @@ static __init int prcmu_debug_init(void)
 {
 	spin_lock_init(&ape_sh.lock);
 	spin_lock_init(&ddr_sh.lock);
+	spin_lock_init(&vsafe_sh.lock);
 	spin_lock_init(&arm_sh.lock);
+	spin_lock_init(&arm_max_freq_sh.lock);
 	ape_sh.start = ktime_get();
 	ddr_sh.start = ktime_get();
+	vsafe_sh.start = ktime_get();
 	arm_sh.start = ktime_get();
+	arm_max_freq_sh.start = ktime_get();
+
 	return 0;
 }
 arch_initcall(prcmu_debug_init);
@@ -1037,13 +1204,15 @@ static __init int prcmu_debug_debugfs_init(void)
 	int i;
 
 	table = cpufreq_frequency_get_table(0);
-
-	for (i = 0; table[i].frequency != CPUFREQ_TABLE_END; i++)
+	for (i = 0; table[i].frequency != CPUFREQ_TABLE_END; i++) {
 		arm_sh.state_names[i] = table[i].frequency;
-
+		arm_sh.opps[i] = table[i].frequency;
+	}
 	arm_sh.max_states = i;
+	arm_sh.init_done = true;
 
 	setup_debugfs();
 	return 0;
 }
+
 late_initcall(prcmu_debug_debugfs_init);

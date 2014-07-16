@@ -12,6 +12,7 @@
 
 #include <linux/leds.h>
 #include <linux/sched.h>
+#include <linux/device.h>
 #include <linux/fault-inject.h>
 
 #include <linux/mmc/core.h>
@@ -280,6 +281,7 @@ struct mmc_host {
 #endif
 
 	int			rescan_disable;	/* disable card detection */
+	int			rescan_entered;	/* used with nonremovable devices */
 
 	struct mmc_card		*card;		/* device attached to this host */
 
@@ -288,10 +290,10 @@ struct mmc_host {
 	int			claim_cnt;	/* "claim" nesting count */
 
 	struct delayed_work	detect;
-
-	struct delayed_work	resume;		/* deferred resume work */
 	int			detect_change;	/* card detect flag */
 	struct mmc_hotplug	hotplug;
+
+	struct delayed_work	resume;		/* deferred resume work */
 	unsigned int		pm_state;	/* used for deferred resume */
 #define MMC_HOST_DEFERRED_RESUME	(1 << 0)
 #define MMC_HOST_NEEDS_RESUME		(1 << 1)
@@ -407,7 +409,7 @@ int mmc_card_can_sleep(struct mmc_host *host);
 int mmc_pm_notify(struct notifier_block *notify_block, unsigned long, void *);
 
 /* Module parameter */
-extern int mmc_assume_removable;
+extern bool mmc_assume_removable;
 
 static inline int mmc_card_is_removable(struct mmc_host *host)
 {
@@ -434,16 +436,6 @@ static inline int mmc_boot_partition_access(struct mmc_host *host)
 	return !(host->caps2 & MMC_CAP2_BOOTPART_NOACC);
 }
 
-static inline int mmc_host_deferred_resume(struct mmc_host *host)
-{
-	return host->pm_state & MMC_HOST_DEFERRED_RESUME;
-}
-
-static inline int mmc_host_needs_resume(struct mmc_host *host)
-{
-	return host->pm_state & MMC_HOST_NEEDS_RESUME;
-}
-
 #ifdef CONFIG_MMC_CLKGATE
 void mmc_host_clk_hold(struct mmc_host *host);
 void mmc_host_clk_release(struct mmc_host *host);
@@ -464,5 +456,14 @@ static inline unsigned int mmc_host_clk_rate(struct mmc_host *host)
 }
 #endif
 
-#endif
+static inline int mmc_host_deferred_resume(struct mmc_host *host)
+{
+	return host->pm_state & MMC_HOST_DEFERRED_RESUME;
+}
 
+static inline int mmc_host_needs_resume(struct mmc_host *host)
+{
+	return host->pm_state & MMC_HOST_NEEDS_RESUME;
+}
+
+#endif /* LINUX_MMC_HOST_H */

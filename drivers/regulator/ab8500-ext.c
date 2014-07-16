@@ -14,12 +14,13 @@
  */
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/err.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/machine.h>
 #include <linux/mfd/abx500.h>
-#include <linux/mfd/ab8500.h>
+#include <linux/mfd/abx500/ab8500.h>
 #include <linux/regulator/ab8500.h>
 
 /**
@@ -29,7 +30,6 @@
  * @rdev: regulator device
  * @cfg: regulator configuration (extension of regulator FW configuration)
  * @is_enabled: status of regulator (on/off)
- * @fixed_uV: typical voltage (for fixed voltage supplies)
  * @update_bank: bank to control on/off
  * @update_reg: register to control on/off
  * @update_mask: mask to enable/disable and set mode of regulator
@@ -47,7 +47,6 @@ struct ab8500_ext_regulator_info {
 	struct regulator_dev *rdev;
 	struct ab8500_ext_regulator_cfg *cfg;
 	bool is_enabled;
-	int fixed_uV;
 	u8 update_bank;
 	u8 update_reg;
 	u8 update_mask;
@@ -258,30 +257,33 @@ static unsigned int ab8500_ext_regulator_get_mode(struct regulator_dev *rdev)
 
 static int ab8500_ext_fixed_get_voltage(struct regulator_dev *rdev)
 {
-	struct ab8500_ext_regulator_info *info = rdev_get_drvdata(rdev);
+	struct regulation_constraints *regu_constraints = rdev->constraints;
 
-	if (info == NULL) {
-		dev_err(rdev_get_dev(rdev), "regulator info null pointer\n");
+	if (regu_constraints == NULL) {
+		dev_err(rdev_get_dev(rdev), "regulator constraints null pointer\n");
 		return -EINVAL;
 	}
-
-	return info->fixed_uV;
+	if (regu_constraints->min_uV && regu_constraints->max_uV) {
+		if (regu_constraints->min_uV == regu_constraints->max_uV)
+			return regu_constraints->min_uV;
+	}
+	return -EINVAL;
 }
 
 static int ab8500_ext_list_voltage(struct regulator_dev *rdev,
 				   unsigned selector)
 {
-	struct ab8500_ext_regulator_info *info = rdev_get_drvdata(rdev);
+	struct regulation_constraints *regu_constraints = rdev->constraints;
 
-	if (info == NULL) {
-		dev_err(rdev_get_dev(rdev), "regulator info null pointer\n");
+	if (regu_constraints == NULL) {
+		dev_err(rdev_get_dev(rdev), "regulator constraints null pointer\n");
 		return -EINVAL;
 	}
-
 	/* return the uV for the fixed regulators */
-	if (info->fixed_uV)
-		return info->fixed_uV;
-
+	if (regu_constraints->min_uV && regu_constraints->max_uV) {
+		if (regu_constraints->min_uV == regu_constraints->max_uV)
+			return regu_constraints->min_uV;
+	}
 	return -EINVAL;
 }
 
@@ -318,7 +320,6 @@ static struct ab8500_ext_regulator_info
 			.owner		= THIS_MODULE,
 			.n_voltages	= 1,
 		},
-		.fixed_uV		= 1800000,
 		.update_bank		= 0x04,
 		.update_reg		= 0x08,
 		.update_mask		= 0x03,
@@ -336,7 +337,6 @@ static struct ab8500_ext_regulator_info
 			.owner		= THIS_MODULE,
 			.n_voltages	= 1,
 		},
-		.fixed_uV		= 1360000,
 		.update_bank		= 0x04,
 		.update_reg		= 0x08,
 		.update_mask		= 0x0c,
@@ -354,7 +354,6 @@ static struct ab8500_ext_regulator_info
 			.owner		= THIS_MODULE,
 			.n_voltages	= 1,
 		},
-		.fixed_uV		= 3400000,
 		.update_bank		= 0x04,
 		.update_reg		= 0x08,
 		.update_mask		= 0x30,
@@ -415,22 +414,20 @@ __devinit int ab8500_ext_regulator_init(struct platform_device *pdev)
 		info->cfg = (struct ab8500_ext_regulator_cfg *)
 			pdata->ext_regulator[i].driver_data;
 
-		if (is_ab9540(ab8500)) {
-			if (info->desc.id == AB8500_EXT_SUPPLY1) {
+		if ((is_ab9540(ab8500)) || (is_ab8540(ab8500))) {
+			if (info->desc.id == AB8500_EXT_SUPPLY1)
 				info->desc.ops = &ab9540_ext_regulator_ops;
-				info->fixed_uV = 4500000;
+			if (info->desc.id == AB8500_EXT_SUPPLY2) {
+				info->desc.ops = &ab9540_ext_regulator_ops;
+				info->desc.n_voltages = 0;
 			}
-			if (info->desc.id == AB8500_EXT_SUPPLY2)
+			if (info->desc.id == AB8500_EXT_SUPPLY3)
 				info->desc.ops = &ab9540_ext_regulator_ops;
-
-			if (info->desc.id == AB8500_EXT_SUPPLY3) {
-				info->desc.ops = &ab9540_ext_regulator_ops;
-				info->fixed_uV = 3300000;
-			}
 		}
+
 		/* register regulator with framework */
 		info->rdev = regulator_register(&info->desc, &pdev->dev,
-				&pdata->ext_regulator[i], info);
+				&pdata->ext_regulator[i], info, NULL);
 		if (IS_ERR(info->rdev)) {
 			err = PTR_ERR(info->rdev);
 			dev_err(&pdev->dev, "failed to register regulator %s\n",

@@ -23,11 +23,12 @@
  * 8bit wide buses, hardware flow contronl, negative edges and clock inversion
  * supported in ST Micro U300 and Ux500 versions
  */
-#define MCI_ST_8BIT_BUS		(1 << 12)
-#define MCI_ST_U300_HWFCEN	(1 << 13)
-#define MCI_ST_UX500_NEG_EDGE	(1 << 13)
-#define MCI_ST_UX500_HWFCEN	(1 << 14)
-#define MCI_ST_UX500_CLK_INV	(1 << 15)
+#define MCI_ST_8BIT_BUS		 (1 << 12)
+#define MCI_ST_U300_HWFCEN	 (1 << 13)
+#define MCI_ST_UX500_NEG_EDGE	 (1 << 13)
+#define MCI_ST_UX500_HWFCEN	 (1 << 14)
+#define MCI_ST_UX500_CLK_INV	 (1 << 15)
+#define MCI_ST_UX500_DIV2_ENABLE (1 << 27)
 
 #define MMCIARGUMENT		0x008
 #define MMCICOMMAND		0x00c
@@ -147,6 +148,12 @@
 #define MMCIFIFOCNT		0x048
 #define MMCIFIFO		0x080 /* to 0x0bc */
 
+#define MMCIBURSTSIZE           0x0c8
+#define MCI_ST_UX500_BURSTSIZE_8         (1 << 0)
+#define MCI_ST_UX500_BURSTSIZE_16        (1 << 1)
+#define MCI_ST_UX500_BURSTSIZE_32        (1 << 2)
+#define MCI_ST_UX500_BURSTSIZE_64        (1 << 3)
+
 #define MCI_IRQENABLE	\
 	(MCI_CMDCRCFAILMASK|MCI_DATACRCFAILMASK|MCI_CMDTIMEOUTMASK|	\
 	MCI_DATATIMEOUTMASK|MCI_TXUNDERRUNMASK|MCI_RXOVERRUNMASK|	\
@@ -202,9 +209,11 @@ struct mmci_host {
 	/* pio stuff */
 	struct sg_mapping_iter	sg_miter;
 	unsigned int		size;
-	struct regulator	*vcc;
+	unsigned int		cache;
+	unsigned int		cache_len;
 
-	struct timer_list	req_expiry;
+	struct regulator	*vcc;
+	struct regulator	*vcore;
 
 #ifdef CONFIG_DMA_ENGINE
 	/* DMA stuff */

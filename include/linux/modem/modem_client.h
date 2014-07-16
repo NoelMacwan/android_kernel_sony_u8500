@@ -16,7 +16,7 @@ struct modem;
 #ifdef CONFIG_MODEM
 struct modem *modem_get(struct device *dev, const char *id);
 void modem_put(struct modem *modem);
-void modem_request(struct modem *modem);
+int modem_request(struct modem *modem);
 void modem_release(struct modem *modem);
 int modem_is_requested(struct modem *modem);
 int modem_get_usage(struct modem *modem);
@@ -32,8 +32,9 @@ static inline void modem_put(struct modem *modem)
 {
 }
 
-static inline void modem_request(struct modem *modem)
+static inline int modem_request(struct modem *modem)
 {
+	return 0;
 }
 
 static inline void modem_release(struct modem *modem)

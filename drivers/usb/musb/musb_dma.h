@@ -116,6 +116,7 @@ struct dma_controller;
  * @max_len: the maximum number of bytes the channel can move in one
  *	transaction (typically representing many USB maximum-sized packets)
  * @actual_len: how many bytes have been transferred
+ * @prog_len: how many bytes have been programmed for transfer
  * @status: current channel status (updated e.g. on interrupt)
  * @desired_mode: true if mode 1 is desired; false if mode 0 is desired
  *
@@ -127,6 +128,7 @@ struct dma_channel {
 	/* FIXME not void* private_data, but a dma_controller * */
 	size_t			max_len;
 	size_t			actual_len;
+	size_t			prog_len;
 	enum dma_channel_status	status;
 	bool			desired_mode;
 };
@@ -155,7 +157,9 @@ dma_channel_status(struct dma_channel *c)
  * @channel_release: call this to release a DMA channel
  * @channel_abort: call this to abort a pending DMA transaction,
  *	returning it to FREE (but allocated) state
- *
+ * @channel_pause: This function pauses the ongoing DMA transfer
+ * @channel_resume: This function resumes the ongoing DMA transfer
+ * @tx_status: Gets the residue of an ongoing DMA transfer
  * Controllers manage dma channels.
  */
 struct dma_controller {
@@ -169,6 +173,9 @@ struct dma_controller {
 							dma_addr_t dma_addr,
 							u32 length);
 	int			(*channel_abort)(struct dma_channel *);
+	int			(*channel_pause)(struct dma_channel *);
+	int			(*channel_resume)(struct dma_channel *);
+	int			(*tx_status)(struct dma_channel *);
 	int			(*is_compatible)(struct dma_channel *channel,
 							u16 maxpacket,
 							void *buf, u32 length);

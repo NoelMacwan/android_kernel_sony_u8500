@@ -10,10 +10,13 @@
  *
  */
 
+#include <linux/module.h>
+#include "osal-kernel.h"
 #include <cm/engine/api/configuration_engine.h>
 #include <cm/engine/configuration/inc/configuration_status.h>
 #include <cm/engine/power_mgt/inc/power.h>
-#include "osal-kernel.h"
+#include <cm/engine/api/control/irq_engine.h>
+#include <cm/engine/executive_engine_mgt/inc/executive_engine_mgt.h>
 
 /* Embedded Static RAM base address */
 /* 8500 config: 0-64k: secure */
@@ -46,7 +49,6 @@ struct OsalEnvironment osalEnv =
 			.monitor_tsk      = NULL,
 			.hwmem_code       = NULL,
 			.hwmem_data       = NULL,
-			.trace_read_count = ATOMIC_INIT(0),
 		},
 		{
 			.coreId           = SIA_CORE_ID,
@@ -59,7 +61,6 @@ struct OsalEnvironment osalEnv =
 			.monitor_tsk      = NULL,
 			.hwmem_code       = NULL,
 			.hwmem_data       = NULL,
-			.trace_read_count = ATOMIC_INIT(0),
 		}
 	},
 	.esram_regulator = { NULL, NULL},
@@ -81,16 +82,16 @@ struct OsalEnvironment osalEnv =
 	},
 };
 
-module_param_call(cm_debug_level, param_set_int, param_get_int,
-                  &cm_debug_level, S_IWUSR|S_IRUGO);
+module_param_cb(cm_debug_level, &param_ops_int,
+		&cm_debug_level, S_IWUSR|S_IRUGO);
 MODULE_PARM_DESC(cm_debug_level, "Debug level of NMF Core");
 
-module_param_call(cm_error_break, param_set_bool, param_get_bool,
-                  &cm_error_break, S_IWUSR|S_IRUGO);
+module_param_cb(cm_error_break, &param_ops_bool,
+		&cm_error_break, S_IWUSR|S_IRUGO);
 MODULE_PARM_DESC(cm_error_break, "Stop on error (in an infinite loop, for debugging purpose)");
 
-module_param_call(cmIntensiveCheckState, param_set_bool, param_get_bool,
-                  &cmIntensiveCheckState, S_IWUSR|S_IRUGO);
+module_param_cb(cmIntensiveCheckState, &param_ops_bool,
+		&cmIntensiveCheckState, S_IWUSR|S_IRUGO);
 MODULE_PARM_DESC(cmIntensiveCheckState, "Add additional intensive checks");
 
 DECLARE_MPC_PARAM(SVA, SDRAM_DATA_SIZE, "", 1);
@@ -109,7 +110,45 @@ int cfgESRAMSize;
 module_param(cfgESRAMSize, uint, S_IRUGO);
 MODULE_PARM_DESC(cfgESRAMSize, "Size of ESRAM used in the CM (in Kb)");
 
-static int set_param_powerMode(const char *val, const struct kernel_param *kp)
+static int param_set_osttrace_nb(const char *val, const struct kernel_param *kp)
+{
+	t_ee_state *state;
+	int coreId, rv;
+	u32 oldSize;
+
+	for (coreId = FIRST_MPC_ID; coreId <= LAST_MPC_ID; coreId++) {
+		state = cm_EEM_getExecutiveEngine(coreId);
+		if (&(state->traceBufferSize) == kp->arg)
+			break;
+	}
+
+	oldSize = state->traceBufferSize;
+	rv = param_set_uint(val, kp);
+	if (rv)
+		return rv;
+
+	if (CM_ENGINE_resizeTraceBuffer(coreId, oldSize) == CM_OK) {
+		pr_info("[CM]: OST Trace buffer resizing done successfully "
+			"for %s DSP\n", osalEnv.mpc[COREIDX(coreId)].name);
+		return 0;
+	} else {
+		return -EINVAL;
+	}
+}
+
+static struct kernel_param_ops param_ops_osttrace_nb = {
+        .set = param_set_osttrace_nb,
+        .get = param_get_uint,
+};
+
+module_param_cb(sva_osttrace_nb,
+		&param_ops_osttrace_nb,
+		&eeState[SVA_CORE_ID].traceBufferSize, S_IWUSR|S_IRUGO);
+module_param_cb(sia_osttrace_nb,
+		&param_ops_osttrace_nb,
+		&eeState[SIA_CORE_ID].traceBufferSize, S_IWUSR|S_IRUGO);
+
+static int param_set_powerMode(const char *val, const struct kernel_param *kp)
 {
 	/* No equals means "set"... */
 	if (!val) val = "1";
@@ -128,8 +167,37 @@ static int set_param_powerMode(const char *val, const struct kernel_param *kp)
 	return 0;
 }
 
-module_param_call(powerMode, set_param_powerMode, param_get_bool, &powerMode, S_IWUSR|S_IRUGO);
+static struct kernel_param_ops param_ops_powerMode = {
+        .set = param_set_powerMode,
+        .get = param_get_bool,
+};
+
+module_param_cb(powerMode, &param_ops_powerMode, &powerMode, S_IWUSR|S_IRUGO);
 MODULE_PARM_DESC(powerMode, "DSP power mode enable");
+
+/**
+ * struct dbx500_asic_id - fields of the ASIC ID
+ * @process: the manufacturing process, 0x40 is 40 nm 0x00 is "standard"
+ * @partnumber: hithereto 0x8500 for DB8500
+ * @revision: version code in the series
+ */
+struct dbx500_asic_id {
+	u16	partnumber;
+	u8	revision;
+	u8	process;
+};
+
+extern struct dbx500_asic_id dbx500_id;
+
+static inline unsigned int __attribute_const__ dbx500_partnumber(void)
+{
+	return dbx500_id.partnumber;
+}
+
+static inline bool __attribute_const__ cpu_is_u9540(void)
+{
+	return dbx500_partnumber() == 0x9540;
+}
 
 int init_config(void)
 {
@@ -156,14 +224,14 @@ int init_config(void)
 	osalEnv.mpc[SVA].sdram_code.size = cfgMpcSDRAMCodeSize_SVA * ONE_KB;
 	osalEnv.mpc[SVA].sdram_data.size = cfgMpcSDRAMDataSize_SVA * ONE_KB;
 	osalEnv.mpc[SVA].base.size       = 128*ONE_KB; //we expose only TCM24
-	spin_lock_init(&osalEnv.mpc[SVA].trace_reader_lock);
+	init_waitqueue_head(&osalEnv.mpc[SVA].trace_waitq);
 
 	osalEnv.mpc[SIA].nbYramBanks     = cfgMpcYBanks_SIA;
 	osalEnv.mpc[SIA].eeId            = cfgSchedulerTypeHybrid_SIA ? HYBRID_EXECUTIVE_ENGINE : SYNCHRONOUS_EXECUTIVE_ENGINE;
 	osalEnv.mpc[SIA].sdram_code.size = cfgMpcSDRAMCodeSize_SIA * ONE_KB;
 	osalEnv.mpc[SIA].sdram_data.size = cfgMpcSDRAMDataSize_SIA * ONE_KB;
 	osalEnv.mpc[SIA].base.size       = 128*ONE_KB; //we expose only TCM24
-	spin_lock_init(&osalEnv.mpc[SIA].trace_reader_lock);
+	init_waitqueue_head(&osalEnv.mpc[SIA].trace_waitq);
 
 	return 0;
 }

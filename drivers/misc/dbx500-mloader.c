@@ -25,6 +25,7 @@
 #include <mach/hardware.h>
 
 #define DEVICE_NAME "dbx500_mloader_fw"
+#define MAP_SIZE PAGE_SIZE
 
 struct mloader_priv {
 	struct platform_device *pdev;
@@ -43,9 +44,10 @@ static int mloader_fw_send(struct dbx500_ml_fw *fw_info)
 	unsigned long size;
 	unsigned long phys_start;
 	void *fw_data;
-	void *vaddr;
 	void __iomem *ioaddr;
 	int ret;
+	unsigned long copy_offset = 0;
+	unsigned long copy_size;
 
 	ret = request_firmware(&fw, fw_info->name, &mloader_priv->pdev->dev);
 	if (ret) {
@@ -61,21 +63,34 @@ static int mloader_fw_send(struct dbx500_ml_fw *fw_info)
 		goto err_fw;
 	}
 
+
 	size = PAGE_ALIGN(fw->size);
 	phys_start = fw_info->area->start + fw_info->offset;
 	phys_start &= PAGE_MASK;
-	ioaddr = ioremap(phys_start, size);
-	if (!ioaddr) {
-		dev_err(&mloader_priv->pdev->dev,
-				"failed remap memory region.\n");
-		ret = -EINVAL;
-		goto err_fw;
-	}
 
-	vaddr = ioaddr + (fw_info->offset & ~PAGE_MASK);
-	fw_data = (void *)fw->data;
-	memcpy_toio(vaddr, fw_data, fw->size);
-	iounmap(ioaddr);
+	while (copy_offset < size) {
+		ioaddr = ioremap(phys_start + copy_offset, MAP_SIZE);
+
+		if (!ioaddr) {
+			dev_err(&mloader_priv->pdev->dev,
+				"Failed to remap memory region.\n");
+			ret = -EINVAL;
+			goto err_fw;
+		}
+
+		fw_data = ((void *)fw->data) + copy_offset;
+
+		if ((copy_offset + MAP_SIZE) > size)
+			copy_size = fw->size - copy_offset;
+		else
+			copy_size = MAP_SIZE;
+
+		memcpy(ioaddr, fw_data, copy_size);
+		iounmap(ioaddr);
+
+		copy_offset += MAP_SIZE;
+	}
+	wmb();
 
 err_fw:
 	release_firmware(fw);
@@ -128,47 +143,6 @@ static int mloader_fw_mmapdump(struct file *file, struct vm_area_struct *vma)
 	return 0;
 }
 
-static int mloader_fw_mmapload(struct file *file, struct vm_area_struct *vma)
-{
-	unsigned long load_addr;
-	struct dbx500_ml_fw *fw_info;
-
-	if (mloader_priv->pdata->nr_fws != 1) {
-		dev_err(&mloader_priv->pdev->dev,
-			"Only one fw area is supported!\n");
-		return -EINVAL;
-	}
-	fw_info = &mloader_priv->pdata->fws[0];
-	load_addr = fw_info->area->start + fw_info->offset;
-
-	if ((vma->vm_end - vma->vm_start) >
-		(fw_info->area->size - fw_info->offset)) {
-		dev_err(&mloader_priv->pdev->dev,
-			"Try to mmap more memory than available!\n");
-		return -EINVAL;
-	}
-	if (remap_pfn_range(vma,
-		    vma->vm_start,
-		    load_addr >> PAGE_SHIFT,
-		    vma->vm_end - vma->vm_start,
-		    vma->vm_page_prot))
-		return -EAGAIN;
-
-	return 0;
-}
-
-static int mloader_fw_mmap(struct file *file, struct vm_area_struct *vma)
-{
-	if (vma->vm_flags & VM_READ)
-		return mloader_fw_mmapdump(file, vma);
-	else if (vma->vm_flags & VM_WRITE)
-		return mloader_fw_mmapload(file, vma);
-
-	dev_err(&mloader_priv->pdev->dev,
-			"Not supported!\n");
-	return -EINVAL;
-}
-
 static void mloader_fw_dumpinfo(struct dump_image *images)
 {
 	u32 offset = 0;
@@ -214,15 +188,6 @@ static long mloader_fw_ioctl(struct file *filp, unsigned int cmd,
 				mloader_priv->size) ? -EFAULT : 0;
 		break;
 	}
-	case ML_FORCE_PANIC: {
-		char dump_name[MAX_PATH];
-		memset(dump_name, 0, MAX_PATH);
-		ret = copy_from_user(dump_name, argp,
-				  MAX_PATH) ? -EFAULT : 0;
-		panic("Modem crash. Modem dump %s" \
-			  " will be saved on next boot.", dump_name);
-		break;
-	}
 	default:
 		ret = -EPERM;
 		break;
@@ -234,7 +199,7 @@ static long mloader_fw_ioctl(struct file *filp, unsigned int cmd,
 static const struct file_operations modem_fw_fops = {
 	.owner			= THIS_MODULE,
 	.unlocked_ioctl		= mloader_fw_ioctl,
-	.mmap			= mloader_fw_mmap,
+	.mmap			= mloader_fw_mmapdump,
 };
 
 static int __devinit mloader_fw_probe(struct platform_device *pdev)

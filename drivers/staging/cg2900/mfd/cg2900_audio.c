@@ -60,7 +60,6 @@ enum chip_revision {
 	CG2905_CHIP_REV_PG1_05,
 	CG2905_CHIP_REV_PG2,
 	CG2910_CHIP_REV_PG1,
-	CG2910_CHIP_REV_PG1_05,
 	CG2910_CHIP_REV_PG2
 };
 
@@ -2408,10 +2407,6 @@ int cg2900_audio_open(unsigned int *session, struct device *parent)
 			info->revision = CG2910_CHIP_REV_PG1;
 			break;
 
-		case CG2910_PG1_05_REV:
-			info->revision = CG2910_CHIP_REV_PG1_05;
-			break;
-
 		case CG2910_PG2_REV:
 			info->revision = CG2910_CHIP_REV_PG2;
 			break;
@@ -3484,7 +3479,7 @@ static int __devexit cg2900_audio_fm_remove(struct platform_device *pdev)
 
 static struct platform_driver cg2900_audio_bt_driver = {
 	.driver = {
-		.name	= "cg2900-audiobt",
+		.name	= "cg2900-audiovs",
 		.owner	= THIS_MODULE,
 	},
 	.probe	= cg2900_audio_bt_probe,

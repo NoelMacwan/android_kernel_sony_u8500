@@ -1036,7 +1036,6 @@ int cg2900_fm_switch_on(
 	}
 
 	if (version_info.revision == CG2910_PG1_REV
-			|| version_info.revision == CG2910_PG1_05_REV
 			|| version_info.revision == CG2910_PG2_REV
 			|| version_info.revision == CG2905_PG1_05_REV
 			|| version_info.revision == CG2905_PG2_REV) {

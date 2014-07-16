@@ -12,12 +12,15 @@
 #include <linux/errno.h>
 #include <linux/smp.h>
 #include <linux/completion.h>
+#include <linux/mfd/dbx500-prcmu.h>
 
 #include <asm/cacheflush.h>
+#include <asm/smp_plat.h>
 
 #include <mach/context.h>
+#include <mach/suspend.h>
 
-#include <../../../drivers/cpuidle/cpuidle-dbx500_dbg.h>
+#include "pm/cpuidle_dbg.h"
 
 extern volatile int pen_release;
 
@@ -39,9 +42,9 @@ static inline void platform_do_lowpower(unsigned int cpu)
 		context_restore_cpu_registers();
 		context_varm_restore_core();
 
-		if (pen_release == cpu) {
+		if (pen_release == cpu_logical_map(cpu)) {
 			/*
-			* OK, proper wakeup, we're done
+			 * OK, proper wakeup, we're done
 			 */
 			break;
 		}
@@ -52,7 +55,16 @@ static inline void platform_do_lowpower(unsigned int cpu)
 
 int platform_cpu_kill(unsigned int cpu)
 {
-	return wait_for_completion_timeout(&cpu_killed, 5000);
+
+
+	int status;
+
+	status = wait_for_completion_timeout(&cpu_killed, 5000);
+
+	/*  switch off CPU1 in case of x540  */
+	status |= prcmu_unplug_cpu1();
+
+	return status;
 }
 
 /*

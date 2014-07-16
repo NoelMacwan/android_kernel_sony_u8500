@@ -11,9 +11,10 @@
 #include <linux/platform_device.h>
 #include <linux/err.h>
 
-static void modem_m6718_request(struct modem_dev *mdev)
+static int modem_m6718_request(struct modem_dev *mdev)
 {
 	/* nothing to do - modem will wake when data is sent */
+	return 0;
 }
 
 static void modem_m6718_release(struct modem_dev *mdev)

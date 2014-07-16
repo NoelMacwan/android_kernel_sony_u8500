@@ -20,7 +20,8 @@
 #define STE_HSI_TX_CHANNELS            0x020
 #define STE_HSI_TX_FLUSHBITS           0x024
 #define STE_HSI_TX_PRIORITY            0x028
-#define STE_HSI_TX_STATICCONFID        0x02C
+#define STE_HSI_TX_BURSTLEN            0x02C
+#define STE_HSI_TX_PREAMBLE            0x030
 #define STE_HSI_TX_DATASWAP            0x034
 #define STE_HSI_TX_FRAMELENX           0x080
 #define STE_HSI_TX_BUFFERX             0x0C0
@@ -34,10 +35,18 @@
 #define STE_HSI_TX_WATERMARKIC         0x20C
 #define STE_HSI_TX_WATERMARKID         0x210
 #define STE_HSI_TX_WATERMARKIS         0x214
+#define STE_HSI_TX_ITCR                0xD00
+#define STE_HSI_TX_ITIP                0xD04
+#define STE_HSI_TX_ITOP1               0xD08
+#define STE_HSI_TX_ITOP2               0xD0C
 #define STE_HSI_TX_PERIPHID0           0xFE0
 #define STE_HSI_TX_PERIPHID1           0xFE4
 #define STE_HSI_TX_PERIPHID2           0xFE8
 #define STE_HSI_TX_PERIPHID3           0xFEC
+#define STE_HSI_TX_PCELLID0            0xFF0
+#define STE_HSI_TX_PCELLID1            0xFF4
+#define STE_HSI_TX_PCELLID2            0xFF8
+#define STE_HSI_TX_PCELLID3            0xFFC
 
 /* HSIR register offsets */
 #define STE_HSI_RX_ID                  0x000
@@ -72,10 +81,19 @@
 #define STE_HSI_RX_EXCEPMIS            0x21C
 #define STE_HSI_RX_EXCEPIM             0x220
 #define STE_HSI_RX_WATERMARKIS         0x224
+#define STE_HSI_RX_ITCR                0xD00
+#define STE_HSI_RX_ITIP                0xD04
+#define STE_HSI_RX_ITOP1               0xD08
+#define STE_HSI_RX_ITOP2               0xD0C
+#define STE_HSI_RX_ITOP3               0xD10
 #define STE_HSI_RX_PERIPHID0           0xFE0
 #define STE_HSI_RX_PERIPHID1           0xFE4
 #define STE_HSI_RX_PERIPHID2           0xFE8
 #define STE_HSI_RX_PERIPHID3           0xFEC
+#define STE_HSI_RX_PCELLID0            0xFF0
+#define STE_HSI_RX_PCELLID1            0xFF4
+#define STE_HSI_RX_PCELLID2            0xFF8
+#define STE_HSI_RX_PCELLID3            0xFFC
 
 /* HSI states */
 #define STE_HSI_STATE_IDLE             0x00
@@ -103,8 +121,6 @@
 /* Max channels of STE HSI controller */
 #define STE_HSI_MAX_CHANNELS           2
 
-#define STE_HSI_DMA_MAX_BURST          1
-
 struct stedma40_chan_cfg;
 
 struct ste_hsi_port_cfg {
@@ -116,9 +132,10 @@ struct ste_hsi_port_cfg {
 };
 
 struct ste_hsi_platform_data {
-       int num_ports;
-       int use_dma;
-       struct ste_hsi_port_cfg *port_cfg;
+	int num_ports;
+	int use_dma;
+	int hsi0_acwake_gpio;
+	struct ste_hsi_port_cfg *port_cfg;
 };
 
 #endif

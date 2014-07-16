@@ -10,6 +10,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/device.h>
 #include <linux/regulator/consumer.h>
 #include <linux/delay.h>
@@ -178,10 +179,8 @@ static int __devinit samsung_s6d16d0_probe(struct mcde_display_device *ddev)
 		di->port.vsync_max_duration = 0;
 	}
 	di->port.frame_trig = ddev->port->frame_trig;
-	di->port.phy.dsi.num_data_lanes = 2;
+	di->port.phy.dsi.num_data_lanes = pdata->num_data_lanes;
 	di->port.phy.dsi.host_eot_gen = true;
-	/* TODO: Move UI to mcde_hw.c when clk_get_rate(dsi) is done */
-	di->port.phy.dsi.ui = 9;
 	di->port.phy.dsi.hs_freq = DSI_HS_FREQ_HZ;
 	di->port.phy.dsi.lp_freq = DSI_LP_FREQ_HZ;
 

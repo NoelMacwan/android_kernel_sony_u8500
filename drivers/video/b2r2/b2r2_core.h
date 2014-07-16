@@ -69,13 +69,47 @@
 /**
  * B2R2_DOMAIN_DISABLE -
  */
-#define B2R2_DOMAIN_DISABLE_TIMEOUT (HZ/100)
+/* original timeout was ~10ms; use more intuitive method to define */
+#define B2R2_DOMAIN_DISABLE_TIMEOUT_MS (10)
+
+/* keep history of last N b2r2 jobs to avoid OPP ping-pong between jobs */
+#define B2R2_OPP_HISTORY_SIZE	(8)
+/* if b2r2 has been powered off, wait this long before discarding the history */
+#define B2R2_OPP_RESET_REQ_MS	(250)
+/**
+ * B2R2_TEMP_BUF -
+ */
+#define B2R2_TEMP_BUF_TIMEOUT (HZ)
+
+#if B2R2_OPP_HISTORY_SIZE > 32
+	#error Invalid B2R2 history size (1 <= size <= 32)
+#elif B2R2_OPP_HISTORY_SIZE < 1
+	#error Invalid B2R2 history size (1 <= size <= 32)
+#endif
+
+#if B2R2_OPP_HISTORY_SIZE <= 8
+	#define B2R2_OPP_HISTORY_MASK	(0xFF >> (8 - B2R2_OPP_HISTORY_SIZE))
+#elif B2R2_OPP_HISTORY_SIZE <= 16
+	#define B2R2_OPP_HISTORY_MASK	(0xFFFF >> (16 - B2R2_OPP_HISTORY_SIZE))
+#else
+	#define B2R2_OPP_HISTORY_MASK	(0xFFFFFFFF >> (32 - B2R2_OPP_HISTORY_SIZE))
+#endif
 
 /**
  * B2R2_REGULATOR_RETRY_COUNT -
  */
 #define B2R2_REGULATOR_RETRY_COUNT 10
 
+/* id for control opp requirements */
+#define B2R2_CORE_CONTROL_ID		"b2r2_block"
+
+/* default opp for normal use-cases */
+#define B2R2_DEFAULT_APE_OPP	PRCMU_QOS_DEFAULT_VALUE
+#define B2R2_DEFAULT_DDR_OPP	PRCMU_QOS_DEFAULT_VALUE
+
+/* opp for heavy use-cases */
+#define B2R2_HIGH_APE_OPP		100
+#define B2R2_HIGH_DDR_OPP		100
 
 #ifdef DEBUG_CHECK_ADDREF_RELEASE
 
@@ -191,6 +225,7 @@ struct b2r2_core {
 	/* Power management variables */
 	struct mutex domain_lock;
 	struct delayed_work domain_disable_work;
+	struct delayed_work tmp_buf_remove_work;
 
 	/*
 	 * We need to keep track of both the number of domain_enable/disable()
@@ -198,15 +233,41 @@ struct b2r2_core {
 	 * power off is done in a delayed job.
 	 */
 	bool domain_enabled;
-	volatile bool valid;
+	bool valid;
 	int domain_request_count;
 	bool lockdown;
 
 	struct clk *b2r2_clock;
 	struct regulator *b2r2_reg;
+	struct regulator *vana_reg;
 
 	struct b2r2_control *control;
 };
+
+/**
+ * struct b2r2_group - Data for group of b2r2 cores
+ *
+ * @core: link to admin data for a particular core
+ * @group_lock: inter-core sync mutex
+ * @work_reset_opp: delayed event to reset opp requirements
+ * @work_queue: work queue for the above
+ * @is_core_enabled: bitmap of enabled cores
+ * @opp_level_hi: true if current opp requirements are set to high
+ * @hi_lo_opp_history: bitfield of previous job hi/lo opp requirements
+ * @history_invalid: sync variable for above
+ */
+
+struct b2r2_group {
+	struct b2r2_core *core[B2R2_MAX_NBR_DEVICES];
+	struct mutex group_lock;
+	struct delayed_work work_reset_opp;
+	struct workqueue_struct *work_queue;
+	u32 is_core_enabled;
+	bool opp_level_hi;
+	u32 hi_lo_opp_history;
+	bool history_invalid;
+};
+
 
 /**
  * b2r2_core_job_add() - Adds a job to B2R2 job queues
@@ -297,5 +358,13 @@ void b2r2_core_job_release(struct b2r2_core_job *job, const char *caller);
 void b2r2_core_print_stats(struct b2r2_core *core);
 
 void b2r2_core_release(struct kref *control_ref);
+
+/* called once per job from b2r2_api.c to update power requirements */
+void b2r2_core_update_opp_req(
+	enum b2r2_blt_fmt src0_fmt,
+	enum b2r2_blt_fmt src1_fmt,
+	enum b2r2_blt_fmt dst_fmt,
+	enum b2r2_blt_transform trans,
+	bool hw_limit);
 
 #endif /* !defined(__B2R2_CORE_JOB_H__) */

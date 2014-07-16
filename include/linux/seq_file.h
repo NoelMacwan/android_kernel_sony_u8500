@@ -3,6 +3,7 @@
 
 #include <linux/types.h>
 #include <linux/string.h>
+#include <linux/bug.h>
 #include <linux/mutex.h>
 #include <linux/cpumask.h>
 #include <linux/nodemask.h>
@@ -23,6 +24,7 @@ struct seq_file {
 	u64 version;
 	struct mutex lock;
 	const struct seq_operations *op;
+	int poll_event;
 	void *private;
 };
 
@@ -73,7 +75,7 @@ static inline void seq_commit(struct seq_file *m, int num)
 	}
 }
 
-char *mangle_path(char *s, char *p, char *esc);
+char *mangle_path(char *s, const char *p, const char *esc);
 int seq_open(struct file *, const struct seq_operations *);
 ssize_t seq_read(struct file *, char __user *, size_t, loff_t *);
 loff_t seq_lseek(struct file *, loff_t, int);
@@ -83,13 +85,12 @@ int seq_putc(struct seq_file *m, char c);
 int seq_puts(struct seq_file *m, const char *s);
 int seq_write(struct seq_file *seq, const void *data, size_t len);
 
-int seq_printf(struct seq_file *, const char *, ...)
-	__attribute__ ((format (printf,2,3)));
+__printf(2, 3) int seq_printf(struct seq_file *, const char *, ...);
 
-int seq_path(struct seq_file *, struct path *, char *);
-int seq_dentry(struct seq_file *, struct dentry *, char *);
-int seq_path_root(struct seq_file *m, struct path *path, struct path *root,
-		  char *esc);
+int seq_path(struct seq_file *, const struct path *, const char *);
+int seq_dentry(struct seq_file *, struct dentry *, const char *);
+int seq_path_root(struct seq_file *m, const struct path *path,
+		  const struct path *root, const char *esc);
 int seq_bitmap(struct seq_file *m, const unsigned long *bits,
 				   unsigned int nr_bits);
 static inline int seq_cpumask(struct seq_file *m, const struct cpumask *mask)
@@ -121,9 +122,12 @@ int single_release(struct inode *, struct file *);
 void *__seq_open_private(struct file *, const struct seq_operations *, int);
 int seq_open_private(struct file *, const struct seq_operations *, int);
 int seq_release_private(struct inode *, struct file *);
+int seq_put_decimal_ull(struct seq_file *m, char delimiter,
+			unsigned long long num);
+int seq_put_decimal_ll(struct seq_file *m, char delimiter,
+			long long num);
 
 #define SEQ_START_TOKEN ((void *)1)
-
 /*
  * Helpers for iteration over list_head-s in seq_files
  */
@@ -153,21 +157,4 @@ extern struct hlist_node *seq_hlist_start_head_rcu(struct hlist_head *head,
 extern struct hlist_node *seq_hlist_next_rcu(void *v,
 						   struct hlist_head *head,
 						   loff_t *ppos);
-
-#ifdef CONFIG_USER_NS
-static inline struct user_namespace *seq_user_ns(struct seq_file *seq)
-{
-	struct file *f = container_of((void *) seq, struct file, private_data);
-
-	return f->f_cred->user_ns;
-}
-
-#else
-static inline struct user_namespace *seq_user_ns(struct seq_file *seq)
-{
-	extern struct user_namespace init_user_ns;
-	return &init_user_ns;
-}
-#endif /* CONFIG_USER_NS */
-
 #endif

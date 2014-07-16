@@ -5,17 +5,22 @@
  */
 
 #include <linux/input/ab8505_micro_usb_iddet.h>
+#include "pins.h"
 
 /* Cables with less than 400kohm iddet resistance */
 static struct cust_rid_adcid cust_rid_adcid_1_8V_200k[] = {
-	CUST_RID_ADCID(0x1F0, 0x214, 121000, USBSWITCH_TTY_CONV),
-	CUST_RID_ADCID(0x237, 0x25B, 150000, USBSWITCH_UART),
-	CUST_RID_ADCID(0x2E6, 0x3e8, 255000, USBSWITCH_USB_BOOT_OFF),
-	CUST_RID_ADCID(0x31D, 0x44c, 301000, USBSWITCH_USB_BOOT_ON),
-	CUST_RID_ADCID(0x177, 0x514, 523000,
+
+	CUST_RID_ADCID(400, 620, 102000, USBSWITCH_PPD),
+	CUST_RID_ADCID(621, 700, 121000, USBSWITCH_TTY_CONV),
+	CUST_RID_ADCID(540, 790, 150000, USBSWITCH_UART),
+	CUST_RID_ADCID(791, 910, 200000, USBSWITCH_CARKIT_TYPE1),
+	CUST_RID_ADCID(940, 1000, 255000, USBSWITCH_USB_BOOT_OFF),
+	CUST_RID_ADCID(1010, 1100, 301000, USBSWITCH_USB_BOOT_ON),
+	CUST_RID_ADCID(1010, 1100, 440000, USBSWITCH_CARKIT_TYPE2),
+	CUST_RID_ADCID(1101, 1300, 523000,
 			USBSWITCH_UART_BOOT_OFF),
-	CUST_RID_ADCID(0x1C0, 0x540, 619000, USBSWITCH_UART_BOOT_ON),
-	CUST_RID_ADCID(0x2E4, 0x544, 1000000,
+	CUST_RID_ADCID(1301, 1344, 619000, USBSWITCH_UART_BOOT_ON),
+	CUST_RID_ADCID(1345, 1348, 1000000,
 			USBSWITCH_AUDIODEV_TYPE1),
 	CUST_RID_ADCID_END
 };
@@ -53,7 +58,41 @@ static struct button_param_list btn_param_list[] = {
 	BTN_PARAM_END,
 };
 
+/*
+ * GPIO enable - enable the gpio configuration
+ * gpio pins are needed to configure to access through ULPI Bus
+ */
+static int musb_gpio_enable(void)
+{
+	struct ux500_pins *pins;
+	pins = ux500_pins_get("ab-iddet.0");
+	if (pins)
+		ux500_pins_enable(pins);
+	else
+		printk("could not get gpio pins for musb(ab-iddet.0)\n");
+	return 0;
+}
+
+/*
+ * GPIO Disnable - Disable the gpio configuration
+ * gpio pins are needed to configure to access through ULPI Bus
+ */
+static int musb_gpio_disable(void)
+{
+	struct ux500_pins *pins;
+
+	pins = ux500_pins_get("ab-iddet.0");
+	if (pins)
+		ux500_pins_disable(pins);
+	else
+		printk("could not get gpio info for musb(ab-iddet.0)\n");
+
+	return 0;
+}
+
 struct ab8505_iddet_platdata iddet_adc_val_list = {
 	.adc_id_list = cust_rid_adcid_1_8V_200k,
 	.btn_list = btn_param_list,
+	.gpio_enable = musb_gpio_enable,
+	.gpio_disable = musb_gpio_disable,
 };

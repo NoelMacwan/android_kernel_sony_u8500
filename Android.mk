@@ -13,8 +13,9 @@ PRIVATE_OUT := $(abspath $(PRODUCT_OUT)/system)
 PATH := $(PATH):$(BOOT_PATH)/u-boot/tools:$(abspath $(UBOOT_OUTPUT)/tools)
 export PATH
 
-# For compat-wireless gits to compile with kernel
-export STERICSSON_WLAN_BUILT_IN=y
+# Disable WLAN for now
+WLAN_ENABLE_OPEN_MAC_SOLUTION:=true
+
 
 # only do this if we are buidling out of tree
 ifneq ($(KERNEL_OUTPUT),)
@@ -24,33 +25,19 @@ endif
 else
 KERNEL_OUTPUT := $(call my-dir)
 endif
-KERNEL_SOURCE_PATH := $(call my-dir)
 
-include $(CLEAR_VARS)
+build-kernel: $(PRODUCT_OUT)/uImage
 
-KERNEL_LIBPATH := $(KERNEL_OUTPUT)
-LOCAL_PATH := $(KERNEL_LIBPATH)
-LOCAL_SRC_FILES := vmlinux
-LOCAL_MODULE := $(LOCAL_SRC_FILES)
-LOCAL_MODULE_TAGS := optional
-LOCAL_MODULE_CLASS := EXECUTABLES
-LOCAL_MODULE_PATH := $(PRODUCT_OUT)
-
-$(KERNEL_LIBPATH)/$(LOCAL_SRC_FILES): build-kernel
-
-include $(BUILD_PREBUILT)
-
+# Include kernel in the Android build system
 include $(CLEAR_VARS)
 
 KERNEL_LIBPATH := $(KERNEL_OUTPUT)/arch/arm/boot
 LOCAL_PATH := $(KERNEL_LIBPATH)
-LOCAL_SRC_FILES := zImage
+LOCAL_SRC_FILES := uImage
 LOCAL_MODULE := $(LOCAL_SRC_FILES)
 LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE_CLASS := EXECUTABLES
 LOCAL_MODULE_PATH := $(PRODUCT_OUT)
-
-$(KERNEL_LIBPATH)/$(LOCAL_SRC_FILES): build-kernel
 
 include $(BUILD_PREBUILT)
 
@@ -60,7 +47,11 @@ include $(BUILD_PREBUILT)
 # If KERNEL_DEFCONFIG is set to 'local', configuration is skipped.
 # This is useful if you want to play with your own, custom configuration.
 
-build-kernel:
+ifeq ($(ONE_SHOT_MAKEFILE),)
+$(KERNEL_OUTPUT)/arch/arm/boot/uImage: $(UBOOT_OUTPUT)/tools/mkimage FORCE
+else
+$(KERNEL_OUTPUT)/arch/arm/boot/uImage: FORCE
+endif
 
 # only do this if we are buidling out of tree
 ifneq ($(KERNEL_OUTPUT),)
@@ -75,7 +66,7 @@ else
 	$(MAKE) $(PRIVATE_KERNEL_ARGS) $(KERNEL_DEFCONFIG)
 endif
 
-	$(MAKE) $(PRIVATE_KERNEL_ARGS) zImage
+	$(MAKE) $(PRIVATE_KERNEL_ARGS) uImage
 ifeq ($(KERNEL_NO_MODULES),)
 	$(MAKE) $(PRIVATE_KERNEL_ARGS) modules
 	$(MAKE) $(PRIVATE_KERNEL_ARGS) INSTALL_MOD_PATH:=$(PRIVATE_OUT) modules_install
@@ -107,68 +98,5 @@ clean clobber : clean-kernel
 clean-kernel:
 	$(MAKE) $(PRIVATE_KERNEL_ARGS) clean
 
-# SEMC: make kernelconfig target
-KERNEL_OUT_CONFIG := $(KERNEL_OUTPUT)/.config
-KERNEL_SOURCE_CONFIG := $(KERNEL_SOURCE_PATH)/arch/arm/configs/$(KERNEL_DEFCONFIG)
-
-# Select choosen defconfig
-install_defconfig_always:
-$(KERNEL_OUT_CONFIG): install_defconfig_always
-	@mkdir -p $(KERNEL_OUTPUT)
-	$(hide) $(MAKE) -C $(KERNEL_SOURCE_PATH) O=$(KERNEL_OUTPUT)\
-            ARCH=arm CROSS_COMPILE=arm-eabi- $(KERNEL_DEFCONFIG)
-
-# Install selected defconfig, run menuconfig and then copy back
-.PHONY: kernelconfig
-kernelconfig: $(KERNEL_OUT_CONFIG)
-	$(hide) $(MAKE) -C $(KERNEL_SOURCE_PATH) O=$(KERNEL_OUTPUT) \
-	             ARCH=arm CROSS_COMPILE=arm-eabi- menuconfig
-	$(hide) $(MAKE) -C $(KERNEL_SOURCE_PATH) O=$(KERNEL_OUTPUT) \
-	             ARCH=arm KCONFIG_NOTIMESTAMP=true savedefconfig
-	$(hide) mv $(KERNEL_OUTPUT)/defconfig $(KERNEL_SOURCE_CONFIG)
-
-
-#Sparse changed files
-.PHONY: kernel-sparse-changed
-kernel-sparse-changed: $(KERNEL_OUT_CONFIG)
-	$(hide) $(MAKE) -C $(KERNEL_SOURCE_PATH) O=$(KERNEL_OUTPUT) \
-	             ARCH=arm CROSS_COMPILE=arm-eabi- C=1
-
-#Sparse all files
-.PHONY: kernel-sparse-all
-kernel-sparse-all: $(KERNEL_OUT_CONFIG)
-	$(hide) $(MAKE) -C $(KERNEL_SOURCE_PATH) O=$(KERNEL_OUTPUT) \
-	             ARCH=arm CROSS_COMPILE=arm-eabi- C=2
-
-#
-# Rules for packing kernel into elf and sin
-#
-TARGET_PREBUILT_KERNEL := $(KERNEL_OUTPUT)/arch/arm/boot/zImage
-
-$(PRODUCT_OUT)/cmdline.txt: device/semc/riogrande/BoardConfig.mk
-	$(hide) echo -n '$(BOARD_KERNEL_CMDLINE)' > $@
-
-$(PRODUCT_OUT)/kernel-unsigned.elf: $(TARGET_PREBUILT_KERNEL) $(PRODUCT_OUT)/ramdisk.img $(PRODUCT_OUT)/cmdline.txt | sin-tools
-	$(hide) $(HOST_OUT_EXECUTABLES)/mkelf.py -o $@ \
-		$(TARGET_PREBUILT_KERNEL)@$(BOARD_KERNEL_ADDR) \
-		$(PRODUCT_OUT)/ramdisk.img@$(BOARD_RAMDISK_ADDR),ramdisk \
-		$(PRODUCT_OUT)/cmdline.txt@cmdline
-
-$(PRODUCT_OUT)/kernel-signed.elf: $(PRODUCT_OUT)/kernel-unsigned.elf $(PRODUCT_PARTITION_CONFIG) | sin-tools
-	$(hide) $(HOST_OUT_EXECUTABLES)/semcsc.py -c $(PRODUCT_PARTITION_CONFIG) -p Kernel -t internal -i $< -o $@
-
-$(PRODUCT_OUT)/kernel.si_: $(PRODUCT_OUT)/kernel-signed.elf $(PRODUCT_PARTITION_CONFIG) | sin-tools
-	$(hide) $(HOST_OUT_EXECUTABLES)/mksin.py -c $(PRODUCT_PARTITION_CONFIG) -p Kernel -i $< -o $@
-
-$(PRODUCT_OUT)/kernel.sin: $(PRODUCT_OUT)/kernel.si_ $(PRODUCT_PARTITION_CONFIG) | sin-tools
-	@echo target SIN: $(notdir $@)
-	$(hide) $(HOST_OUT_EXECUTABLES)/semcsc.py -c $(PRODUCT_PARTITION_CONFIG) -p Kernel -t external -i $< -o $@
-
-#
-# Add kernel to system wide PHONY target sin
-#
-.PHONY: sin
-
-sin: $(PRODUCT_OUT)/kernel.sin
 
 endif

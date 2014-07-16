@@ -447,7 +447,14 @@ PUBLIC void OSAL_EnableServiceMessages(void);
  * \ingroup CM_ENGINE_OSAL_API
  */
 PUBLIC void OSAL_GeneratePanic(t_nmf_core_id coreId, t_uint32 reason);
-
+/*!
+ * \brief Enable HTIMEN-SIA/SVA Timer enable
+ *
+ * It enables the : Imaging/Audio/Video Accelerator Timers enable signal
+ *
+ * \ingroup CM_ENGINE_OSAL_API
+ */
+PUBLIC t_cm_error OSAL_EnableSxA_HTIMEN(void);
 extern /*const*/ t_nmf_osal_sync_handle lockHandleApi;
 extern /*const*/ t_nmf_osal_sync_handle lockHandleCom;
 extern /*const*/ t_nmf_osal_sem_handle semHandle;

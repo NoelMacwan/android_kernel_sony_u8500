@@ -273,10 +273,27 @@ static int get_next_job_id(void)
 }
 
 /**
+ * Check for macroblock formats
+ */
+static bool is_mb_fmt(enum b2r2_blt_fmt fmt)
+{
+	switch (fmt) {
+	case B2R2_BLT_FMT_YUV420_PACKED_SEMIPLANAR_MB_STE:
+	case B2R2_BLT_FMT_YUV422_PACKED_SEMIPLANAR_MB_STE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/**
  * Limit the number of cores used in some "easy" and impossible cases
  */
-static int limit_blits(int n_split, struct b2r2_blt_req *user_req)
+static int limit_blits(int n_split,
+	struct b2r2_blt_req *user_req, bool *hw_limit)
 {
+	*hw_limit = false;
+
 	if (n_split <= 1)
 		return n_split;
 
@@ -286,6 +303,17 @@ static int limit_blits(int n_split, struct b2r2_blt_req *user_req)
 	if (user_req->src_rect.width < n_split &&
 			user_req->src_rect.height < n_split)
 		return 1;
+
+	/*
+	 * Handle macroblock formats with one
+	 * core for now since there seems to be some bug
+	 * related to macroblock access patterns
+	 */
+	if (is_mb_fmt(user_req->src_img.fmt)) {
+		if (n_split > 1)
+			*hw_limit = true;
+		return 1;
+	}
 
 	return n_split;
 }
@@ -315,19 +343,6 @@ static bool is_scaling_fmt(enum b2r2_blt_fmt fmt)
 	}
 }
 
-/**
- * Check for macroblock formats
- */
-static bool is_mb_fmt(enum b2r2_blt_fmt fmt)
-{
-	switch (fmt) {
-	case B2R2_BLT_FMT_YUV420_PACKED_SEMIPLANAR_MB_STE:
-	case B2R2_BLT_FMT_YUV422_PACKED_SEMIPLANAR_MB_STE:
-		return true;
-	default:
-		return false;
-	}
-}
 
 /**
  * Split a request rectangle on available cores
@@ -368,13 +383,7 @@ static int b2r2_blt_split_request(struct b2r2_blt_data *blt_data,
 		return -ENOSYS;
 	} else if (*n_split == 1 ||
 			(srw < *n_split && srh < *n_split) ||
-			(drw < *n_split && drh < *n_split) ||
-			is_mb_fmt(user_req->src_img.fmt)) {
-		/*
-		 * Handle macroblock formats with one
-		 * core for now since there seems to be some bug
-		 * related to macroblock access patterns
-		 */
+			(drw < *n_split && drh < *n_split)) {
 		memcpy(&split_requests[0]->user_req,
 				user_req,
 				sizeof(*user_req));
@@ -765,6 +774,7 @@ static int b2r2_blt_blit_internal(int handle,
 		struct b2r2_blt_req *user_req,
 		bool us_req)
 {
+	bool hw_limit = false;
 	int request_id;
 	int i;
 	int n_instance = 0;
@@ -825,7 +835,7 @@ static int b2r2_blt_blit_internal(int handle,
 	}
 
 	/* Don't split small requests */
-	n_blit = limit_blits(n_instance, &ureq);
+	n_blit = limit_blits(n_instance, &ureq, &hw_limit);
 
 	/* The id needs to be universal on all cores */
 	request_id = get_next_job_id();
@@ -862,6 +872,10 @@ static int b2r2_blt_blit_internal(int handle,
 				__func__);
 		goto exit;
 	}
+
+	b2r2_core_update_opp_req(ureq.src_img.fmt,
+		ureq.bg_img.fmt, ureq.dst_img.fmt,
+		ureq.transform, hw_limit);
 
 #ifdef CONFIG_B2R2_GENERIC_ONLY
 	if (ureq.flags & B2R2_BLT_FLAG_BG_BLEND) {

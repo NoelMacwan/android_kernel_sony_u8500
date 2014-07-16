@@ -134,6 +134,7 @@ static inline int mcde_display_try_video_mode_default(
 	struct mcde_display_device *ddev,
 	struct mcde_video_mode *video_mode)
 {
+	u16 native_xres, native_yres;
 	/*
 	 * DSI video mode:
 	 * This function is intended for configuring supported video mode(s).
@@ -156,6 +157,17 @@ static inline int mcde_display_try_video_mode_default(
 	 *                    framerate * bpp / num_data_lanes * 1.1
 	 * (1.1 is a 10% margin needed for burst mode calculations)
 	 */
+
+	/*
+	 * The video_mode->xres and ->yres must be the same as
+	 * returned by mcde_display_get_native_resolution_default() for
+	 * fixed resolution displays.
+	 */
+	mcde_display_get_native_resolution_default(ddev, &native_xres,
+			&native_yres);
+	if (video_mode->xres != native_xres || video_mode->yres != native_yres)
+		return -EINVAL;
+
 	return 0;
 }
 
@@ -164,16 +176,27 @@ static int mcde_display_set_video_mode_default(struct mcde_display_device *ddev,
 {
 	int ret;
 	struct mcde_video_mode channel_video_mode;
+	u16 native_xres, native_yres;
 
 	if (!video_mode)
+		return -EINVAL;
+
+	/*
+	 * The video_mode->xres and ->yres must be the same as
+	 * returned by mcde_display_get_native_resolution_default() for
+	 * fixed resolution displays.
+	 */
+	mcde_display_get_native_resolution_default(ddev, &native_xres,
+			&native_yres);
+	if (video_mode->xres != native_xres || video_mode->yres != native_yres)
 		return -EINVAL;
 
 	ddev->video_mode = *video_mode;
 	channel_video_mode = ddev->video_mode;
 	/*
 	 * If orientation is 90 or 270 then rotate the x and y resolution
-	 * Channel video mode resolution is always the native display
-	 * resolution
+	 * Channel video mode resolution is always the true resolution of the
+	 * display
 	 */
 	if (ddev->orientation == MCDE_DISPLAY_ROT_90_CCW ||
 				ddev->orientation == MCDE_DISPLAY_ROT_90_CW) {
@@ -224,43 +247,49 @@ static inline enum mcde_ovly_pix_fmt mcde_display_get_pixel_format_default(
 	return ddev->pixel_format;
 }
 
+
 static int mcde_display_set_rotation_default(struct mcde_display_device *ddev,
 	enum mcde_display_rotation rotation)
 {
 	int ret;
-	u8 param = 0;
+	bool horizontal_display_flip = false;
 	enum mcde_display_rotation final;
-	struct mcde_port *port = ddev->port;
-	bool use_default;
+	enum mcde_hw_rotation final_hw_rot;
 
 	final = (360 + rotation - ddev->orientation) % 360;
-	ret = mcde_chnl_set_rotation(ddev->chnl_state, final);
+
+	switch (final) {
+	case MCDE_DISPLAY_ROT_180:
+		/* 180 rotation is only possible on DSI devices that supports
+		 * DCS.
+		 * The 180 rotation is performed by horizontal flip in the
+		 * DSI device and by vertical mirroring in MCDE.
+		 * Can only check for DSI */
+		if (ddev->port->type != MCDE_PORTTYPE_DSI)
+			return -EINVAL;
+		final_hw_rot = MCDE_HW_ROT_VERT_MIRROR;
+		horizontal_display_flip = true;
+		break;
+	case MCDE_DISPLAY_ROT_0:
+		final_hw_rot = MCDE_HW_ROT_0;
+		break;
+	case MCDE_DISPLAY_ROT_90_CW:
+		final_hw_rot = MCDE_HW_ROT_90_CW;
+		break;
+	case MCDE_DISPLAY_ROT_90_CCW:
+		final_hw_rot = MCDE_HW_ROT_90_CCW;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	ret = mcde_chnl_set_rotation(ddev->chnl_state, final_hw_rot);
 	if (WARN_ON(ret))
 		return ret;
 
-	if (port->dcs_addr_mode.normal || port->dcs_addr_mode.hor_flip)
-		use_default = false; /* Use values set in disp driver */
-	else
-		use_default = true; /* Not set in disp driver; use default */
-
-	if (final == MCDE_DISPLAY_ROT_180_CW) {
-		if (use_default)
-			param = DSI_DCS_ADDR_MODE_HOR_FLIP_DEFAULT;
-		else
-			param = port->dcs_addr_mode.hor_flip;
-	} else {
-		if (use_default)
-			param = DSI_DCS_ADDR_MODE_NORMAL_DEFAULT;
-		else
-			param = port->dcs_addr_mode.normal;
-	}
-
-	/* Set normal or horizontal flip */
-	(void)mcde_dsi_dcs_write(ddev->chnl_state, DCS_CMD_SET_ADDRESS_MODE,
-								&param, 1);
-
 	ddev->rotation = rotation;
 	ddev->update_flags |= UPDATE_FLAG_ROTATION;
+	ddev->horizontal_display_flip = horizontal_display_flip;
 
 	return 0;
 }
@@ -284,8 +313,8 @@ static int mcde_display_apply_config_default(struct mcde_display_device *ddev)
 	if (!ddev->update_flags)
 		return 0;
 
-	if (ddev->update_flags &
-			(UPDATE_FLAG_VIDEO_MODE | UPDATE_FLAG_ROTATION))
+	if (ddev->update_flags & (UPDATE_FLAG_VIDEO_MODE |
+			UPDATE_FLAG_ROTATION))
 		mcde_chnl_stop_flow(ddev->chnl_state);
 
 	ret = mcde_chnl_apply(ddev->chnl_state);
@@ -294,18 +323,37 @@ static int mcde_display_apply_config_default(struct mcde_display_device *ddev)
 							__func__);
 		return ret;
 	}
+
+	if (ddev->update_flags & UPDATE_FLAG_ROTATION) {
+		u8 adress_mode = 0x00; /* 0x00 - No horizontal flip */
+
+		if (ddev->horizontal_display_flip)
+#if defined(CONFIG_MCDE_DISPLAY_BAMBOOK)
+			adress_mode = 0x02;
+#else
+			adress_mode = 0x40; /* 0x40 - Horizontal flip */
+#endif
+
+		ret = mcde_dsi_dcs_write(ddev->chnl_state,
+				DCS_CMD_SET_ADDRESS_MODE, &adress_mode, 1);
+		if (ret < 0) {
+			dev_warn(&ddev->dev, "%s:Failed to flip display\n",
+								__func__);
+			return ret;
+		}
+	}
+
 	ddev->update_flags = 0;
 	ddev->first_update = true;
 
 	return 0;
 }
 
-static int mcde_display_update_default(struct mcde_display_device *ddev,
-							bool tripple_buffer)
+static int mcde_display_update_default(struct mcde_display_device *ddev)
 {
 	int ret = 0;
 
-	ret = mcde_chnl_update(ddev->chnl_state, tripple_buffer);
+	ret = mcde_chnl_update(ddev->chnl_state);
 
 	if (ret < 0) {
 		dev_warn(&ddev->dev, "%s:Failed to update channel\n", __func__);

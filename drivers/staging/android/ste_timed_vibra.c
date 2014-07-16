@@ -24,15 +24,12 @@
  * @linear_tick:	Linear Vibrator high resolution timer
  * @vibra_workqueue:    Pointer to vibrator workqueue structure
  * @vibra_work:		Vibrator work
- * @vibra_workqueue:    Pointer to enable workqueue structure
- * @vibra_work:		Enable work
  * @vibra_timer:	Vibrator high resolution timer
  * @vibra_lock:		Vibrator lock
- * @timer_cancelled:	Cancels run of timer code
  * @vibra_state:	Actual vibrator state
+ * @state_force:	Indicates if oppositive state is requested
  * @timeout:		Indicates how long time the vibrator will be enabled
- * @queued_timeout:	Queued timeout
- * @next_timeout:	Next timeout to be applied
+ * @time_passed:	Total time passed in states
  * @pdata:		Local pointer to platform data with vibrator parameters
  *
  * Structure vibra_info holds vibrator information
@@ -44,16 +41,15 @@ struct vibra_info {
 	struct hrtimer				linear_tick;
 	struct workqueue_struct			*vibra_workqueue;
 	struct work_struct			vibra_work;
-	struct workqueue_struct			*enable_workqueue;
-	struct work_struct			enable_work;
 	struct hrtimer				vibra_timer;
 	spinlock_t				vibra_lock;
-	atomic_t				timer_cancelled;
 	enum ste_timed_vibra_states		vibra_state;
+	bool					state_force;
 	unsigned int				timeout;
-	int					queued_timeout;
-	int					next_timeout;
+	unsigned int				time_passed;
 	struct ste_timed_vibra_platform_data	*pdata;
+	bool                                    is_vibrating;
+	unsigned int                            vibra_tick_counts;
 };
 
 /*
@@ -78,214 +74,98 @@ static void linear_vibra_work(struct work_struct *work)
 	unsigned char speed_pos = 0, speed_neg = 0;
 	ktime_t ktime;
 	static unsigned char toggle;
-	unsigned long flags;
 
 	if (toggle) {
 		speed_pos = vinfo->pdata->boost_level;
-		speed_neg = 0;
+		speed_neg = 100 - speed_pos;
 	} else {
 		speed_neg = vinfo->pdata->boost_level;
-		speed_pos = 0;
+		speed_pos = 100 - speed_neg;
 	}
 
 	toggle = !toggle;
 	vinfo->pdata->timed_vibra_control(speed_pos, speed_neg,
 			speed_pos, speed_neg);
 
-	spin_lock_irqsave(&vinfo->vibra_lock, flags);
 	if ((vinfo->vibra_state != STE_VIBRA_IDLE) &&
-		(vinfo->vibra_state != STE_VIBRA_OFF)) {
-		spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
+		(vinfo->vibra_state != STE_VIBRA_OFF) &&
+		(vinfo->vibra_tick_counts != 0)) {
+		vinfo->vibra_tick_counts--;
 		ktime = ktime_set((LINEAR_RESONANCE / USEC_PER_SEC),
 			(LINEAR_RESONANCE % USEC_PER_SEC) * NSEC_PER_USEC);
 		hrtimer_start(&vinfo->linear_tick, ktime, HRTIMER_MODE_REL);
-	} else {
-		spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
 	}
 }
 
-static void vibra_cancel_timer_and_flush(struct vibra_info *vinfo)
-{
-	atomic_set(&vinfo->timer_cancelled, 1);
-
-	hrtimer_cancel(&vinfo->vibra_timer);
-	flush_workqueue(vinfo->vibra_workqueue);
-	hrtimer_cancel(&vinfo->vibra_timer);
-
-	atomic_set(&vinfo->timer_cancelled, 0);
-}
-
 /**
- * vibra_control - Vibrator control, turns on/off vibrator
- * @vinfo:	Pointer to vibra_info structure
+ * vibra_control_work() - Vibrator work, turns on/off vibrator
+ * @work:	Pointer to work structure
  *
- * This function is called from work callbacks, turns on/off vibrator
+ * This function is called from workqueue, turns on/off vibrator
  **/
-static void vibra_control(struct vibra_info *vinfo)
+static void vibra_control_work(struct work_struct *work)
 {
+	struct vibra_info *vinfo =
+			container_of(work, struct vibra_info, vibra_work);
 	unsigned val = 0;
 	unsigned char speed_pos = 0, speed_neg = 0;
 	unsigned long flags;
 
+	/*
+	 * Cancel scheduled timer if it has not started
+	 * else it will wait for timer callback to complete.
+	 * It should be done before taking vibra_lock to
+	 * prevent race condition, as timer callback also
+	 * takes same lock.
+	 */
+	hrtimer_cancel(&vinfo->vibra_timer);
+
 	spin_lock_irqsave(&vinfo->vibra_lock, flags);
+
 	switch (vinfo->vibra_state) {
 	case STE_VIBRA_BOOST:
-		val = vinfo->pdata->boost_time;
 		/* Turn on both vibrators with boost speed */
-		if (vinfo->pdata->reverse_polarity)
-			speed_neg = vinfo->pdata->boost_level;
-		else
-			speed_pos = vinfo->pdata->boost_level;
-
+		speed_pos = vinfo->pdata->boost_level;
+		val = vinfo->pdata->boost_time;
 		break;
 	case STE_VIBRA_ON:
-		val = vinfo->timeout - vinfo->pdata->boost_time;
 		/* Turn on both vibrators with speed */
-		if (vinfo->pdata->reverse_polarity)
-			speed_neg = vinfo->pdata->on_level;
-		else
-			speed_pos = vinfo->pdata->on_level;
-
+		speed_pos = vinfo->pdata->on_level;
+		val = vinfo->timeout - vinfo->pdata->boost_time;
 		break;
 	case STE_VIBRA_OFF:
-		val = vinfo->pdata->off_time;
 		/* Turn on both vibrators with reversed speed */
-		if (vinfo->pdata->reverse_polarity)
-			speed_pos = vinfo->pdata->off_level;
-		else
-			speed_neg = vinfo->pdata->off_level;
-
+		speed_neg = vinfo->pdata->off_level;
+		val = vinfo->pdata->off_time;
+		break;
+	case STE_VIBRA_IDLE:
+		vinfo->time_passed = 0;
 		break;
 	default:
 		break;
 	}
-
-	if (vinfo->pdata->is_linear_vibra
-		&& vinfo->vibra_state == STE_VIBRA_IDLE) {
-		spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
-		/* Cancel work and timers of linear vibrator in IDLE state */
-		hrtimer_cancel(&vinfo->linear_tick);
-		flush_workqueue(vinfo->linear_workqueue);
-		hrtimer_cancel(&vinfo->linear_tick);
-		vinfo->pdata->timed_vibra_control(0, 0, 0, 0);
-	} else {
-		spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
-	}
+	spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
 
 	/* Send new settings (only for rotary vibrators) */
 	if (!vinfo->pdata->is_linear_vibra)
 		vinfo->pdata->timed_vibra_control(speed_pos, speed_neg,
 				speed_pos, speed_neg);
 
-	spin_lock_irqsave(&vinfo->vibra_lock, flags);
 	if (vinfo->vibra_state != STE_VIBRA_IDLE) {
 		/* Start timer if it's not in IDLE state */
 		ktime_t ktime;
 		ktime = ktime_set((val / MSEC_PER_SEC),
 				(val % MSEC_PER_SEC) * NSEC_PER_MSEC),
 		hrtimer_start(&vinfo->vibra_timer, ktime, HRTIMER_MODE_REL);
+	} else if (vinfo->pdata->is_linear_vibra) {
+		/* Cancel work and timers of linear vibrator in IDLE state */
+		hrtimer_cancel(&vinfo->linear_tick);
+		flush_workqueue(vinfo->linear_workqueue);
+		vinfo->pdata->timed_vibra_control(0, 0, 0, 0);
+		vinfo->vibra_tick_counts = 0;
+		vinfo->is_vibrating = false;
+
 	}
-	vinfo->next_timeout = -1;
-	spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
-}
-
-/**
- * vibra_control_work() - Vibrator work, calls vibra_control
- * @work:	Pointer to work structure
- *
- * This function is called from workqueue, calls vibra_control
- **/
-static void vibra_control_work(struct work_struct *work)
-{
-	struct vibra_info *vinfo =
-			container_of(work, struct vibra_info, vibra_work);
-	vibra_control(vinfo);
-}
-
-/**
- * vibra_enable_work() - Executes an enable command
- * @work:	Pointer to work structure
- *
- * This executes an enable command
- **/
-static void vibra_enable_work(struct work_struct *work)
-{
-	struct vibra_info *vinfo =
-			container_of(work, struct vibra_info, enable_work);
-	unsigned long flags;
-	ktime_t ktime;
-
-	vibra_cancel_timer_and_flush(vinfo);
-
-	spin_lock_irqsave(&vinfo->vibra_lock, flags);
-	if (vinfo->queued_timeout == -1) {
-		dev_err(vinfo->tdev.dev,
-			"Nothing queued when doing enable work\n");
-		vinfo->next_timeout = 0;
-	} else {
-		vinfo->next_timeout = vinfo->queued_timeout;
-		vinfo->queued_timeout = -1;
-	}
-
-	switch (vinfo->vibra_state) {
-	case STE_VIBRA_IDLE:
-		if (vinfo->next_timeout)
-			vinfo->vibra_state = STE_VIBRA_BOOST;
-		else    /* Already disabled */
-			break;
-
-		/* Trim timeout */
-		vinfo->timeout = vinfo->next_timeout <
-				vinfo->pdata->boost_time ?
-				vinfo->pdata->boost_time :
-				vinfo->next_timeout;
-
-		if (vinfo->pdata->is_linear_vibra) {
-			queue_work(vinfo->linear_workqueue,
-					&vinfo->linear_work);
-		}
-		spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
-		vibra_control(vinfo);
-		return;
-	case STE_VIBRA_BOOST:
-		vinfo->timeout = vinfo->next_timeout <
-			vinfo->pdata->boost_time ?
-			vinfo->pdata->boost_time :
-			vinfo->next_timeout;
-		hrtimer_restart(&vinfo->vibra_timer);
-		vinfo->next_timeout = -1;
-		break;
-	case STE_VIBRA_ON:
-		if (!vinfo->next_timeout) {
-			vinfo->vibra_state = STE_VIBRA_OFF;
-			spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
-			vibra_control(vinfo);
-			return;
-		} else {
-			ktime = ktime_set((vinfo->next_timeout / MSEC_PER_SEC),
-				(vinfo->next_timeout % MSEC_PER_SEC)
-				* NSEC_PER_MSEC);
-			hrtimer_start(&vinfo->vibra_timer, ktime,
-						HRTIMER_MODE_REL);
-			vinfo->next_timeout = -1;
-		}
-		break;
-	case STE_VIBRA_OFF:
-		if (vinfo->next_timeout) {
-			vinfo->vibra_state = STE_VIBRA_ON;
-			vinfo->timeout = vinfo->next_timeout +
-				vinfo->pdata->boost_time;
-			spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
-			vibra_control(vinfo);
-			return;
-		} else {
-			hrtimer_restart(&vinfo->vibra_timer);
-		}
-		break;
-	default:
-		break;
-	}
-	spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
 }
 
 /**
@@ -300,14 +180,62 @@ static void vibra_enable(struct timed_output_dev *tdev, int timeout)
 	struct vibra_info *vinfo = dev_get_drvdata(tdev->dev);
 	unsigned long flags;
 
-	if (timeout < 0)
-		return;
-
 	spin_lock_irqsave(&vinfo->vibra_lock, flags);
-	if (vinfo->queued_timeout == -1)
-		queue_work(vinfo->enable_workqueue, &vinfo->enable_work);
 
-	vinfo->queued_timeout = timeout;
+	if (!vinfo->is_vibrating) {
+		if (timeout) {
+			vinfo->is_vibrating = true;
+			vinfo->vibra_tick_counts =
+				(timeout * USEC_PER_MSEC / LINEAR_RESONANCE);
+		}
+	}
+
+	switch (vinfo->vibra_state) {
+	case STE_VIBRA_IDLE:
+		if (timeout)
+			vinfo->vibra_state = STE_VIBRA_BOOST;
+		else    /* Already disabled */
+			break;
+
+		vinfo->state_force = false;
+		/* Trim timeout */
+		vinfo->timeout = timeout < vinfo->pdata->boost_time ?
+				vinfo->pdata->boost_time : timeout;
+
+		if (vinfo->pdata->is_linear_vibra)
+			queue_work(vinfo->linear_workqueue,
+					&vinfo->linear_work);
+		queue_work(vinfo->vibra_workqueue, &vinfo->vibra_work);
+		break;
+	case STE_VIBRA_BOOST:
+		/* Force only when user requested OFF while BOOST */
+		if (!timeout)
+			vinfo->state_force = true;
+		break;
+	case STE_VIBRA_ON:
+		/* If user requested OFF */
+		if (!timeout) {
+			if (vinfo->pdata->is_linear_vibra)
+				hrtimer_cancel(&vinfo->linear_tick);
+			/* Cancel timer if it has not expired yet.
+			 * Else setting the vibra_state to STE_VIBRA_OFF
+			 * will make take care that vibrator will move to
+			 * STE_VIBRA_IDLE in timer callback just after
+			 * this function call.
+			 */
+			hrtimer_try_to_cancel(&vinfo->vibra_timer);
+			vinfo->vibra_state = STE_VIBRA_OFF;
+			queue_work(vinfo->vibra_workqueue, &vinfo->vibra_work);
+		}
+		break;
+	case STE_VIBRA_OFF:
+		/* Force only when user requested ON while OFF */
+		if (timeout)
+			vinfo->state_force = true;
+		break;
+	default:
+		break;
+	}
 	spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
 }
 
@@ -325,15 +253,10 @@ static enum hrtimer_restart linear_vibra_tick(struct hrtimer *hrtimer)
 {
 	struct vibra_info *vinfo =
 			container_of(hrtimer, struct vibra_info, linear_tick);
-	unsigned long flags;
 
-	spin_lock_irqsave(&vinfo->vibra_lock, flags);
 	if ((vinfo->vibra_state != STE_VIBRA_IDLE) &&
 		(vinfo->vibra_state != STE_VIBRA_OFF)) {
-		spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
 		queue_work(vinfo->linear_workqueue, &vinfo->linear_work);
-	} else {
-		spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
 	}
 
 	return HRTIMER_NORESTART;
@@ -354,28 +277,36 @@ static enum hrtimer_restart vibra_timer_expired(struct hrtimer *hrtimer)
 			container_of(hrtimer, struct vibra_info, vibra_timer);
 	unsigned long flags;
 
-	if (atomic_read(&vinfo->timer_cancelled))
-		return HRTIMER_NORESTART;
-
 	spin_lock_irqsave(&vinfo->vibra_lock, flags);
 	switch (vinfo->vibra_state) {
 	case STE_VIBRA_BOOST:
-		vinfo->vibra_state = STE_VIBRA_ON;
-		vinfo->next_timeout = vinfo->timeout - vinfo->pdata->boost_time;
+		/* If BOOST finished and force, go to OFF */
+		if (vinfo->state_force)
+			vinfo->vibra_state = STE_VIBRA_OFF;
+		else
+			vinfo->vibra_state = STE_VIBRA_ON;
+		vinfo->time_passed = vinfo->pdata->boost_time;
 		break;
 	case STE_VIBRA_ON:
 		vinfo->vibra_state = STE_VIBRA_OFF;
-		vinfo->next_timeout = 0;
+		vinfo->time_passed = vinfo->timeout;
 		break;
 	case STE_VIBRA_OFF:
-		vinfo->vibra_state = STE_VIBRA_IDLE;
+		/* If OFF finished and force, go to ON */
+		if (vinfo->state_force)
+			vinfo->vibra_state = STE_VIBRA_ON;
+		else
+			vinfo->vibra_state = STE_VIBRA_IDLE;
+		vinfo->time_passed += vinfo->pdata->off_time;
 		break;
 	case STE_VIBRA_IDLE:
 		break;
 	default:
 		break;
 	}
+	vinfo->state_force = false;
 	spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
+
 	queue_work(vinfo->vibra_workqueue, &vinfo->vibra_work);
 
 	return HRTIMER_NORESTART;
@@ -393,37 +324,14 @@ static enum hrtimer_restart vibra_timer_expired(struct hrtimer *hrtimer)
 static int vibra_get_time(struct timed_output_dev *tdev)
 {
 	struct vibra_info *vinfo = dev_get_drvdata(tdev->dev);
-	int rc;
-	ktime_t remain;
-	unsigned long flags;
-	spin_lock_irqsave(&vinfo->vibra_lock, flags);
-	if (vinfo->queued_timeout != -1)
-		rc = vinfo->queued_timeout;
-	else if (vinfo->next_timeout != -1)
-		rc = vinfo->next_timeout;
-	else {
-		switch (vinfo->vibra_state) {
-		case STE_VIBRA_ON:
-			remain = hrtimer_get_remaining(&vinfo->vibra_timer);
-			if (ktime_to_ns(remain) > 0)
-				rc = (u32) ktime_to_ms(remain);
-			else
-				rc = 0;
-		break;
-		case STE_VIBRA_BOOST:
-			remain = hrtimer_get_remaining(&vinfo->vibra_timer);
-			rc = vinfo->timeout - vinfo->pdata->boost_time;
-			if (ktime_to_ns(remain) > 0)
-				rc += ktime_to_ms(remain);
-			break;
-		default:
-			rc = 0;
-			break;
-		}
-	}
+	u32 ms;
 
-	spin_unlock_irqrestore(&vinfo->vibra_lock, flags);
-	return rc;
+	if (hrtimer_active(&vinfo->vibra_timer)) {
+		ktime_t remain = hrtimer_get_remaining(&vinfo->vibra_timer);
+		ms = (u32) ktime_to_ms(remain);
+		return ms + vinfo->time_passed;
+	} else
+		return 0;
 }
 
 static int __devinit ste_timed_vibra_probe(struct platform_device *pdev)
@@ -445,10 +353,9 @@ static int __devinit ste_timed_vibra_probe(struct platform_device *pdev)
 	vinfo->tdev.name = "vibrator";
 	vinfo->tdev.enable = vibra_enable;
 	vinfo->tdev.get_time = vibra_get_time;
+	vinfo->time_passed = 0;
 	vinfo->vibra_state = STE_VIBRA_IDLE;
-	atomic_set(&vinfo->timer_cancelled, 0);
-	vinfo->queued_timeout = -1;
-	vinfo->next_timeout = -1;
+	vinfo->state_force = false;
 	vinfo->pdata = pdev->dev.platform_data;
 
 	if (vinfo->pdata->is_linear_vibra)
@@ -478,20 +385,11 @@ static int __devinit ste_timed_vibra_probe(struct platform_device *pdev)
 	if (!vinfo->vibra_workqueue) {
 		dev_err(&pdev->dev, "failed to allocate workqueue\n");
 		ret = -ENOMEM;
-		goto exit_destroy_linear_workqueue;
-	}
-
-	vinfo->enable_workqueue =
-		create_singlethread_workqueue("ste-timed-enable-vibra");
-	if (!vinfo->enable_workqueue) {
-		dev_err(&pdev->dev, "failed to allocate workqueue\n");
-		ret = -ENOMEM;
-		goto exit_destroy_vibra_workqueue;
+		goto exit_destroy_workqueue;
 	}
 
 	INIT_WORK(&vinfo->linear_work, linear_vibra_work);
 	INIT_WORK(&vinfo->vibra_work, vibra_control_work);
-	INIT_WORK(&vinfo->enable_work, vibra_enable_work);
 	spin_lock_init(&vinfo->vibra_lock);
 	hrtimer_init(&vinfo->linear_tick, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	hrtimer_init(&vinfo->vibra_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -501,9 +399,7 @@ static int __devinit ste_timed_vibra_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, vinfo);
 	return 0;
 
-exit_destroy_vibra_workqueue:
-	destroy_workqueue(vinfo->vibra_workqueue);
-exit_destroy_linear_workqueue:
+exit_destroy_workqueue:
 	destroy_workqueue(vinfo->linear_workqueue);
 exit_timed_output_unregister:
 	timed_output_dev_unregister(&vinfo->tdev);
@@ -519,7 +415,6 @@ static int __devexit ste_timed_vibra_remove(struct platform_device *pdev)
 	timed_output_dev_unregister(&vinfo->tdev);
 	destroy_workqueue(vinfo->linear_workqueue);
 	destroy_workqueue(vinfo->vibra_workqueue);
-	destroy_workqueue(vinfo->enable_workqueue);
 	kfree(vinfo);
 	platform_set_drvdata(pdev, NULL);
 

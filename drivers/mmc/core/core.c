@@ -5,7 +5,6 @@
  *  SD support Copyright (C) 2004 Ian Molton, All Rights Reserved.
  *  Copyright (C) 2005-2008 Pierre Ossman, All Rights Reserved.
  *  MMCv4 support Copyright (C) 2006 Philip Langdale, All Rights Reserved.
- *  Copyright (C) 2012 Sony Mobile Communications AB.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -24,6 +23,7 @@
 #include <linux/log2.h>
 #include <linux/regulator/consumer.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <linux/fault-inject.h>
 #include <linux/random.h>
 
@@ -42,13 +42,14 @@
 #include "sdio_ops.h"
 
 static struct workqueue_struct *workqueue;
+static const unsigned freqs[] = { 400000, 300000, 200000, 100000 };
 
 /*
  * Enabling software CRCs on the data blocks can be a significant (30%)
  * performance cost, and for other reasons may not always be desired.
  * So we allow it it to be disabled.
  */
-int use_spi_crc = 1;
+bool use_spi_crc = 1;
 module_param(use_spi_crc, bool, 0);
 
 /*
@@ -58,19 +59,15 @@ module_param(use_spi_crc, bool, 0);
  * overridden if necessary.
  */
 #ifdef CONFIG_MMC_UNSAFE_RESUME
-int mmc_assume_removable;
+bool mmc_assume_removable;
 #else
-int mmc_assume_removable = 1;
+bool mmc_assume_removable = 1;
 #endif
 EXPORT_SYMBOL(mmc_assume_removable);
 module_param_named(removable, mmc_assume_removable, bool, 0644);
 MODULE_PARM_DESC(
 	removable,
 	"MMC/SD cards are removable and may be removed during suspend");
-
-/* Sandisk and Samsung manufacture-ID */
-#define SANDISK_MANFID 0x45
-#define SAMSUNG_MANFID 0x15
 
 /*
  * Internal function. Schedule delayed work in the MMC work queue.
@@ -531,10 +528,14 @@ void mmc_set_data_timeout(struct mmc_data *data, const struct mmc_card *card)
 
 		if (data->flags & MMC_DATA_WRITE)
 			/*
-			 * The limit is really 250 ms, but that is
-			 * insufficient for some crappy cards.
+			 * The MMC spec "It is strongly recommended
+			 * for hosts to implement more than 500ms
+			 * timeout value even if the card indicates
+			 * the 250ms maximum busy length."  Even the
+			 * previous value of 300ms is known to be
+			 * insufficient for some cards.
 			 */
-			limit_us = 300000;
+			limit_us = 3000000;
 		else
 			limit_us = 100000;
 
@@ -1155,6 +1156,9 @@ static void mmc_power_up(struct mmc_host *host)
 {
 	int bit;
 
+	if (host->ios.power_mode == MMC_POWER_ON)
+		return;
+
 	mmc_host_clk_hold(host);
 
 	/* If ocr is set, we use it */
@@ -1196,6 +1200,9 @@ static void mmc_power_up(struct mmc_host *host)
 
 void mmc_power_off(struct mmc_host *host)
 {
+	if (host->ios.power_mode == MMC_POWER_OFF)
+		return;
+
 	mmc_host_clk_hold(host);
 
 	host->ios.clock = 0;
@@ -1391,7 +1398,10 @@ static unsigned int mmc_mmc_erase_timeout(struct mmc_card *card,
 {
 	unsigned int erase_timeout;
 
-	if (card->ext_csd.erase_group_def & 1) {
+	if (arg == MMC_DISCARD_ARG ||
+	    (arg == MMC_TRIM_ARG && card->ext_csd.rev >= 6)) {
+		erase_timeout = card->ext_csd.trim_timeout;
+	} else if (card->ext_csd.erase_group_def & 1) {
 		/* High Capacity Erase Group Size uses HC timeouts */
 		if (arg == MMC_TRIM_ARG)
 			erase_timeout = card->ext_csd.trim_timeout;
@@ -1523,30 +1533,6 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
 		cmd.opcode = SD_ERASE_WR_BLK_START;
 	else
 		cmd.opcode = MMC_ERASE_GROUP_START;
-	/* Always erase on Sandisk (manfid 69). */
-	if (card->cid.manfid != SANDISK_MANFID) {
-		/* Allow Samsung chips for secure discard and align on 8kB */
-		if ((card->cid.manfid == SAMSUNG_MANFID) &&
-		    (cmd.opcode == MMC_ERASE_GROUP_START) &&
-		    ((arg == MMC_SECURE_TRIM1_ARG) ||
-		     (arg == MMC_SECURE_TRIM2_ARG) ||
-		     (arg == MMC_SECURE_ERASE_ARG))) {
-			/*
-			 * Upper limit should be last 512B block in 8kB block
-			 * Move index up to next 512B block and possibly next
-			 * 8kB block, align it down and move back down,
-			 * possibly dropping as much as 8kB-512B
-			 */
-			to = round_down(to + 1, 16) - 1;
-			from = round_up(from, 16);
-			if (to > from) {
-				goto do_erase;
-			}
-		}
-		err = 0;
-		goto out;
-	}
-do_erase:
 	cmd.arg = from;
 	cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_R1 | MMC_CMD_AC;
 	err = mmc_wait_for_cmd(card->host, &cmd, 0);
@@ -1687,8 +1673,6 @@ int mmc_can_trim(struct mmc_card *card)
 {
 	if (card->ext_csd.sec_feature_support & EXT_CSD_SEC_GB_CL_EN)
 		return 1;
-	if (mmc_can_discard(card))
-		return 1;
 	return 0;
 }
 EXPORT_SYMBOL(mmc_can_trim);
@@ -1707,6 +1691,8 @@ EXPORT_SYMBOL(mmc_can_discard);
 
 int mmc_can_sanitize(struct mmc_card *card)
 {
+	if (!mmc_can_trim(card) && !mmc_can_erase(card))
+		return 0;
 	if (card->ext_csd.sec_feature_support & EXT_CSD_SEC_SANITIZE)
 		return 1;
 	return 0;
@@ -1821,6 +1807,20 @@ int mmc_set_blocklen(struct mmc_card *card, unsigned int blocklen)
 	return mmc_wait_for_cmd(card->host, &cmd, 5);
 }
 EXPORT_SYMBOL(mmc_set_blocklen);
+
+int mmc_set_blockcount(struct mmc_card *card, unsigned int blockcount,
+			bool is_rel_write)
+{
+	struct mmc_command cmd = {0};
+
+	cmd.opcode = MMC_SET_BLOCK_COUNT;
+	cmd.arg = blockcount & 0x0000FFFF;
+	if (is_rel_write)
+		cmd.arg |= 1 << 31;
+	cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_R1 | MMC_CMD_AC;
+	return mmc_wait_for_cmd(card->host, &cmd, 5);
+}
+EXPORT_SYMBOL(mmc_set_blockcount);
 
 static void mmc_hw_reset_for_init(struct mmc_host *host)
 {
@@ -2008,13 +2008,17 @@ EXPORT_SYMBOL(mmc_detect_card_removed);
 
 void mmc_rescan(struct work_struct *work)
 {
-	static const unsigned freqs[] = { 400000, 300000, 200000, 100000 };
 	struct mmc_host *host =
 		container_of(work, struct mmc_host, detect.work);
 	int i;
 
 	if (host->rescan_disable || mmc_host_needs_resume(host))
 		return;
+
+	/* If there is a non-removable card registered, only scan once */
+	if ((host->caps & MMC_CAP_NONREMOVABLE) && host->rescan_entered)
+		return;
+	host->rescan_entered = 1;
 
 	mmc_bus_get(host);
 
@@ -2047,11 +2051,19 @@ void mmc_rescan(struct work_struct *work)
 	 */
 	mmc_bus_put(host);
 
-	if (host->ops->get_cd && host->ops->get_cd(host) == 0)
+	if (host->ops->get_cd && host->ops->get_cd(host) == 0) {
+		mmc_claim_host(host);
+		mmc_power_off(host);
+		mmc_release_host(host);
 		goto out;
+	}
 
 	mmc_claim_host(host);
 	for (i = 0; i < ARRAY_SIZE(freqs); i++) {
+		if (host->rescan_disable) {
+			mmc_release_host(host);
+			return;
+		}
 		if (!mmc_rescan_try_freq(host, max(freqs[i], host->f_min)))
 			break;
 		if (freqs[i] <= host->f_min)
@@ -2066,7 +2078,8 @@ void mmc_rescan(struct work_struct *work)
 
 void mmc_start_host(struct mmc_host *host)
 {
-	mmc_power_off(host);
+	host->f_init = max(freqs[0], host->f_min);
+	mmc_power_up(host);
 	mmc_detect_change(host, 0);
 }
 
@@ -2241,6 +2254,7 @@ int mmc_cache_ctrl(struct mmc_host *host, u8 enable)
 			mmc_card_is_removable(host))
 		return err;
 
+	mmc_claim_host(host);
 	if (card && mmc_card_mmc(card) &&
 			(card->ext_csd.cache_size > 0)) {
 		enable = !!enable;
@@ -2249,15 +2263,16 @@ int mmc_cache_ctrl(struct mmc_host *host, u8 enable)
 			timeout = enable ? card->ext_csd.generic_cmd6_time : 0;
 			err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
 					EXT_CSD_CACHE_CTRL, enable, timeout);
-
 			if (err)
 				pr_err("%s: cache %s error %d\n",
-					mmc_hostname(card->host),
-					enable ? "on" : "off", err);
+						mmc_hostname(card->host),
+						enable ? "on" : "off",
+						err);
 			else
 				card->ext_csd.cache_ctrl = enable;
 		}
 	}
+	mmc_release_host(host);
 
 	return err;
 }
@@ -2275,65 +2290,42 @@ int mmc_suspend_host(struct mmc_host *host)
 
 	cancel_delayed_work(&host->detect);
 	cancel_delayed_work_sync(&host->resume);
+
 	mmc_flush_scheduled_work();
 
 	/* Skip suspend, if deferred resume were scheduled but not completed. */
 	if (mmc_host_needs_resume(host))
 		return 0;
 
-	if (mmc_try_claim_host(host)) {
-		err = mmc_cache_ctrl(host, 0);
-		mmc_release_host(host);
-	} else {
-		err = -EBUSY;
-	}
-
+	err = mmc_cache_ctrl(host, 0);
 	if (err)
 		goto out;
 
 	mmc_bus_get(host);
 	if (host->bus_ops && !host->bus_dead) {
 
-		/*
-		 * A long response time is not acceptable for device drivers
-		 * when doing suspend. Prevent mmc_claim_host in the suspend
-		 * sequence, to potentially wait "forever" by trying to
-		 * pre-claim the host.
-		 */
-		if (mmc_try_claim_host(host)) {
-			if (host->bus_ops->suspend) {
-				/*
-				 * For eMMC 4.5 device send notify command
-				 * before sleep, because in sleep state eMMC 4.5
-				 * devices respond to only RESET and AWAKE cmd
-				 */
-				mmc_poweroff_notify(host);
-				err = host->bus_ops->suspend(host);
-			}
-			mmc_release_host(host);
+		if (host->bus_ops->suspend)
+			err = host->bus_ops->suspend(host);
 
-			if (err == -ENOSYS || !host->bus_ops->resume) {
-				/*
-				 * We simply "remove" the card in this case.
-				 * It will be redetected on resume.  (Calling
-				 * bus_ops->remove() with a claimed host can
-				 * deadlock.)
-				 */
-				if (host->bus_ops->remove)
-					host->bus_ops->remove(host);
-				mmc_claim_host(host);
-				mmc_detach_bus(host);
-				mmc_power_off(host);
-				mmc_release_host(host);
-				host->pm_flags = 0;
-				err = 0;
-			} else if (mmc_card_mmc(host->card) ||
-				   mmc_card_sd(host->card)) {
-				host->pm_state |= MMC_HOST_DEFERRED_RESUME |
-						  MMC_HOST_NEEDS_RESUME;
-			}
-		} else {
-			err = -EBUSY;
+		if (err == -ENOSYS || !host->bus_ops->resume) {
+			/*
+			 * We simply "remove" the card in this case.
+			 * It will be redetected on resume.  (Calling
+			 * bus_ops->remove() with a claimed host can
+			 * deadlock.)
+			 */
+			if (host->bus_ops->remove)
+				host->bus_ops->remove(host);
+			mmc_claim_host(host);
+			mmc_detach_bus(host);
+			mmc_power_off(host);
+			mmc_release_host(host);
+			host->pm_flags = 0;
+			err = 0;
+		} else if (mmc_card_mmc(host->card) ||
+			   mmc_card_sd(host->card)) {
+			host->pm_state |= MMC_HOST_DEFERRED_RESUME |
+					  MMC_HOST_NEEDS_RESUME;
 		}
 	}
 	mmc_bus_put(host);

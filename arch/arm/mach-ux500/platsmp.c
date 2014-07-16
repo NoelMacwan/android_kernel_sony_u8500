@@ -16,12 +16,17 @@
 #include <linux/device.h>
 #include <linux/smp.h>
 #include <linux/io.h>
+#include <linux/mfd/dbx500-prcmu.h>
 
 #include <asm/cacheflush.h>
 #include <asm/hardware/gic.h>
+#include <asm/smp_plat.h>
 #include <asm/smp_scu.h>
+
 #include <mach/hardware.h>
 #include <mach/setup.h>
+
+#include "id.h"
 
 /* This is called from headsmp.S to wakeup the secondary core */
 extern void u8500_secondary_startup(void);
@@ -47,9 +52,7 @@ static void write_pen_release(int val)
 
 static void __iomem *scu_base_addr(void)
 {
-	if (cpu_is_u5500())
-		return __io_address(U5500_SCU_BASE);
-	else if (cpu_is_u8500() || cpu_is_u9540())
+	if (cpu_is_u8500_family() || cpu_is_ux540_family())
 		return __io_address(U8500_SCU_BASE);
 	else
 		ux500_unknown_soc();
@@ -84,11 +87,18 @@ void __cpuinit platform_secondary_init(unsigned int cpu)
 int __cpuinit boot_secondary(unsigned int cpu, struct task_struct *idle)
 {
 	unsigned long timeout;
+	int ret;
+
+	ret = prcmu_replug_cpu1();
+	/*  if CPU1 not switch on Abort sequence */
+	if (ret != 0)
+		return ret;
 
 	/*
 	 * set synchronisation state between this boot processor
 	 * and the secondary one
 	 */
+
 	spin_lock(&boot_lock);
 
 	/*
@@ -96,7 +106,7 @@ int __cpuinit boot_secondary(unsigned int cpu, struct task_struct *idle)
 	 * the holding pen - release it, then wait for it to flag
 	 * that it has been released by resetting pen_release.
 	 */
-	write_pen_release(cpu);
+	write_pen_release(cpu_logical_map(cpu));
 
 	smp_send_reschedule(cpu);
 
@@ -119,9 +129,7 @@ static void __init wakeup_secondary(void)
 {
 	void __iomem *backupram;
 
-	if (cpu_is_u5500())
-		backupram = __io_address(U5500_BACKUPRAM0_BASE);
-	else if (cpu_is_u8500() || cpu_is_u9540())
+	if (cpu_is_u8500_family() || cpu_is_ux540_family())
 		backupram = __io_address(U8500_BACKUPRAM0_BASE);
 	else
 		ux500_unknown_soc();

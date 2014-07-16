@@ -2,7 +2,6 @@
  * Copyright (C) ST-Ericsson SA 2010
  * Author: Pierre Peiffer <pierre.peiffer@stericsson.com> for ST-Ericsson.
  * License terms: GNU General Public License (GPL), version 2.
- * Copyright (c) 2012 Sony Mobile Communications AB
  */
 
 /** \file osal-kernel.c
@@ -10,6 +9,7 @@
  * Implements NMF OSAL for Linux kernel-space environment
  */
 
+#include <linux/module.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kthread.h>
@@ -19,8 +19,13 @@
 #include <linux/timer.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
-
+#include <linux/init.h>
+#include <mach/db8500-regs.h>
+#include <linux/mmio.h>
+#include <linux/clk.h>
+#ifdef CONFIG_STM_TRACE
 #include <trace/stm.h>
+#endif
 
 #include <cm/engine/configuration/inc/configuration_status.h>
 
@@ -37,6 +42,8 @@ __iomem void *prcmu_tcdm_base = NULL;
 /* DSP Load Monitoring */
 #define FULL_OPP 100
 #define HALF_OPP 50
+#define MMDSP_FULL_OPP_MHZ 200*1000*1000
+#define MMDSP_HALF_OPP_MHZ 100*1000*1000
 static unsigned long running_dsp = 0;
 static unsigned int dspLoadMonitorPeriod = 1000;
 module_param(dspLoadMonitorPeriod, uint, S_IWUSR|S_IRUGO);
@@ -44,13 +51,33 @@ MODULE_PARM_DESC(dspLoadMonitorPeriod, "Period of the DSP-Load monitoring in ms"
 static unsigned int dspLoadHighThreshold = 85;
 module_param(dspLoadHighThreshold, uint, S_IWUSR|S_IRUGO);
 MODULE_PARM_DESC(dspLoadHighThreshold, "Threshold above which 100 APE OPP is requested");
-static unsigned int dspLoadLowThreshold = 35;
+static unsigned int dspLoadLowThreshold = 38;
 module_param(dspLoadLowThreshold, uint, S_IWUSR|S_IRUGO);
 MODULE_PARM_DESC(dspLoadLowThreshold, "Threshold below which 100 APE OPP request is removed");
 static bool cm_use_ftrace;
 module_param(cm_use_ftrace, bool, S_IWUSR|S_IRUGO);
 MODULE_PARM_DESC(cm_use_ftrace, "Whether all CM debug traces goes through ftrace or normal kernel output");
+static phys_addr_t nmf_mmdsp_paddr;
+static size_t nmf_mmdsp_size;
 
+static int __init parse_nmf_mmdsp_param(char *p)
+{
+	nmf_mmdsp_size = memparse(p, &p);
+
+	if (*p != '@')
+		goto no_at;
+
+	nmf_mmdsp_paddr = memparse(p + 1, &p);
+
+	return 0;
+
+no_at:
+	nmf_mmdsp_size = 0;
+	nmf_mmdsp_paddr = 0;
+
+	return -EINVAL;
+}
+early_param("nmf_mmdsp", parse_nmf_mmdsp_param);
 /** \defgroup ENVIRONMENT_INITIALIZATION Environment initialization
  * Includes functions that initialize the Linux OSAL itself plus functions that
  * are responsible to factor configuration objects needed to initialize Component Manager library
@@ -67,7 +94,167 @@ MODULE_PARM_DESC(cm_use_ftrace, "Whether all CM debug traces goes through ftrace
  * \osalEnvironment NMF-Osal descriptor
  * \return POSIX error code 
  */
-int remapRegions(void)
+
+static int remapRegions_dynamicAllocation(void)
+{
+	unsigned i,err=0;
+
+	/* Allocate code and data sections for MPC (SVA, SIA) */
+	for (i=0; i<NB_MPC; i++) {
+	/* Allocate MPC SDRAM code area */
+		struct hwmem_mem_chunk mem_chunk;
+		size_t mem_chunk_length;
+		osalEnv.mpc[i].hwmem_code = hwmem_alloc(osalEnv.mpc[i].sdram_code.size,
+						       //HWMEM_ALLOC_HINT_CACHE_WB,
+						       HWMEM_ALLOC_HINT_WRITE_COMBINE | HWMEM_ALLOC_HINT_UNCACHED,
+						       HWMEM_ACCESS_READ | HWMEM_ACCESS_WRITE,
+						       HWMEM_MEM_STATIC_SYS);
+		if (IS_ERR(osalEnv.mpc[i].hwmem_code)) {
+			err = PTR_ERR(osalEnv.mpc[i].hwmem_code);
+			osalEnv.mpc[i].hwmem_code = NULL;
+			pr_err("%s: could not allocate SDRAM Code for %s\n",
+			       __func__, osalEnv.mpc[i].name);
+			return err;
+		}
+		osalEnv.mpc[i].sdram_code.data = hwmem_kmap(osalEnv.mpc[i].hwmem_code);
+		if (IS_ERR(osalEnv.mpc[i].sdram_code.data)) {
+			err = PTR_ERR(osalEnv.mpc[i].sdram_code.data);
+			osalEnv.mpc[i].sdram_code.data = NULL;
+			pr_err("%s: could not map SDRAM Code for %s\n", __func__, osalEnv.mpc[i].name);
+			return err;
+		}
+		mem_chunk_length = 1;
+		(void)hwmem_pin(osalEnv.mpc[i].hwmem_code, &mem_chunk, &mem_chunk_length);
+		osalEnv.mpc[i].sdram_code_phys = mem_chunk.paddr;
+		/* Allocate MPC SDRAM data area by taking care wether the data are shared or not */
+		if (osalEnv.mpc[i].sdram_data.size == 0) {
+			/* size of 0 means shared data segment, reuse the same param as for first MPC */
+			osalEnv.mpc[i].sdram_data_phys = osalEnv.mpc[0].sdram_data_phys;
+			osalEnv.mpc[i].sdram_data.data = osalEnv.mpc[0].sdram_data.data;
+			osalEnv.mpc[i].sdram_data.size = osalEnv.mpc[0].sdram_data.size;
+		} else {
+			/* If we do not share the data segment or if this is the first MPC */
+			osalEnv.mpc[i].hwmem_data = hwmem_alloc(osalEnv.mpc[i].sdram_data.size,
+							       HWMEM_ALLOC_HINT_WRITE_COMBINE | HWMEM_ALLOC_HINT_UNCACHED,
+							       HWMEM_ACCESS_READ | HWMEM_ACCESS_WRITE,
+							       HWMEM_MEM_STATIC_SYS);
+			if (IS_ERR(osalEnv.mpc[i].hwmem_data)) {
+				err = PTR_ERR(osalEnv.mpc[i].hwmem_data);
+				osalEnv.mpc[i].hwmem_data = NULL;
+				pr_err("%s: could not allocate SDRAM Data for %s\n",
+				       __func__, osalEnv.mpc[i].name);
+				return err;
+			}
+			mem_chunk_length = 1;
+			(void)hwmem_pin(osalEnv.mpc[i].hwmem_data,
+					&mem_chunk, &mem_chunk_length);
+			osalEnv.mpc[i].sdram_data_phys = mem_chunk.paddr;
+			osalEnv.mpc[i].sdram_data.data = hwmem_kmap(osalEnv.mpc[i].hwmem_data);
+			if (IS_ERR(osalEnv.mpc[i].sdram_data.data)) {
+				err = PTR_ERR(osalEnv.mpc[i].sdram_data.data);
+				osalEnv.mpc[i].sdram_data.data = NULL;
+				pr_err("%s: could not map SDRAM Data for %s\n",
+				       __func__, osalEnv.mpc[i].name);
+				return err;
+			}
+		}
+	}
+	return err;
+}
+
+static int remapRegions_staticAllocation(void)
+{
+	unsigned int phy_addr;
+	unsigned int logical_addr;
+	unsigned int i, size=0;
+
+	phy_addr = nmf_mmdsp_paddr; // = 0x3B000000 mapped on linear memory region
+
+	for (i=0; i<NB_MPC; i++)
+		size += osalEnv.mpc[i].sdram_code.size + osalEnv.mpc[i].sdram_data.size;
+
+	if((size > nmf_mmdsp_size) || (nmf_mmdsp_paddr ==0x0))
+	{
+		pr_err("%s:ERROR: Either nmf_mmdsp session not initialized or no sufficient space\n", __func__);
+		return -ENOMEM;
+	}
+
+	logical_addr = (unsigned int)ioremap_nocache(phy_addr, size);
+	if(logical_addr == 0x0){
+		pr_err("%s: could not remap SDRAM for code and data \n", __func__);
+		return -ENOMEM;
+	}
+
+	// Allocate MPC SDRAM code area
+	for (i=0; i<NB_MPC; i++)
+	{
+		osalEnv.mpc[i].sdram_code.data = (void*)logical_addr;
+		osalEnv.mpc[i].sdram_code_phys = phy_addr;
+		logical_addr += osalEnv.mpc[i].sdram_code.size;
+		phy_addr += osalEnv.mpc[i].sdram_code.size;
+
+		if (osalEnv.mpc[i].sdram_data.size == 0) {
+			// size of 0 means shared data segment, reuse the same param as for first MPC
+			osalEnv.mpc[i].sdram_data_phys = osalEnv.mpc[0].sdram_data_phys;
+			osalEnv.mpc[i].sdram_data.data = osalEnv.mpc[0].sdram_data.data;
+			osalEnv.mpc[i].sdram_data.size = osalEnv.mpc[0].sdram_data.size;
+		} else {
+			osalEnv.mpc[i].sdram_data.data = (void*)logical_addr;
+			osalEnv.mpc[i].sdram_data_phys = phy_addr;
+			logical_addr += osalEnv.mpc[i].sdram_data.size;
+			phy_addr += osalEnv.mpc[i].sdram_data.size;
+		}
+	}
+
+	return 0;
+}
+
+
+/**
+ * struct dbx500_asic_id - fields of the ASIC ID
+ * @process: the manufacturing process, 0x40 is 40 nm 0x00 is "standard"
+ * @partnumber: hithereto 0x8500 for DB8500
+ * @revision: version code in the series
+ */
+struct dbx500_asic_id {
+	u16	partnumber;
+	u8	revision;
+	u8	process;
+};
+
+extern struct dbx500_asic_id dbx500_id;
+
+static inline unsigned int __attribute_const__ dbx500_partnumber(void)
+{
+	return dbx500_id.partnumber;
+}
+
+static inline unsigned int __attribute_const__ dbx500_revision(void)
+{
+	return dbx500_id.revision;
+}
+
+static inline bool __attribute_const__ cpu_is_u8500(void)
+{
+	return dbx500_partnumber() == 0x8500;
+}
+
+static inline bool __attribute_const__ cpu_is_u8520(void)
+{
+	return dbx500_partnumber() == 0x8520;
+}
+
+static inline bool cpu_is_u8500_family(void)
+{
+	return cpu_is_u8500() || cpu_is_u8520();
+}
+
+static inline bool __attribute_const__ cpu_is_u9540(void)
+{
+	return dbx500_partnumber() == 0x9540;
+}
+
+ int remapRegions(void)
 {
 	unsigned i;
 
@@ -94,66 +281,12 @@ int remapRegions(void)
 		return -ENOMEM;
 	}
 
-	/* Allocate code and data sections for MPC (SVA, SIA) */
-        for (i=0; i<NB_MPC; i++) {
-		/* Allocate MPC SDRAM code area */
-		struct hwmem_mem_chunk mem_chunk;
-		size_t mem_chunk_length;
-		osalEnv.mpc[i].hwmem_code = hwmem_alloc(osalEnv.mpc[i].sdram_code.size,
-						       //HWMEM_ALLOC_HINT_CACHE_WB,
-						       HWMEM_ALLOC_HINT_WRITE_COMBINE | HWMEM_ALLOC_HINT_UNCACHED,
-						       HWMEM_ACCESS_READ | HWMEM_ACCESS_WRITE,
-						       HWMEM_MEM_CONTIGUOUS_SYS);
-		if (IS_ERR(osalEnv.mpc[i].hwmem_code)) {
-			int err = PTR_ERR(osalEnv.mpc[i].hwmem_code);
-			osalEnv.mpc[i].hwmem_code = NULL;
-			pr_err("%s: could not allocate SDRAM Code for %s\n",
-			       __func__, osalEnv.mpc[i].name);
-			return err;
-		}
-		osalEnv.mpc[i].sdram_code.data = hwmem_kmap(osalEnv.mpc[i].hwmem_code);
-		if (IS_ERR(osalEnv.mpc[i].sdram_code.data)) {
-			int err = PTR_ERR(osalEnv.mpc[i].sdram_code.data);
-			osalEnv.mpc[i].sdram_code.data = NULL;
-			pr_err("%s: could not map SDRAM Code for %s\n", __func__, osalEnv.mpc[i].name);
-			return err;
-		}
-		mem_chunk_length = 1;
-		(void)hwmem_pin(osalEnv.mpc[i].hwmem_code, &mem_chunk, &mem_chunk_length);
-		osalEnv.mpc[i].sdram_code_phys = mem_chunk.paddr;
-		/* Allocate MPC SDRAM data area by taking care wether the data are shared or not */
-		if (osalEnv.mpc[i].sdram_data.size == 0) {
-			/* size of 0 means shared data segment, reuse the same param as for first MPC */
-			osalEnv.mpc[i].sdram_data_phys = osalEnv.mpc[0].sdram_data_phys;
-			osalEnv.mpc[i].sdram_data.data = osalEnv.mpc[0].sdram_data.data;
-			osalEnv.mpc[i].sdram_data.size = osalEnv.mpc[0].sdram_data.size;
-		} else {
-			/* If we do not share the data segment or if this is the first MPC */
-			osalEnv.mpc[i].hwmem_data = hwmem_alloc(osalEnv.mpc[i].sdram_data.size,
-							       HWMEM_ALLOC_HINT_WRITE_COMBINE | HWMEM_ALLOC_HINT_UNCACHED,
-							       HWMEM_ACCESS_READ | HWMEM_ACCESS_WRITE,
-							       HWMEM_MEM_CONTIGUOUS_SYS);
-			if (IS_ERR(osalEnv.mpc[i].hwmem_data)) {
-				int err = PTR_ERR(osalEnv.mpc[i].hwmem_data);
-				osalEnv.mpc[i].hwmem_data = NULL;
-				pr_err("%s: could not allocate SDRAM Data for %s\n",
-				       __func__, osalEnv.mpc[i].name);
-				return err;
-			}
-			mem_chunk_length = 1;
-			(void)hwmem_pin(osalEnv.mpc[i].hwmem_data,
-					&mem_chunk, &mem_chunk_length);
-			osalEnv.mpc[i].sdram_data_phys = mem_chunk.paddr;
-			osalEnv.mpc[i].sdram_data.data = hwmem_kmap(osalEnv.mpc[i].hwmem_data);
-			if (IS_ERR(osalEnv.mpc[i].sdram_data.data)) {
-				int err = PTR_ERR(osalEnv.mpc[i].sdram_data.data);
-				osalEnv.mpc[i].sdram_data.data = NULL;
-				pr_err("%s: could not map SDRAM Data for %s\n",
-				       __func__, osalEnv.mpc[i].name);
-				return err;
-			}
-		}
-	}
+	if (cpu_is_u9540()) {
+		return remapRegions_staticAllocation();
+	} else if (cpu_is_u8500_family()) {
+		return remapRegions_dynamicAllocation();
+	} else
+		return -EINVAL;
 
 	return 0;
 }
@@ -179,25 +312,29 @@ void unmapRegions(void)
 	if(osalEnv.esram_base != NULL)
 		iounmap(osalEnv.esram_base);
 
+	if (cpu_is_u9540()) {
+		iounmap(osalEnv.mpc[0].sdram_code.data);
+	} else if (cpu_is_u8500_family()) {
 	/*
 	 * Free SVA and SIA code and data sections or release their mappings
 	 * according on how memory allocations has been achieved
 	 */
-	for (i=0; i<NB_MPC; i++) {
-		if (osalEnv.mpc[i].sdram_code.data != NULL) {
-			hwmem_unpin(osalEnv.mpc[i].hwmem_code);
-			hwmem_kunmap(osalEnv.mpc[i].hwmem_code);
-			if (osalEnv.mpc[i].hwmem_code != NULL)
-				hwmem_release(osalEnv.mpc[i].hwmem_code);
-		}
+		for (i=0; i<NB_MPC; i++) {
+			if (osalEnv.mpc[i].sdram_code.data != NULL) {
+				hwmem_unpin(osalEnv.mpc[i].hwmem_code);
+				hwmem_kunmap(osalEnv.mpc[i].hwmem_code);
+				if (osalEnv.mpc[i].hwmem_code != NULL)
+					hwmem_release(osalEnv.mpc[i].hwmem_code);
+			}
 
-		/* If data segment is shared, we must free only the first data segment */
-		if (((i == 0) || (osalEnv.mpc[i].sdram_data.data != osalEnv.mpc[0].sdram_data.data))
-		    && (osalEnv.mpc[i].sdram_data.data != NULL)) {
-			hwmem_unpin(osalEnv.mpc[i].hwmem_data);
-			hwmem_kunmap(osalEnv.mpc[i].hwmem_data);
-			if (osalEnv.mpc[i].hwmem_data != NULL)
-				hwmem_release(osalEnv.mpc[i].hwmem_data);
+			/* If data segment is shared, we must free only the first data segment */
+			if (((i == 0) || (osalEnv.mpc[i].sdram_data.data != osalEnv.mpc[0].sdram_data.data))
+				&& (osalEnv.mpc[i].sdram_data.data != NULL)) {
+				hwmem_unpin(osalEnv.mpc[i].hwmem_data);
+				hwmem_kunmap(osalEnv.mpc[i].hwmem_data);
+				if (osalEnv.mpc[i].hwmem_data != NULL)
+					hwmem_release(osalEnv.mpc[i].hwmem_data);
+			}
 		}
 	}
 }
@@ -551,8 +688,7 @@ void* OSAL_Alloc(t_cm_size size)
 
 	if (size == 0)
 		return NULL;
-	/* Use kmalloc() if the size is small enough. */
-	mem = (size < (2 * PAGE_SIZE - 64)) ? kmalloc(size, GFP_KERNEL) : NULL;
+	mem = kmalloc(size, GFP_KERNEL | __GFP_NOWARN);
 	if (mem == NULL) {
 		mem = vmalloc(size);
 		if (mem == NULL)
@@ -602,8 +738,7 @@ void* OSAL_Alloc_Zero(t_cm_size size)
 
 	if (size == 0)
 		return NULL;
-	/* Use kzalloc() if the size is small enough. */
-	mem = (size < (2 * PAGE_SIZE - 64)) ? kzalloc(size, GFP_KERNEL) : NULL;
+	mem = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
 	if (mem == NULL) {
 		mem = vmalloc(size);
 		if (mem == NULL)
@@ -695,9 +830,10 @@ void OSAL_Log(const char *format, int param1, int param2, int param3, int param4
  * 
  * return -1 if in case of failure, a value between 0 and 100 otherwise
  */
-static s8 computeDspLoad(t_cm_mpc_load_counter *oldCounter, t_cm_mpc_load_counter *counter)
+static s8 computeDspLoad(t_cm_mpc_load_counter *oldCounter, t_cm_mpc_load_counter *counter,t_nmf_core_id id)
 {
 	u32 t, l;
+	u32 currentmips=0;
 
 	if ((oldCounter->totalCounter == 0) && (oldCounter->loadCounter == 0))
 		return -1; // Failure or not started ?
@@ -721,6 +857,16 @@ static s8 computeDspLoad(t_cm_mpc_load_counter *oldCounter, t_cm_mpc_load_counte
 
 	if (l > t) // not significant
 		return -1;
+
+#ifdef CONFIG_DEBUG_FS
+	if(HALF_OPP==osalEnv.mpc[id-1].opp_request)
+		currentmips = l *(MMDSP_HALF_OPP_MHZ/t);
+	if(FULL_OPP==osalEnv.mpc[id-1].opp_request)
+		currentmips = l *(MMDSP_FULL_OPP_MHZ/t);
+
+	if(currentmips>osalEnv.mpc[id-1].max_mips)
+		osalEnv.mpc[id-1].max_mips = currentmips;
+#endif
 
 	return (l*100) / t;
 }
@@ -748,7 +894,7 @@ static int dspload_monitor(void *idx)
 	mpc->opp_request = current_opp_request;
 #endif
 	if (prcmu_qos_add_requirement(PRCMU_QOS_APE_OPP,
-				      (char*)mpc->name,
+				      mpc->name,
 				      current_opp_request))
 		pr_err("CM Driver: Add QoS failed\n");
 
@@ -790,7 +936,7 @@ static int dspload_monitor(void *idx)
 #ifdef CONFIG_DEBUG_FS
 		mpc->load =
 #endif
-		load = computeDspLoad(&mpc->oldLoadCounter, &loadCounter);
+		load = computeDspLoad(&mpc->oldLoadCounter, &loadCounter,mpc->coreId);
 		mpc->oldLoadCounter = loadCounter;
 
 		if (load == -1)
@@ -806,7 +952,7 @@ static int dspload_monitor(void *idx)
 				pr_info("CM Driver: Request QoS OPP %d for %s\n",
 					current_opp_request, mpc->name);
 			prcmu_qos_update_requirement(PRCMU_QOS_APE_OPP,
-						     (char*)mpc->name,
+						     mpc->name,
 						     current_opp_request);
 		}
 		/* check if we can request less opp */
@@ -820,7 +966,7 @@ static int dspload_monitor(void *idx)
 				pr_info("CM Driver: Request QoS OPP %d for %s\n",
 					current_opp_request, mpc->name);
 			prcmu_qos_update_requirement(PRCMU_QOS_APE_OPP,
-						     (char*)mpc->name,
+						     mpc->name,
 						     current_opp_request);
 		}
 	}
@@ -832,11 +978,11 @@ static int dspload_monitor(void *idx)
 	if (cm_debug_level)
 		pr_info("CM Driver: Remove QoS OPP for %s\n", mpc->name);
 	prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP,
-				     (char*)mpc->name);
+				     mpc->name);
  	return 0;
 }
 
-static int enable_auto_pm = 1;
+static bool enable_auto_pm = 1;
 module_param(enable_auto_pm, bool, S_IWUSR|S_IRUGO);
 
 /** \ingroup OSAL_IMPLEMENTATION
@@ -881,6 +1027,9 @@ void OSAL_DisablePwrRessource(t_nmf_power_resource resource, t_uint32 firstParam
 		msg.d.srv.srvType = NMF_SERVICE_SHUTDOWN;
 		msg.d.srv.srvData.shutdown.coreid = firstParam;
 		dispatch_service_msg(&msg);
+
+		/* wake up all trace readers to let them retrieve last traces */
+		wake_up_all(&osalEnv.mpc[idx].trace_waitq);
 		break;
 	}
 	case CM_OSAL_POWER_SxA_AUTOIDLE:
@@ -1086,7 +1235,7 @@ void OSAL_GeneratePanic(t_nmf_core_id coreId, t_uint32 reason)
 {
 	struct osal_msg msg;
 
-	/* Create and dispatch a shutdown service message */
+	/* Create and dispatch a panic service message */
 	msg.msg_type = MSG_SERVICE;
 	msg.d.srv.srvType = NMF_SERVICE_PANIC;
 	msg.d.srv.srvData.panic.panicReason = MPC_NOT_RESPONDING_PANIC;
@@ -1096,6 +1245,9 @@ void OSAL_GeneratePanic(t_nmf_core_id coreId, t_uint32 reason)
 	msg.d.srv.srvData.panic.info.mpc.panicInfo1 = reason;
 	msg.d.srv.srvData.panic.info.mpc.panicInfo2 = 0;
 	dispatch_service_msg(&msg);
+
+	/* wake up all trace readers to let them retrieve last traces */
+	wake_up_all(&osalEnv.mpc[COREIDX(coreId)].trace_waitq);
 }
 
 /*!
@@ -1221,3 +1373,53 @@ PUBLIC void OSAL_DisableServiceMessages(void) {
 PUBLIC void OSAL_EnableServiceMessages(void) {
 	tasklet_enable(&cmld_service_tasklet);
 }
+
+
+/*!
+ * \brief Enable HTIMEN-SIA/SVA Timer enable
+ *
+ * It enables the : Imaging/Audio/Video Accelerator Timers enable signal
+ *
+ * \ingroup CM_ENGINE_OSAL_API
+ */
+PUBLIC t_cm_error OSAL_EnableSxA_HTIMEN(void) {
+    int err = 0;
+    void *htim_base=NULL;
+    struct mmio_clk per6_clk;
+    per6_clk.name = "cfgreg";
+    htim_base = ioremap_nocache(U8500_CR_BASE/*0xA03C8000*/,SZ_4K);
+    if (htim_base == NULL)
+    {
+      pr_err("%s CM: could not remap htim_base\n", __func__);
+      return -ENOMEM;
+    }
+    per6_clk.clk_ptr = clk_get_sys(per6_clk.name,NULL);
+    if (IS_ERR(per6_clk.clk_ptr))
+    {
+       err = PTR_ERR(per6_clk.clk_ptr);
+       pr_err("CM: Error %d getting clock '%s'\n",err,per6_clk.name);
+       iounmap(htim_base);
+       return err;
+    }
+    /* Enable Peripheral 6 clock */
+    err = clk_enable(per6_clk.clk_ptr);
+    if (err)
+    {
+       pr_err("CM: Error %d enable clock '%s'\n",err,per6_clk.name);
+       goto onerror;
+    }
+    //Enable HTIMEN:TIMER_EN pin is kept high to activate SIA Timer
+    iowrite32((1<<26) | ioread32(htim_base), htim_base);
+    /* Disable Peripheral 6 clock */
+    clk_disable(per6_clk.clk_ptr);
+    /* Release Peripheral 6 clock pointer */
+    clk_put(per6_clk.clk_ptr);
+    iounmap(htim_base);
+    return CM_OK;
+
+    onerror:
+    iounmap(htim_base);
+    clk_put(per6_clk.clk_ptr);
+    return err;
+}
+

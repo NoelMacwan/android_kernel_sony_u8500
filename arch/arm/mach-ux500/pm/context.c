@@ -8,6 +8,7 @@
  *
  */
 #include <linux/init.h>
+#include <linux/module.h>
 #include <linux/io.h>
 #include <linux/smp.h>
 #include <linux/percpu.h>
@@ -24,12 +25,12 @@
 #include <mach/irqs.h>
 #include <mach/pm.h>
 #include <mach/context.h>
+#include <mach/product.h>
 
 #include <asm/hardware/gic.h>
-#include <asm/smp_twd.h>
 
+#include "../id.h"
 #include "scu.h"
-#include "../product.h"
 #include "../prcc.h"
 
 #define GPIO_NUM_BANKS 9
@@ -44,11 +45,9 @@
 
 #define U8500_PUBLIC_BOOT_ROM_BASE (U8500_BOOT_ROM_BASE + 0x17000)
 #define U9540_PUBLIC_BOOT_ROM_BASE (U9540_BOOT_ROM_BASE + 0x17000)
-#define U5500_PUBLIC_BOOT_ROM_BASE (U5500_BOOT_ROM_BASE + 0x18000)
 
 /*
- * Special dedicated addresses in backup RAM.  The 5500 addresses are identical
- * to the 8500 ones.
+ * Special dedicated addresses in backup RAM.
  */
 #define U8500_EXT_RAM_LOC_BACKUPRAM_ADDR		0x80151FDC
 #define U8500_CPU0_CP15_CR_BACKUPRAM_ADDR		0x80151F80
@@ -58,6 +57,7 @@
 #define U8500_CPU1_BACKUPRAM_ADDR_PUBLIC_BOOT_ROM_LOG_ADDR	0x80151FE0
 
 #define GIC_DIST_ENABLE_NS 0x0
+#define GIC_DIST_ENABLE_PPI_MASK 0xF0000000
 
 /* 32 interrupts fits in 4 bytes */
 #define GIC_DIST_ENABLE_SET_COMMON_NUM ((DBX500_NR_INTERNAL_IRQS - \
@@ -71,6 +71,9 @@
 #define GIC_DIST_ENABLE_CLEAR_64 (GIC_DIST_ENABLE_CLEAR + 8)
 #define GIC_DIST_ENABLE_CLEAR_96 (GIC_DIST_ENABLE_CLEAR + 12)
 #define GIC_DIST_ENABLE_CLEAR_128 (GIC_DIST_ENABLE_CLEAR + 16)
+#define GIC_DIST_ENABLE_CLEAR_160 (GIC_DIST_ENABLE_CLEAR + 20)
+#define GIC_DIST_ENABLE_CLEAR_192 (GIC_DIST_ENABLE_CLEAR + 24)
+#define GIC_DIST_ENABLE_CLEAR_224 (GIC_DIST_ENABLE_CLEAR + 28)
 
 #define GIC_DIST_PRI_COMMON_NUM ((DBX500_NR_INTERNAL_IRQS - IRQ_SHPI_START) / 4)
 #define GIC_DIST_PRI_CPU_NUM (IRQ_SHPI_START / 4)
@@ -109,6 +112,9 @@
 #define SCU_FILTER_STARTADDR	0x40
 #define SCU_FILTER_ENDADDR	0x44
 #define SCU_ACCESS_CTRL_SAC	0x50
+
+/* TODO expand the CR block handling to all registers and not only the CR_REG1*/
+#define  U8500_CR_REG1 0x4
 
 /* The context of the Trace Port Interface Unit (TPIU) */
 static struct {
@@ -173,6 +179,12 @@ static struct {
 	u32 kern_clk;
 } context_prcc[UX500_NR_PRCC_BANKS];
 
+static struct {
+	void __iomem *base;
+	u32 cr_reg1;
+	struct clk *clk;
+} context_cr;
+
 static u32 backup_sram_storage[NR_CPUS] = {
 	IO_ADDRESS(U8500_CPU0_CP15_CR_BACKUPRAM_ADDR),
 	IO_ADDRESS(U8500_CPU1_CP15_CR_BACKUPRAM_ADDR),
@@ -191,6 +203,10 @@ static u32 gpio_bankaddr[GPIO_NUM_BANKS] = {IO_ADDRESS(U8500_GPIOBANK0_BASE),
 
 static u32 gpio_save[GPIO_NUM_BANKS][GPIO_NUM_SAVE_REGISTERS];
 
+static struct {
+	void (*gic_dist_disable_unneeded_irqs)(void);
+} ux500_context_fn;
+
 /*
  * Stacks and stack pointers
  */
@@ -202,6 +218,12 @@ static DEFINE_PER_CPU(u32 *, varm_cp15_pointer);
 
 static ATOMIC_NOTIFIER_HEAD(context_ape_notifier_list);
 static ATOMIC_NOTIFIER_HEAD(context_arm_notifier_list);
+
+/*
+ * Store PPI irq mask before in ARM retention - use this to restore when
+ * waking up. One per CPU.
+ */
+static unsigned int cpu_ppi_irqs[NR_CPUS];
 
 /*
  * Register a simple callback for handling vape context save/restore
@@ -240,6 +262,28 @@ int context_arm_notifier_unregister(struct notifier_block *nb)
 						    nb);
 }
 EXPORT_SYMBOL(context_arm_notifier_unregister);
+
+static void save_cr(void)
+{
+
+	clk_enable(context_cr.clk);
+
+	context_cr.cr_reg1 = readl(context_cr.base + U8500_CR_REG1);
+
+	clk_disable(context_cr.clk);
+
+}
+
+static void restore_cr(void)
+{
+
+	clk_enable(context_cr.clk);
+
+	writel(context_cr.cr_reg1, context_cr.base + U8500_CR_REG1);
+
+	clk_disable(context_cr.clk);
+
+}
 
 static void save_prcc(void)
 {
@@ -528,10 +572,42 @@ static void restore_gic_dist_cpu(struct context_gic_dist_cpu *c_gic)
 }
 
 /*
+ * Store irq mask and disable PPI interrupts in ARM retention
+ */
+void context_gic_dist_store_ppi_irqs(void)
+{
+	int this_cpu = smp_processor_id();
+
+	/* Store PPI irqs */
+	cpu_ppi_irqs[this_cpu] = readl_relaxed(context_gic_dist_common.base +
+			GIC_DIST_ENABLE_CLEAR_0) & GIC_DIST_ENABLE_PPI_MASK;
+	/* Disable PPI irqs */
+	writel_relaxed(cpu_ppi_irqs[this_cpu],
+			context_gic_dist_common.base + GIC_DIST_ENABLE_CLEAR_0);
+}
+
+/*
+ * Restore PPI interrupts after in ARM retention
+ */
+void context_gic_dist_restore_ppi_irqs(void)
+{
+	int this_cpu = smp_processor_id();
+
+	/* Restore PPI irqs */
+	writel_relaxed(cpu_ppi_irqs[this_cpu],
+			context_gic_dist_common.base + GIC_DIST_ENABLE_SET);
+}
+
+/*
  * Disable interrupts that are not necessary
  * to have turned on during ApDeepSleep.
  */
 void context_gic_dist_disable_unneeded_irqs(void)
+{
+	BUG_ON(unlikely(!ux500_context_fn.gic_dist_disable_unneeded_irqs));
+	ux500_context_fn.gic_dist_disable_unneeded_irqs();
+}
+static void u8500_context_gic_dist_disable_unneeded_irqs(void)
 {
 	writel(0xffffffff,
 	       context_gic_dist_common.base +
@@ -553,6 +629,15 @@ void context_gic_dist_disable_unneeded_irqs(void)
 	writel(0xffffffff,
 	       context_gic_dist_common.base +
 	       GIC_DIST_ENABLE_CLEAR_128);
+}
+static void ux540_context_gic_dist_disable_unneeded_irqs(void)
+{
+	void __iomem *base;
+	u8500_context_gic_dist_disable_unneeded_irqs();
+	base = context_gic_dist_common.base;
+	writel(0xffffffff, base + GIC_DIST_ENABLE_CLEAR_160);
+	writel(0xffffffff, base + GIC_DIST_ENABLE_CLEAR_192);
+	writel(0xffffffff, base + GIC_DIST_ENABLE_CLEAR_224);
 }
 
 static void save_scu(void)
@@ -595,16 +680,16 @@ void context_vape_save(void)
 	atomic_notifier_call_chain(&context_ape_notifier_list,
 				   CONTEXT_APE_SAVE, NULL);
 
-	if (cpu_is_u5500())
-		u5500_context_save_icn();
-	if (cpu_is_u8500())
+	if (cpu_is_u8500_family())
 		u8500_context_save_icn();
-	if (cpu_is_u9540())
+	if (cpu_is_ux540_family())
 		u9540_context_save_icn();
 
 	save_stm_ape();
 
 	save_tpiu();
+
+	save_cr();
 
 	save_prcc();
 }
@@ -616,15 +701,15 @@ void context_vape_restore(void)
 {
 	restore_prcc();
 
+	restore_cr();
+
 	restore_tpiu();
 
 	restore_stm_ape();
 
-	if (cpu_is_u5500())
-		u5500_context_restore_icn();
-	if (cpu_is_u8500())
+	if (cpu_is_u8500_family())
 		u8500_context_restore_icn();
-	if (cpu_is_u9540())
+	if (cpu_is_ux540_family())
 		u9540_context_restore_icn();
 
 	atomic_notifier_call_chain(&context_ape_notifier_list,
@@ -805,7 +890,6 @@ void context_varm_save_core(void)
 	per_cpu(varm_cp15_pointer, cpu) = per_cpu(varm_cp15_backup_stack, cpu);
 
 	/* Save core */
-	twd_save();
 	save_gic_if_cpu(&per_cpu(context_gic_cpu, cpu));
 	save_gic_dist_cpu(&per_cpu(context_gic_dist_cpu, cpu));
 	context_save_cp15_registers(&per_cpu(varm_cp15_pointer, cpu));
@@ -825,7 +909,6 @@ void context_varm_restore_core(void)
 	context_restore_cp15_registers(&per_cpu(varm_cp15_pointer, cpu));
 	restore_gic_dist_cpu(&per_cpu(context_gic_dist_cpu, cpu));
 	restore_gic_if_cpu(&per_cpu(context_gic_cpu, cpu));
-	twd_restore();
 
 	atomic_notifier_call_chain(&context_arm_notifier_list,
 				   CONTEXT_ARM_CORE_RESTORE, NULL);
@@ -892,28 +975,9 @@ static int __init context_init(void)
 	writel(virt_to_phys(ux500_backup_ptr),
 	       IO_ADDRESS(U8500_EXT_RAM_LOC_BACKUPRAM_ADDR));
 
-	if (cpu_is_u5500()) {
-		writel(IO_ADDRESS(U5500_PUBLIC_BOOT_ROM_BASE),
-		       IO_ADDRESS(U8500_CPU0_BACKUPRAM_ADDR_PUBLIC_BOOT_ROM_LOG_ADDR));
-
-		writel(IO_ADDRESS(U5500_PUBLIC_BOOT_ROM_BASE),
-		       IO_ADDRESS(U8500_CPU1_BACKUPRAM_ADDR_PUBLIC_BOOT_ROM_LOG_ADDR));
-
-		context_tpiu.base = ioremap(U5500_TPIU_BASE, SZ_4K);
-		context_stm_ape.base = ioremap(U5500_STM_REG_BASE, SZ_4K);
-		context_scu.base = ioremap(U5500_SCU_BASE, SZ_4K);
-
-		context_prcc[0].base = ioremap(U5500_CLKRST1_BASE, SZ_4K);
-		context_prcc[1].base = ioremap(U5500_CLKRST2_BASE, SZ_4K);
-		context_prcc[2].base = ioremap(U5500_CLKRST3_BASE, SZ_4K);
-		context_prcc[3].base = ioremap(U5500_CLKRST5_BASE, SZ_4K);
-		context_prcc[4].base = ioremap(U5500_CLKRST6_BASE, SZ_4K);
-
-		context_gic_dist_common.base = ioremap(U5500_GIC_DIST_BASE, SZ_4K);
-		per_cpu(context_gic_cpu, 0).base = ioremap(U5500_GIC_CPU_BASE, SZ_4K);
-	} else if (cpu_is_u8500() || cpu_is_u9540()) {
+	if (cpu_is_u8500_family() || cpu_is_ux540_family()) {
 		/* Give logical address to backup RAM. For both CPUs */
-		if (cpu_is_u9540()) {
+		if (cpu_is_ux540_family()) {
 			writel(IO_ADDRESS_DB9540_ROM(U9540_PUBLIC_BOOT_ROM_BASE),
 					IO_ADDRESS(U8500_CPU0_BACKUPRAM_ADDR_PUBLIC_BOOT_ROM_LOG_ADDR));
 
@@ -938,8 +1002,27 @@ static int __init context_init(void)
 		context_prcc[3].base = ioremap(U8500_CLKRST5_BASE, SZ_4K);
 		context_prcc[4].base = ioremap(U8500_CLKRST6_BASE, SZ_4K);
 
+		context_cr.base =  ioremap(U8500_CR_BASE, PAGE_SIZE);
+		context_cr.clk = clk_get_sys("cfgreg", NULL);
+		BUG_ON(IS_ERR(context_cr.clk));
+
 		context_gic_dist_common.base = ioremap(U8500_GIC_DIST_BASE, SZ_4K);
 		per_cpu(context_gic_cpu, 0).base = ioremap(U8500_GIC_CPU_BASE, SZ_4K);
+	}
+
+	if (!context_tpiu.base
+	    || !context_stm_ape.base
+	    || !context_scu.base
+	    || !context_prcc[0].base
+	    || !context_prcc[1].base
+	    || !context_prcc[2].base
+	    || !context_prcc[3].base
+	    || !context_prcc[4].base
+	    || !context_cr.base
+	    || !context_gic_dist_common.base
+	    || !per_cpu(context_gic_cpu, 0).base) {
+		pr_err("context: ioremap failed\n");
+		BUG();
 	}
 
 	per_cpu(context_gic_dist_cpu, 0).base = context_gic_dist_common.base;
@@ -961,11 +1044,13 @@ static int __init context_init(void)
 		BUG_ON(IS_ERR(context_prcc[i].clk));
 	}
 
-	if (cpu_is_u8500()) {
+	if (cpu_is_u8500_family()) {
+		ux500_context_fn.gic_dist_disable_unneeded_irqs =
+			u8500_context_gic_dist_disable_unneeded_irqs;
 		u8500_context_init();
-	} else if (cpu_is_u5500()) {
-		u5500_context_init();
-	} else if (cpu_is_u9540()) {
+	} else if (cpu_is_ux540_family()) {
+		ux500_context_fn.gic_dist_disable_unneeded_irqs =
+			ux540_context_gic_dist_disable_unneeded_irqs;
 		u9540_context_init();
 	} else {
 		printk(KERN_ERR "context: unknown hardware!\n");

@@ -1,6 +1,4 @@
 /*
- * hsi_boardinfo.c
- *
  * HSI clients registration interface
  *
  * Copyright (C) 2010 Nokia Corporation. All rights reserved.

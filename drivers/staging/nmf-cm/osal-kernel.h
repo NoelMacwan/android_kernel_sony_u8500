@@ -57,9 +57,7 @@ struct mpcConfig {
 #endif
 	struct task_struct *monitor_tsk; /**< task to monitor the dsp load; */
 	t_cm_mpc_load_counter oldLoadCounter; /**< previous load counter of the DSP */
-	atomic_t trace_read_count;       /**< number of trace reader */
-	spinlock_t trace_reader_lock;
-	struct task_struct *trace_reader;/**< current reader task */
+	wait_queue_head_t trace_waitq;   /**< wait queue used to block trace_read() call */
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *dir;              /**< debugfs dir entry */
 	struct dentry *comp_dir;         /**< debugfs component dir entry */
@@ -70,6 +68,7 @@ struct mpcConfig {
 	struct dentry *esram_file;       /**< debugfs meminfo file entry */
 	s8         load;                 /**< current load of the DSP */
 	s8         opp_request;          /**< current requested opp of the DSP */
+	u32        max_mips;          /**< current max mips of the DSP for HALF & FULL OPP*/
 #endif
 };
 

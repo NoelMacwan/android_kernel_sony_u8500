@@ -1,13 +1,13 @@
 config DBX500_PRCMU_QOS_POWER
 	bool "DBX500 PRCMU power QoS support"
-	depends on (MFD_DB5500_PRCMU || MFD_DB8500_PRCMU)
+	depends on (MFD_DB8500_PRCMU || MFD_DBX540_PRCMU)
 	default y
 	help
 	  Add support for PRCMU power Quality of Service
 
 config DBX500_CONTEXT
 	bool "Context save/restore support for DBX500"
-	depends on (UX500_SOC_DB8500 || UX500_SOC_DB5500) && PM
+	depends on (UX500_SOC_DB8500) && PM
 	help
 	  This is needed for ApSleep and deeper sleep states.
 
@@ -30,7 +30,7 @@ config UX500_CONSOLE_UART_GPIO_PIN
 
 config UX500_SUSPEND
 	bool "Suspend to mem and standby support"
-	depends on (UX500_SOC_DB8500 || UX500_SOC_DB5500) && PM && SUSPEND
+	depends on (UX500_SOC_DB8500) && PM && SUSPEND
 	select DBX500_CONTEXT
 	help
 	  Add support for suspend.
@@ -54,6 +54,13 @@ config UX500_SUSPEND_DBG
 	help
 	  Add debug support for suspend.
 
+config UX500_HATS_DEEP_DBG
+	bool "Hats deep debug"
+	depends on UX500_SUSPEND && DEEP_DEBUG
+	default n
+	help
+	  Add deep debug support for hats.
+
 config UX500_SUSPEND_DBG_WAKE_ON_UART
 	bool "Suspend wakes on console UART"
 	depends on UX500_SUSPEND_DBG
@@ -62,9 +69,40 @@ config UX500_SUSPEND_DBG_WAKE_ON_UART
 
 config UX500_USECASE_GOVERNOR
 	bool "UX500 use-case governor"
-	depends on (UX500_SOC_DB8500 || UX500_SOC_DB5500) && \
+	depends on (UX500_SOC_DB8500) && \
 			(CPU_FREQ && CPU_IDLE && HOTPLUG_CPU && \
 			EARLYSUSPEND && UX500_L2X0_PREFETCH_CTRL && PM)
 	default y
 	help
 	  Adjusts CPU_IDLE, CPU_FREQ, HOTPLUG_CPU and L2 cache parameters
+
+config DBX500_CPUIDLE
+	tristate "DBX500 CPUIdle support"
+	depends on CPU_IDLE && (MFD_DB8500_PRCMU || MFD_DBX540_PRCMU) && PM
+	default y
+	select GENERIC_CLOCKEVENTS_BROADCAST
+	select DBX500_CONTEXT
+	help
+	  Add support for CPUIdle for DBX500.
+
+config DBX500_CPUIDLE_DEEPEST_STATE
+	int "DBX500 CPUIdle Deepest sleep state"
+	default 3 if UX500_SOC_DB8500
+	depends on DBX500_CPUIDLE
+	help
+	  Set deepest sleep state. See the cstate struct in cpuidle.c.
+	  Default is ApSleep.
+
+config DBX500_CPUIDLE_APDEEPIDLE
+	bool "DBX50 CPUIdle ApDeepIdle"
+	depends on DBX500_CPUIDLE
+	help
+	  Adds the power level ApDeepIdle, where APE is powered on while
+	  ARM is powered off. Default n.
+
+config DBX500_CPUIDLE_DEBUG
+	bool "DBX500 CPUIdle debug"
+	depends on DBX500_CPUIDLE && DEBUG_FS
+	help
+	  Add debugging support for CPUIdle for DBX500.
+

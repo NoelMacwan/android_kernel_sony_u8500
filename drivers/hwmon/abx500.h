@@ -10,9 +10,7 @@
 #define NUM_SENSORS 5
 
 struct ab8500_gpadc;
-struct ab5500_gpadc;
 struct ab8500_btemp;
-struct ab5500_btemp;
 struct adc_auto_input;
 struct abx500_temp;
 
@@ -39,7 +37,6 @@ struct abx500_temp_ops {
  * @pdev: platform device
  * @hwmon_dev: hwmon device
  * @ab8500_gpadc: gpadc interface for ab8500
- * @ab5500_gpadc: gpadc interface for ab5500
  * @btemp: battery temperature interface for ab8500
  * @adc_auto_input: gpadc auto trigger
  * @gpadc_addr: gpadc channel address
@@ -65,9 +62,7 @@ struct abx500_temp {
 	struct platform_device *pdev;
 	struct device *hwmon_dev;
 	struct ab8500_gpadc *ab8500_gpadc;
-	struct ab5500_gpadc *ab5500_gpadc;
 	struct ab8500_btemp *ab8500_btemp;
-	struct ab5500_btemp *ab5500_btemp;	
 	struct adc_auto_input *gpadc_auto;
 	struct abx500_temp_ops ops;
 	u8 gpadc_addr[NUM_SENSORS];

@@ -30,6 +30,7 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <linux/module.h>
 #include <linux/input/lps331ap.h>
 
 /* device id */
@@ -59,6 +60,12 @@
 #define LAST_REG		0x40
 #define AUTO_INCREMENT		0x80
 
+/* ctrl_reg2 */
+#define ONE_SHOT		0x01
+#define AUTO_ZERO		0x02
+#define SWRESET			0x04
+#define BOOT			0x80
+
 /* odr settings */
 #define ODR_MASK		0x70
 #define ODR250			0x70
@@ -80,8 +87,8 @@
 
 /*pressure and temperature data status*/
 #define DATA_OVERRUN	0x30 /*data overrun*/
-#define PRESSURE_AVAIL	0x20 /*pressure data is available*/
-#define TEMP_AVAIL		0x01 /*Temperature data is available*/
+#define PRESSURE_AVAIL	0x02 /*pressure data is available*/
+#define TEMP_AVAIL	0x01 /*Temperature data is available*/
 
 static const struct odr_delay {
 	u8 odr;			/* odr reg setting */
@@ -160,12 +167,41 @@ static int barometer_disable(struct barometer_data *barom)
 static int barometer_read_pressure_data(struct barometer_data *barom)
 {
 	int err = 0;
-	int status;
+	int status, ctrl;
 	u8 temp_data[2];
 	u8 press_data[3];
 
-	/* prime the single shot mode to read data if it is cleared */
-	err = i2c_smbus_write_byte_data(barom->client, CTRL_REG2, 0x01);
+	ctrl = i2c_smbus_read_byte_data(barom->client, CTRL_REG2);
+	status = i2c_smbus_read_byte_data(barom->client, STATUS_REG);
+
+	if ((ctrl == ONE_SHOT) || (status & (TEMP_AVAIL | PRESSURE_AVAIL))) {
+		/* No need to prime the read again - just get the data */
+		dev_dbg(barom->dev, "%s: PENDING one-shot %02x NOT cleared yet or STATUS"
+		"already available %02x\n", __func__, ctrl, status);
+	} else {
+		/*
+		 * have to clear the ONE-SHOT flag first in case it was powered
+		 * down whilst set - hardware behaviour observed during testing
+		 * that if device is powered down whilst status is being
+		 * collected and the ONE-SHOT bit is still set to 1 then when
+		 * powered backup the device initialisation does not sety the
+		 * bit to 0 so subsequent writes of 1 will not cause a new
+		 * sample sequence to occur - it needs a transition from 0 to 1
+		 */
+		err = i2c_smbus_write_byte_data(barom->client, CTRL_REG2, 0x00);
+		if (err < 0) {
+			dev_err(barom->dev, "%s: CTRL_REG2 i2c write failed\n",
+					__func__);
+			goto done;
+		}
+		/* prime the single shot mode to read data if it is cleared */
+		err = i2c_smbus_write_byte_data(barom->client, CTRL_REG2, 0x01);
+		if (err < 0) {
+			dev_err(barom->dev, "%s: CTRL_REG2 i2c write failed\n",
+					__func__);
+			goto done;
+		}
+	}
 
 	/* check out if data is ready */
 	status = i2c_smbus_read_byte_data(barom->client, STATUS_REG);
@@ -174,10 +210,9 @@ static int barometer_read_pressure_data(struct barometer_data *barom)
 			__func__);
 		err = status;
 		goto done;
-	} else if (status & DATA_OVERRUN) {
+	} else if (status & DATA_OVERRUN)
 		dev_dbg(barom->dev, "%s: data overrun %02x\n",
 			__func__, (u8)status);
-	}
 
 	if (status & TEMP_AVAIL)  {
 		/* read temperature data */
@@ -336,21 +371,19 @@ static ssize_t barometer_enable_store(struct device *dev,
 	mutex_lock(&barom->lock);
 	if (new_value) {
 		err = barometer_enable(barom);
-		if (err < 0) {
+		if (err < 0)
 			dev_err(barom->dev, "%s: barometer enable failed\n",
-				__func__);
-		}
+					__func__);
 	} else {
 		err = barometer_disable(barom);
-		if (err < 0) {
+		if (err < 0)
 			dev_err(barom->dev, "%s: barometer disable failed\n",
-				__func__);
-		}
+					__func__);
 	}
-
 	mutex_unlock(&barom->lock);
 	if (err < 0)
 		return err;
+
 	return size;
 }
 
@@ -379,7 +412,8 @@ static int setup_input_device(struct barometer_data *barom)
 	if (!barom->input_dev) {
 		dev_err(barom->dev, "%s: could not allocate input device\n",
 			__func__);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto done;
 	}
 
 	input_set_drvdata(barom->input_dev, barom);
@@ -422,16 +456,17 @@ static int setup_regs(struct barometer_data *barom)
 	/* clear(power-down) device */
 	err = i2c_smbus_write_byte_data(barom->client,
 					CTRL_REG1, 0x00);
-	if (err < 0)
+	if (err < 0) {
 		dev_err(barom->dev, "%s: power-down failed\n", __func__);
+		goto exit;
+	}
 
 	/* set higher precision */
 	err = i2c_smbus_write_byte_data(barom->client,
 					RES_CONF, default_regs[1]);
 	if (err < 0)
-		dev_err(barom->dev, "%s: higher precision failed\n",
-		__func__);
-
+		dev_err(barom->dev, "%s: higher precision failed\n", __func__);
+exit:
 	return err;
 }
 
@@ -625,6 +660,7 @@ static int barometer_resume(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct barometer_data *barom = i2c_get_clientdata(client);
+	int err = 0;
 
 	if (barom->enabled) {
 		err = barometer_enable(barom);
@@ -633,13 +669,14 @@ static int barometer_resume(struct device *dev)
 			__func__);
 	}
 
-	return 0;
+	return err;
 }
 
 static int barometer_suspend(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct barometer_data *barom = i2c_get_clientdata(client);
+	int err = 0;
 
 	if (barom->enabled) {
 		err = barometer_disable(barom);
@@ -648,7 +685,7 @@ static int barometer_suspend(struct device *dev)
 			__func__);
 	}
 
-	return 0;
+	return err;
 }
 
 static const struct i2c_device_id barometer_id[] = {

@@ -25,6 +25,8 @@
  *	bit 19..20 - SLPM direction
  *	bit 21..22 - SLPM Value (if output)
  *	bit 23..25 - PDIS value (if input)
+ *	bit	26 - Gpio mode
+ *	bit	27 - Sleep mode
  *
  * to facilitate the definition, the following macros are provided
  *
@@ -123,6 +125,19 @@ typedef unsigned long pin_cfg_t;
 #define PIN_LOWEMI(x)		(((x) & PIN_LOWEMI_MASK) >> PIN_LOWEMI_SHIFT)
 #define PIN_LOWEMI_DISABLED	(0 << PIN_LOWEMI_SHIFT)
 #define PIN_LOWEMI_ENABLED	(1 << PIN_LOWEMI_SHIFT)
+
+#define PIN_GPIOMODE_SHIFT	26
+#define PIN_GPIOMODE_MASK	(0x1 << PIN_GPIOMODE_SHIFT)
+#define PIN_GPIOMODE(x)		(((x) & PIN_GPIOMODE_MASK) >> PIN_GPIOMODE_SHIFT)
+#define PIN_GPIOMODE_DISABLED	(0 << PIN_GPIOMODE_SHIFT)
+#define PIN_GPIOMODE_ENABLED	(1 << PIN_GPIOMODE_SHIFT)
+
+#define PIN_SLEEPMODE_SHIFT	27
+#define PIN_SLEEPMODE_MASK	(0x1 << PIN_SLEEPMODE_SHIFT)
+#define PIN_SLEEPMODE(x)	(((x) & PIN_SLEEPMODE_MASK) >> PIN_SLEEPMODE_SHIFT)
+#define PIN_SLEEPMODE_DISABLED	(0 << PIN_SLEEPMODE_SHIFT)
+#define PIN_SLEEPMODE_ENABLED	(1 << PIN_SLEEPMODE_SHIFT)
+
 
 /* Shortcuts.  Use these instead of separate DIR, PULL, and VAL.  */
 #define PIN_INPUT_PULLDOWN	(PIN_DIR_INPUT | PIN_PULL_DOWN)

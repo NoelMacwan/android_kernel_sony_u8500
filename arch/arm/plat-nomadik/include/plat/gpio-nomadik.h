@@ -9,8 +9,9 @@
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
  */
-#ifndef __GPIO_NOMADIK_H
-#define __GPIO_NOMADIK_H
+
+#ifndef __PLAT_NOMADIK_GPIO
+#define __PLAT_NOMADIK_GPIO
 
 /*
  * "nmk_gpio" and "NMK_GPIO" stand for "Nomadik GPIO", leaving
@@ -37,12 +38,20 @@
 #define NMK_GPIO_RWIMSC	0x50
 #define NMK_GPIO_FWIMSC	0x54
 #define NMK_GPIO_WKS	0x58
+#define NMK_GPIO_EDGELEVEL 0x5C
+#define NMK_GPIO_LEVEL	0x60
 
 /* Alternate functions: function C is set in hw by setting both A and B */
 #define NMK_GPIO_ALT_GPIO	0
 #define NMK_GPIO_ALT_A	1
 #define NMK_GPIO_ALT_B	2
 #define NMK_GPIO_ALT_C	(NMK_GPIO_ALT_A | NMK_GPIO_ALT_B)
+
+#define NMK_GPIO_ALT_CX_SHIFT 2
+#define NMK_GPIO_ALT_C1	((1<<NMK_GPIO_ALT_CX_SHIFT) | NMK_GPIO_ALT_C)
+#define NMK_GPIO_ALT_C2	((2<<NMK_GPIO_ALT_CX_SHIFT) | NMK_GPIO_ALT_C)
+#define NMK_GPIO_ALT_C3	((3<<NMK_GPIO_ALT_CX_SHIFT) | NMK_GPIO_ALT_C)
+#define NMK_GPIO_ALT_C4	((4<<NMK_GPIO_ALT_CX_SHIFT) | NMK_GPIO_ALT_C)
 
 /* Pull up/down values */
 enum nmk_gpio_pull {
@@ -85,4 +94,4 @@ struct nmk_gpio_platform_data {
 	bool supports_sleepmode;
 };
 
-#endif
+#endif /* __PLAT_NOMADIK_GPIO */

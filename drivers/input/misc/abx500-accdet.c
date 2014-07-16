@@ -30,10 +30,10 @@
 #include <sound/soc.h>
 #include <sound/jack.h>
 
-#ifdef CONFIG_SND_SOC_UX500_AB8500
+#ifdef CONFIG_SND_SOC_UX500_AB850X
 #include <sound/ux500_ab8500.h>
 #else
-#define ux500_ab8500_jack_report(i)
+#define ux500_ab850x_jack_report(i)
 #endif
 
 /* Unique value used to identify Headset button input device */
@@ -46,22 +46,6 @@
 
 /* After being loaded, how fast the first check is to be made */
 #define INIT_DELAY_MS			3000
-
-/* Voltage limits (mV) for various types of AV Accessories */
-#define ACCESSORY_DET_VOL_DONTCARE	-1
-#define ACCESSORY_HEADPHONE_DET_VOL_MIN	0
-#define ACCESSORY_HEADPHONE_DET_VOL_MAX	40
-#define ACCESSORY_U_HEADSET_DET_VOL_MIN	47
-#define ACCESSORY_U_HEADSET_DET_VOL_MAX	732
-#define ACCESSORY_U_HEADSET_ALT_DET_VOL_MIN	25
-#define ACCESSORY_U_HEADSET_ALT_DET_VOL_MAX	50
-#define ACCESSORY_CARKIT_DET_VOL_MIN	1100
-#define ACCESSORY_CARKIT_DET_VOL_MAX	1300
-#define ACCESSORY_HEADSET_DET_VOL_MIN	1301
-#define ACCESSORY_HEADSET_DET_VOL_MAX	2000
-#define ACCESSORY_OPENCABLE_DET_VOL_MIN	2001
-#define ACCESSORY_OPENCABLE_DET_VOL_MAX	2150
-
 
 /* Macros */
 
@@ -83,92 +67,19 @@
 static void config_accdetect(struct abx500_ad *dd);
 static enum accessory_jack_type detect(struct abx500_ad *dd, int *required_det);
 
-/* Static data initialization */
-static struct accessory_detect_task detect_ops[] = {
-	{
-		.type = JACK_TYPE_DISCONNECTED,
-		.typename = "DISCONNECTED",
-		.meas_mv = 1,
-		.req_det_count = 1,
-		.minvol = ACCESSORY_DET_VOL_DONTCARE,
-		.maxvol = ACCESSORY_DET_VOL_DONTCARE,
-		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
-		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
-	},
-	{
-		.type = JACK_TYPE_HEADPHONE,
-		.typename = "HEADPHONE",
-		.meas_mv = 1,
-		.req_det_count = 1,
-		.minvol = ACCESSORY_HEADPHONE_DET_VOL_MIN,
-		.maxvol = ACCESSORY_HEADPHONE_DET_VOL_MAX,
-		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
-		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
-	},
-	{
-		.type = JACK_TYPE_UNSUPPORTED_HEADSET,
-		.typename = "UNSUPPORTED HEADSET",
-		.meas_mv = 1,
-		.req_det_count = 2,
-		.minvol = ACCESSORY_U_HEADSET_DET_VOL_MIN,
-		.maxvol = ACCESSORY_U_HEADSET_DET_VOL_MAX,
-		.alt_minvol = ACCESSORY_U_HEADSET_ALT_DET_VOL_MIN,
-		.alt_maxvol = ACCESSORY_U_HEADSET_ALT_DET_VOL_MAX
-	},
-	{
-		.type = JACK_TYPE_OPENCABLE,
-		.typename = "OPENCABLE",
-		.meas_mv = 0,
-		.req_det_count = 4,
-		.minvol = ACCESSORY_OPENCABLE_DET_VOL_MIN,
-		.maxvol = ACCESSORY_OPENCABLE_DET_VOL_MAX,
-		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
-		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
-	},
-	{
-		.type = JACK_TYPE_CARKIT,
-		.typename = "CARKIT",
-		.meas_mv = 1,
-		.req_det_count = 1,
-		.minvol = ACCESSORY_CARKIT_DET_VOL_MIN,
-		.maxvol = ACCESSORY_CARKIT_DET_VOL_MAX,
-		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
-		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
-	},
-	{
-		.type = JACK_TYPE_HEADSET,
-		.typename = "HEADSET",
-		.meas_mv = 0,
-		.req_det_count = 2,
-		.minvol = ACCESSORY_HEADSET_DET_VOL_MIN,
-		.maxvol = ACCESSORY_HEADSET_DET_VOL_MAX,
-		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
-		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
-	},
-	{
-		.type = JACK_TYPE_CONNECTED,
-		.typename = "CONNECTED",
-		.meas_mv = 0,
-		.req_det_count = 4,
-		.minvol = ACCESSORY_DET_VOL_DONTCARE,
-		.maxvol = ACCESSORY_DET_VOL_DONTCARE,
-		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
-		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
-	}
-};
-
 static struct accessory_irq_descriptor *abx500_accdet_irq_desc;
 
 /*
  * textual represenation of the accessory type
  */
-static const char *accessory_str(enum accessory_jack_type type)
+static const char *accessory_str(struct abx500_ad *dd,
+		enum accessory_jack_type type)
 {
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(detect_ops); i++)
-		if (type == detect_ops[i].type)
-			return detect_ops[i].typename;
+	for (i = 0; i < dd->detect_ops_array_size; i++)
+		if (type == dd->detect_ops[i].type)
+			return dd->detect_ops[i].typename;
 
 	return "UNKNOWN?";
 }
@@ -304,7 +215,7 @@ void report_jack_status(struct abx500_ad *dd)
 	dd->reported_jack_type = dd->jack_type;
 
 	dev_dbg(&dd->pdev->dev, "Accessory: %s\n",
-		accessory_str(dd->jack_type));
+		accessory_str(dd, dd->jack_type));
 
 	/* Never report unsupported headset */
 	if (dd->jack_type == JACK_TYPE_UNSUPPORTED_HEADSET)
@@ -322,7 +233,7 @@ void report_jack_status(struct abx500_ad *dd)
 	else
 		set_android_switch_state(1);
 
-	ux500_ab8500_jack_report(value);
+	ux500_ab850x_jack_report(value);
 
 out: return;
 }
@@ -400,7 +311,7 @@ static void detect_work(struct work_struct *work)
 	dev_dbg(&dd->pdev->dev, "%s: Enter\n", __func__);
 
 	if (dd->set_av_switch)
-		dd->set_av_switch(dd, AUDIO_IN);
+		dd->set_av_switch(dd, AUDIO_IN, false);
 
 	new_type = detect(dd, &req_det_count);
 
@@ -583,10 +494,10 @@ static enum accessory_jack_type detect(struct abx500_ad *dd,
 	/* enable the VAMIC1 regulator */
 	dd->config_hw_test_basic_carkit(dd, 0);
 
-	for (i = 0; i < ARRAY_SIZE(detect_ops); ++i) {
-		if (detect_hw(dd, &detect_ops[i])) {
-			type = detect_ops[i].type;
-			*req_det_count = detect_ops[i].req_det_count;
+	for (i = 0; i < dd->detect_ops_array_size; ++i) {
+		if (detect_hw(dd, &dd->detect_ops[i])) {
+			type = dd->detect_ops[i].type;
+			*req_det_count = dd->detect_ops[i].req_det_count;
 			break;
 		}
 	}
@@ -696,12 +607,12 @@ static void config_accdetect(struct abx500_ad *dd)
 		release_irq(dd, BUTTON_PRESS_IRQ);
 		release_irq(dd, BUTTON_RELEASE_IRQ);
 		if (dd->set_av_switch)
-			dd->set_av_switch(dd, NOT_SET);
+			dd->set_av_switch(dd, NOT_SET, false);
 		break;
 
 	case JACK_TYPE_DISCONNECTED:
 	if (dd->set_av_switch)
-		dd->set_av_switch(dd, NOT_SET);
+		dd->set_av_switch(dd, NOT_SET, false);
 	case JACK_TYPE_HEADPHONE:
 		dd->config_accdetect1_hw(dd, 1);
 		dd->config_accdetect2_hw(dd, 0);
@@ -721,7 +632,7 @@ static void config_accdetect(struct abx500_ad *dd)
 		release_irq(dd, BUTTON_PRESS_IRQ);
 		release_irq(dd, BUTTON_RELEASE_IRQ);
 		if (dd->set_av_switch)
-			dd->set_av_switch(dd, NOT_SET);
+			dd->set_av_switch(dd, AUDIO_IN, true);
 		break;
 
 	case JACK_TYPE_CONNECTED:
@@ -766,7 +677,9 @@ static void init_work(struct work_struct *work)
 static int abx500_accessory_init(struct platform_device *pdev)
 {
 	int ret;
-	struct abx500_ad *dd = (struct abx500_ad *)pdev->id_entry->driver_data;
+	const struct platform_device_id *platid = platform_get_device_id(pdev);
+
+	struct abx500_ad *dd = (struct abx500_ad *)platid->driver_data;
 
 	dev_dbg(&pdev->dev, "Enter: %s\n", __func__);
 
@@ -808,6 +721,24 @@ static int abx500_accessory_init(struct platform_device *pdev)
 			dev_err(&pdev->dev, "%s: Get mic ctrl GPIO"
 					"failed.\n", __func__);
 			goto mic_ctrl_fail;
+		}
+	}
+
+	if (dd->pdata->nahj_ctrl) {
+		ret = gpio_is_valid(dd->pdata->nahj_ctrl);
+		if (!ret) {
+			dev_err(&pdev->dev,
+				"%s: nahj ctrl GPIO invalid (%d).\n", __func__,
+						dd->pdata->nahj_ctrl);
+
+			goto nahj_fail;
+		}
+		ret = gpio_request(dd->pdata->nahj_ctrl,
+				"nahj Control");
+	       if (ret)	{
+			dev_err(&pdev->dev, "%s: Get nahj GPIO"
+					"failed.\n", __func__);
+			goto nahj_fail;
 		}
 	}
 
@@ -854,6 +785,9 @@ fail_no_mem_for_wq:
 fail_no_regulators:
 	input_unregister_device(dd->btn_input_dev);
 fail_no_btn_input_dev:
+	if (dd->pdata->nahj_ctrl)
+		gpio_free(dd->pdata->nahj_ctrl);
+nahj_fail:
 	if (dd->pdata->mic_ctrl)
 		gpio_free(dd->pdata->mic_ctrl);
 mic_ctrl_fail:
@@ -871,6 +805,9 @@ static void abx500_accessory_cleanup(struct abx500_ad *dd)
 
 	dd->jack_type = JACK_TYPE_UNSPECIFIED;
 	config_accdetect(dd);
+
+	if (dd->pdata->nahj_ctrl)
+		gpio_free(dd->pdata->nahj_ctrl);
 
 	if (dd->pdata->mic_ctrl)
 		gpio_free(dd->pdata->mic_ctrl);
@@ -971,7 +908,7 @@ static int abx500_acc_detect_resume(struct device *dev)
 	}
 
 	/* After resume, reinitialize */
-	dd->gpio35_dir_set = dd->accdet1_th_set = dd->accdet2_th_set = 0;
+	dd->accdet1_th_set = dd->accdet2_th_set = 0;
 	queue_delayed_work(dd->irq_work_queue, &dd->init_work, 0);
 
 	return 0;
@@ -982,9 +919,6 @@ static int abx500_acc_detect_resume(struct device *dev)
 #endif
 
 static struct platform_device_id abx500_accdet_ids[] = {
-#ifdef CONFIG_INPUT_AB5500_ACCDET
-	{ "ab5500-acc-det", (kernel_ulong_t)&ab5500_accessory_det_callbacks, },
-#endif
 #ifdef CONFIG_INPUT_AB8500_ACCDET
 	{ "ab8500-acc-det", (kernel_ulong_t)&ab8500_accessory_det_callbacks, },
 #endif

@@ -8,14 +8,15 @@
  * on U8500 which uses Shared Memroy as IPC between Application
  * Processor and Modem processor.
  */
+#include <linux/module.h>
 #include <linux/modem/modem.h>
 #include <linux/platform_device.h>
 #include <linux/err.h>
 #include <linux/mfd/dbx500-prcmu.h>
 
-static void u8500_modem_request(struct modem_dev *mdev)
+static int u8500_modem_request(struct modem_dev *mdev)
 {
-	prcmu_ac_wake_req();
+	return prcmu_ac_wake_req();
 }
 
 static void u8500_modem_release(struct modem_dev *mdev)

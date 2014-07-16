@@ -1,6 +1,5 @@
 /*
  * Copyright (C) ST-Ericsson SA 2011
- * Copyright (C) 2012 Sony Mobile Communications AB.
  *
  * Display overlay compositer device driver
  *
@@ -11,12 +10,10 @@
  * for ST-Ericsson.
  *
  * License terms: GNU General Public License (GPL), version 2.
- *
- * NOTE: This file has been modified by Sony Mobile Communications AB.
- * Modifications are licensed under the License.
  */
 
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/err.h>
 #include <linux/slab.h>
@@ -27,14 +24,10 @@
 #include <linux/mutex.h>
 #include <linux/ioctl.h>
 #include <linux/sched.h>
-
 #include <linux/compdev.h>
 #include <linux/compdev_util.h>
 #include <linux/hwmem.h>
 #include <linux/mm.h>
-#include <video/mcde_dss.h>
-#include <video/mcde.h>
-#include <video/b2r2_blt.h>
 #include <linux/workqueue.h>
 #include <linux/completion.h>
 #include <linux/kref.h>
@@ -42,6 +35,10 @@
 #ifdef CONFIG_HAS_EARLYSUSPEND
 #include <linux/earlysuspend.h>
 #endif
+
+#include <video/mcde_dss.h>
+#include <video/mcde.h>
+#include <video/b2r2_blt.h>
 
 #define NUM_COMPDEV_BUFS 2
 
@@ -101,7 +98,6 @@ struct compdev {
 	struct compdev_img *pimages[NUM_COMPDEV_BUFS];
 	enum compdev_transform  mcde_transform;
 	enum compdev_transform  saved_reuse_fb_transform;
-	bool mcde_transform_set;
 	struct compdev_display_work *display_work;
 	struct completion fence;
 	void *cb_data;
@@ -245,6 +241,7 @@ static int disable_overlay(struct mcde_overlay *ovly)
 	if (info.paddr != 0) {
 		/* Set the pointer to zero to disable the overlay */
 		info.paddr = 0;
+		info.kaddr = 0;
 		mcde_dss_apply_overlay(ovly, &info);
 	}
 	return 0;
@@ -287,6 +284,92 @@ static enum mcde_ovly_pix_fmt get_ovly_fmt(enum compdev_fmt fmt)
 	}
 }
 
+static int to_degree(enum compdev_transform transform)
+{
+	switch (transform) {
+	case COMPDEV_TRANSFORM_ROT_270_CW:
+		return 270;
+	case COMPDEV_TRANSFORM_ROT_180:
+		return 180;
+	case COMPDEV_TRANSFORM_ROT_90_CW:
+	case COMPDEV_TRANSFORM_ROT_90_CW_FLIP_H:
+	case COMPDEV_TRANSFORM_ROT_90_CW_FLIP_V:
+		return 90;
+	case COMPDEV_TRANSFORM_ROT_0:
+	default:
+		return 0;
+	}
+}
+
+static enum mcde_display_rotation to_mcde_rotation(int degrees)
+{
+#if defined(CONFIG_MCDE_DISPLAY_BAMBOOK)
+	switch (degrees) {
+	case 90:
+		return MCDE_DISPLAY_ROT_270_CW;
+	case 180:
+		return MCDE_DISPLAY_ROT_0;
+	case 270:
+		return MCDE_DISPLAY_ROT_90_CW;
+	default:
+		return MCDE_DISPLAY_ROT_180;
+	}
+#else
+	switch (degrees) {
+	case 90:
+		return MCDE_DISPLAY_ROT_90_CW;
+	case 180:
+		return MCDE_DISPLAY_ROT_180;
+	case 270:
+		return MCDE_DISPLAY_ROT_270_CW;
+	default:
+		return MCDE_DISPLAY_ROT_0;
+	}
+#endif
+}
+
+static enum compdev_transform to_transform(int degrees)
+{
+	switch (degrees) {
+	case 270:
+		return COMPDEV_TRANSFORM_ROT_270_CW;
+	case 180:
+		return COMPDEV_TRANSFORM_ROT_180;
+	case 90:
+		return COMPDEV_TRANSFORM_ROT_90_CW;
+	default:
+		return COMPDEV_TRANSFORM_ROT_0;
+	}
+}
+
+enum compdev_transform extract_rotation(enum compdev_transform transform)
+{
+	switch (transform) {
+	case COMPDEV_TRANSFORM_ROT_90_CW:
+	case COMPDEV_TRANSFORM_ROT_90_CW_FLIP_H:
+	case COMPDEV_TRANSFORM_ROT_90_CW_FLIP_V:
+		return COMPDEV_TRANSFORM_ROT_90_CW;
+	case COMPDEV_TRANSFORM_ROT_90_CCW:
+		return COMPDEV_TRANSFORM_ROT_90_CCW;
+	default:
+		return COMPDEV_TRANSFORM_ROT_0;
+	}
+}
+
+enum compdev_transform extract_transform(enum compdev_transform transform)
+{
+	switch (transform) {
+	case COMPDEV_TRANSFORM_FLIP_H:
+	case COMPDEV_TRANSFORM_ROT_90_CW_FLIP_H:
+		return COMPDEV_TRANSFORM_FLIP_H;
+	case COMPDEV_TRANSFORM_FLIP_V:
+	case COMPDEV_TRANSFORM_ROT_90_CW_FLIP_V:
+		return COMPDEV_TRANSFORM_FLIP_V;
+	default:
+		return COMPDEV_TRANSFORM_ROT_0;
+	}
+}
+
 static int compdev_setup_ovly(struct compdev_img *img,
 		struct compdev_buffer *buffer,
 		struct mcde_overlay *ovly,
@@ -301,6 +384,7 @@ static int compdev_setup_ovly(struct compdev_img *img,
 	size_t mem_chunk_length = 1;
 	struct hwmem_region rgn = { .offset = 0, .count = 1, .start = 0 };
 	struct mcde_overlay_info info;
+	enum compdev_transform tot_trans;
 
 	if (img->buf.type == COMPDEV_PTR_HWMEM_BUF_NAME_OFFSET) {
 		buffer->paddr = 0;
@@ -317,8 +401,7 @@ static int compdev_setup_ovly(struct compdev_img *img,
 				&access);
 
 		if (!(access & HWMEM_ACCESS_READ) ||
-				!(memtype == HWMEM_MEM_CONTIGUOUS_SYS ||
-				memtype == HWMEM_MEM_PROTECTED_SYS)) {
+				memtype == HWMEM_MEM_SCATTERED_SYS) {
 			ret = -EACCES;
 			dev_warn(dss_ctx->dev,
 				"Invalid_mem overlay, %d\n", ret);
@@ -350,7 +433,10 @@ static int compdev_setup_ovly(struct compdev_img *img,
 	info.fmt = get_ovly_fmt(img->fmt);
 	info.dst_z = z_order;
 
-	if ((mcde_transform ^ img->transform) & COMPDEV_TRANSFORM_ROT_90_CW) {
+	tot_trans = to_transform((to_degree(mcde_transform)
+			+ to_degree(img->transform)) % 360);
+
+	if (tot_trans & COMPDEV_TRANSFORM_ROT_90_CW) {
 		info.dst_x = img->dst_rect.y;
 		info.dst_y = img->dst_rect.x;
 		info.w = img->dst_rect.height;
@@ -371,6 +457,11 @@ static int compdev_setup_ovly(struct compdev_img *img,
 	info.paddr = buffer->paddr + img->pitch * img->src_rect.y +
 		img->src_rect.x * (compdev_get_bpp(img->fmt) >> 3);
 
+	if (img->buf.type == COMPDEV_PTR_HWMEM_BUF_NAME_OFFSET)
+		info.kaddr = hwmem_kmap(buffer->alloc);
+	else
+		info.kaddr = 0; /* requires an ioremap at dump time */
+
 	mcde_dss_apply_overlay(ovly, &info);
 	return ret;
 
@@ -383,26 +474,6 @@ invalid_mem:
 
 resolve_failed:
 	return ret;
-}
-
-static enum mcde_display_rotation to_mcde_rotation(
-		enum compdev_transform transform)
-{
-	/* FIXME: Needs description of why CW equal CCW */
-	switch (transform) {
-	case COMPDEV_TRANSFORM_ROT_270_CW:
-		return MCDE_DISPLAY_ROT_270_CCW;
-	case COMPDEV_TRANSFORM_ROT_180:
-		return MCDE_DISPLAY_ROT_180_CCW;
-	case COMPDEV_TRANSFORM_ROT_90_CW:
-	case COMPDEV_TRANSFORM_ROT_90_CW_FLIP_H:
-	case COMPDEV_TRANSFORM_ROT_90_CW_FLIP_V:
-		return MCDE_DISPLAY_ROT_90_CCW;
-	case COMPDEV_TRANSFORM_ROT_0:
-		return MCDE_DISPLAY_ROT_0;
-	default:
-		return MCDE_DISPLAY_ROT_0;
-	}
 }
 
 static int compdev_update_rotation(struct dss_context *dss_ctx,
@@ -518,6 +589,15 @@ static int compdev_blt(struct compdev *cd,
 	req.global_alpha = 0xff;
 	req.flags = B2R2_BLT_FLAG_DITHER | B2R2_BLT_FLAG_ASYNCH;
 
+	dev_dbg(cd->dev, "%s: src_rect: x %d, y %d, w %d h %d\n",
+		__func__, req.src_rect.x, req.src_rect.y,
+		req.src_rect.width, req.src_rect.height);
+	dev_dbg(cd->dev, "%s: dst_rect: x %d, y %d, w %d h %d\n",
+		__func__, req.dst_rect.x, req.dst_rect.y,
+		req.dst_rect.width, req.dst_rect.height);
+	dev_dbg(cd->dev, "%s: img_trans 0x%02x, mcde_trans %d\n",
+		__func__, src_img->transform, cd->mcde_transform);
+
 	req_id = b2r2_blt_request(blt_handle, &req);
 	if (req_id < 0) {
 		dev_err(cd->dev,
@@ -530,15 +610,15 @@ static int compdev_blt(struct compdev *cd,
 
 static int compdev_post_buffers_dss(struct dss_context *dss_ctx,
 		struct compdev_img *img1, struct compdev_img *img2,
-		bool tripple_buffer, enum compdev_transform mcde_transform)
+		enum compdev_transform mcde_transform)
 {
 	int ret = 0;
 	int i = 0;
 
 	struct compdev_img *fb_img = NULL;
 	struct compdev_img *ovly_img = NULL;
-	int curr_rot = to_mcde_rotation(dss_ctx->current_buffer_transform);
-	int img_rot = to_mcde_rotation(mcde_transform);
+	int curr_rot = to_degree(dss_ctx->current_buffer_transform);
+	int img_rot = to_degree(mcde_transform);
 	bool update_ovly[] = {false, false};
 
 	/* Unpin the previous frame */
@@ -546,13 +626,14 @@ static int compdev_post_buffers_dss(struct dss_context *dss_ctx,
 
 	/* Set channel rotation */
 	if ((curr_rot != img_rot)) {
-		if (compdev_update_rotation(dss_ctx, img_rot) != 0)
+		if (compdev_update_rotation(dss_ctx,
+				to_mcde_rotation(img_rot)) == 0)
+			dss_ctx->current_buffer_transform = mcde_transform;
+		else
 			dev_warn(dss_ctx->dev,
 				"Failed to update MCDE rotation "
 				"(image rotation = %d), %d\n",
 				img_rot, ret);
-		else
-			dss_ctx->current_buffer_transform = mcde_transform;
 	}
 
 	if ((img1 != NULL) && (img1->flags & COMPDEV_OVERLAY_FLAG))
@@ -612,8 +693,7 @@ static int compdev_post_buffers_dss(struct dss_context *dss_ctx,
 	/* Do the display update */
 	for (i = 0; i < 2; i++) {
 		if (update_ovly[i]) {
-			mcde_dss_update_overlay(dss_ctx->ovly[i],
-					tripple_buffer);
+			mcde_dss_update_overlay(dss_ctx->ovly[i]);
 			break;
 		}
 	}
@@ -639,11 +719,11 @@ static void compdev_display_worker_function(struct work_struct *w)
 
 	if (dw->img_count == 1)
 		compdev_post_buffers_dss(dw->dss_ctx,
-				&dw->img1, NULL, false,
+				&dw->img1, NULL,
 				dw->mcde_transform);
 	else if (dw->img_count == 2)
 		compdev_post_buffers_dss(dw->dss_ctx,
-				&dw->img1, &dw->img2, false,
+				&dw->img1, &dw->img2,
 				dw->mcde_transform);
 
 	if (dw->img1_alloc != NULL) {
@@ -707,20 +787,6 @@ int compdev_add_display_work(struct compdev *cd,
 	return 0;
 }
 
-enum compdev_transform extract_rotation(enum compdev_transform src)
-{
-	/* Check if there is a 90 or 270 degree rotation */
-	if ((COMPDEV_TRANSFORM_ROT_90_CW & src)) {
-		if ((COMPDEV_TRANSFORM_FLIP_H & src) &&
-				(COMPDEV_TRANSFORM_FLIP_V & src))
-			return COMPDEV_TRANSFORM_ROT_90_CCW;
-		else
-			return COMPDEV_TRANSFORM_ROT_90_CW;
-	}
-
-	return src;
-}
-
 /* Determine if transform is needed */
 static bool transform_needed(struct compdev_img *src_img,
 		enum compdev_transform mcde_transform)
@@ -729,7 +795,11 @@ static bool transform_needed(struct compdev_img *src_img,
 	if (src_img->transform != COMPDEV_TRANSFORM_ROT_0)
 		return true;
 
-	/* Check scaling, notice that dst_rect is defined after mcde_transform */
+	/*
+	 * Check scaling, notice that dst_rect
+	 * is defined after mcde_transform
+	 */
+
 	if ((mcde_transform == COMPDEV_TRANSFORM_ROT_0 ||
 		mcde_transform == COMPDEV_TRANSFORM_ROT_180) &&
 		(src_img->src_rect.width != src_img->dst_rect.width ||
@@ -747,22 +817,15 @@ static bool transform_needed(struct compdev_img *src_img,
 	return false;
 }
 
+/* Remove GPU transform if using MCDE rotation */
 static void update_transform(struct compdev *cd,
 		struct compdev_img *src_img)
 {
 	if (cd->mcde_rotation) {
-		if (!cd->mcde_transform_set) {
-			cd->mcde_transform =
-					extract_rotation(src_img->transform);
-			if (src_img->transform != cd->mcde_transform)
-				dev_dbg(cd->dev,
-					"%s WARNING src_img->transform != "
-					"cd->mcde_transform WARNING\n",
-					__func__);
-			cd->mcde_transform_set = true;
-		}
-		/* Remove the mcde_transform from the src */
-		src_img->transform ^= cd->mcde_transform;
+		/* Remove the rotation from the src */
+		if (!(src_img->flags & COMPDEV_OVERLAY_FLAG))
+			src_img->transform =
+				extract_transform(src_img->transform);
 	}
 }
 
@@ -802,6 +865,7 @@ static void compdev_set_background_fb(
 		}
 	}
 }
+
 static int compdev_reuse_fb(struct compdev *cd, struct compdev_img **image1,
 		struct compdev_img **image2)
 {
@@ -832,6 +896,7 @@ static int compdev_reuse_fb(struct compdev *cd, struct compdev_img **image1,
 			 * image rotation. Clonedev needs this transform.
 			 */
 			enum compdev_transform tmp = cd->fb_image.transform;
+
 			cd->fb_image.transform = cd->saved_reuse_fb_transform;
 			cd->pb_cb(cd->cb_data, &cd->fb_image);
 			cd->fb_image.transform = tmp;
@@ -984,7 +1049,7 @@ static int compdev_post_buffer_locked(struct compdev *cd,
 
 			/* Do the refresh */
 			compdev_post_buffers_dss(&cd->dss_ctx,
-				img[0], img[1], true, cd->mcde_transform);
+					img[0], img[1], cd->mcde_transform);
 
 			/*
 			 * Free references to the temp buffers,
@@ -1010,12 +1075,11 @@ static int compdev_post_buffer_locked(struct compdev *cd,
 			cd->image_count = 0;
 			cd->pimages[0] = NULL;
 			cd->pimages[1] = NULL;
-			cd->mcde_transform_set = false;
 		}
 	} else {
 		if (cd->sync_count && !cd->s_info.reuse_fb_img)
 			cd->sync_count--;
-		/* Do a blanking of main display But only once to clear*/
+		/* Do a blanking of main display But only once to clear */
 		if (!cd->blanked && cd->s_info.img_count == 1) {
 			compdev_clear_screen_locked(cd);
 			cd->blanked = true;
@@ -1052,7 +1116,6 @@ static int compdev_post_single_buffer_asynch_locked(struct compdev *cd,
 
 	cd->sync_count = 0;
 	cd->image_count = 0;
-	cd->mcde_transform_set = false;
 
 	return 0;
 }
@@ -1077,7 +1140,6 @@ static int compdev_post_scene_info_locked(struct compdev *cd,
 	if (cd->mcde_rotation) {
 		if (cd->sync_count >= 1 || cd->s_info.reuse_fb_img) {
 			cd->mcde_transform = s_info->hw_transform;
-			cd->mcde_transform_set = true;
 		}
 	}
 
@@ -1145,7 +1207,7 @@ static int compdev_clear_screen_locked(struct compdev *cd)
 	/* disable all overlays and refresh update screen */
 	disable_overlay(cd->dss_ctx.ovly[0]);
 	disable_overlay(cd->dss_ctx.ovly[1]);
-	mcde_dss_update_overlay(cd->dss_ctx.ovly[0], false);
+	mcde_dss_update_overlay(cd->dss_ctx.ovly[0]);
 
 	return 0;
 }
@@ -1226,19 +1288,18 @@ static long compdev_ioctl(struct file *file,
 		mutex_unlock(&cd->lock);
 		break;
 	case COMPDEV_POST_SCENE_INFO_IOC:
-		mutex_lock(&cd->lock);
 		/* Get the user data */
 		if (copy_from_user(&s_info, (void *)arg, sizeof(s_info))) {
 			dev_warn(cd->dev,
 				"%s: copy_from_user failed\n",
 				__func__);
-			mutex_unlock(&cd->lock);
 			return -EFAULT;
 		}
 		mutex_lock(&cd->si_lock);
+		mutex_lock(&cd->lock);
 		ret = compdev_post_scene_info_locked(cd, &s_info);
-		mutex_unlock(&cd->si_lock);
 		mutex_unlock(&cd->lock);
+		mutex_unlock(&cd->si_lock);
 		break;
 	case COMPDEV_SET_VIDEO_MODE_IOC:
 		mutex_lock(&cd->lock);
@@ -1299,7 +1360,6 @@ static void init_compdev(struct compdev *cd)
 	cd->mdev.name = cd->name;
 	cd->mdev.fops = &compdev_fops;
 	cd->dev = cd->mdev.this_device;
-	cd->mcde_transform_set = false;
 	cd->fb_image_alloc = NULL;
 	cd->blanked = false;
 }
@@ -1323,7 +1383,7 @@ static int init_dss_context(struct dss_context *dss_ctx,
 	mutex_init(&dss_ctx->cache_ctx.janitor_lock);
 	dss_ctx->cache_ctx.janitor_thread = create_workqueue(wq_name);
 	if (!dss_ctx->cache_ctx.janitor_thread) {
-		mutex_destroy(&dss_ctx.cache_ctx.janitor_lock);
+		mutex_destroy(&dss_ctx->cache_ctx.janitor_lock);
 		return -ENOMEM;
 	}
 
@@ -1366,7 +1426,8 @@ int compdev_create(struct mcde_display_device *ddev,
 
 	cd->dev_index = dev_counter++;
 
-	snprintf(cd->name, sizeof(cd->name), "%s%d", COMPDEV_DEFAULT_DEVICE_PREFIX,
+	snprintf(cd->name, sizeof(cd->name), "%s%d",
+			COMPDEV_DEFAULT_DEVICE_PREFIX,
 			cd->dev_index);
 	init_compdev(cd);
 
@@ -1582,13 +1643,13 @@ int compdev_post_scene_info(struct compdev *cd,
 	if (cd == NULL)
 		return -ENOMEM;
 
+	mutex_lock(&cd->si_lock);
 	mutex_lock(&cd->lock);
 
-	mutex_lock(&cd->si_lock);
 	ret = compdev_post_scene_info_locked(cd, s_info);
-	mutex_unlock(&cd->si_lock);
 
 	mutex_unlock(&cd->lock);
+	mutex_unlock(&cd->si_lock);
 	return ret;
 }
 EXPORT_SYMBOL(compdev_post_scene_info);

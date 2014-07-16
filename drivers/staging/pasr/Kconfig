@@ -11,6 +11,11 @@ config PASR
 	  The role of this framework is to stop the refresh of unused memory to
 	  enhance DDR power consumption.
 
+config PASR_ENABLE
+	bool "Enable PASR"
+	def_bool n
+	depends on PASR
+
 config PASR_DEBUG
 	bool "Add PASR debug prints"
 	def_bool n
@@ -19,4 +24,14 @@ config PASR_DEBUG
 config UX500_PASR
 	bool "Ux500 Family PASR driver"
 	def_bool y
-	depends on (PASR && UX500_SOC_DB8500)
+	depends on (PASR_ENABLE && UX500_SOC_DB8500)
+
+config PASR_SYSFS
+	bool "Enable PASR sysfs"
+	def_bool y
+	depends on PASR_ENABLE
+
+config PASR_DEBUGFS
+	bool "Enable PASR debugfs"
+	def_bool n
+	depends on PASR_ENABLE

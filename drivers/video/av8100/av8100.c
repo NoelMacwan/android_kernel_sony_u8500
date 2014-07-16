@@ -32,6 +32,7 @@
 #include <linux/earlysuspend.h>
 #include <linux/mfd/dbx500-prcmu.h>
 #include <linux/spinlock.h>
+#include <linux/pinctrl/consumer.h>
 
 #include "av8100_regs.h"
 #include <video/av8100.h>
@@ -128,6 +129,7 @@
 #define HDMI_EDIDREAD_SIZE 0x7F
 #define HDCP_STATE_ENCRYPTION_ONGOING 7
 #define INT_CNT_MAX 100
+#define INFOFRAME_TYPE_AUDIO 0x84
 
 #define REG_16_8_LSB(p)		((u8)(p & 0xFF))
 #define REG_16_8_MSB(p)		((u8)((p & 0xFF00)>>8))
@@ -206,6 +208,7 @@ struct av8100_config {
 	struct av8100_hdcp_management_format_cmd
 		hdmi_hdcp_management_format_cmd;
 	struct av8100_infoframes_format_cmd	hdmi_infoframes_cmd;
+	struct av8100_infoframes_format_cmd	hdmi_audio_infoframe;
 	struct av8100_edid_section_readback_format_cmd
 		hdmi_edid_section_readback_cmd;
 	struct av8100_pattern_generator_format_cmd hdmi_pattern_generator_cmd;
@@ -243,6 +246,10 @@ struct av8100_params {
 	bool busy;
 	u8 hdcp_state;
 	bool pwr_recover;
+	/* Two optional pin states - default & sleep */
+	struct pinctrl *pinctrl;
+	struct pinctrl_state *pins_default;
+	struct pinctrl_state *pins_sleep;
 };
 
 /**
@@ -479,8 +486,8 @@ static const struct av8100_cea av8100_all_cea[29] = {
 	0,	"-",	1792,	1360,	48,	32,	10,	85500000,
 	"+",	0,	0,	0,	0,	0},/*Settings to be define*/
 { "28 VESA 81      1366x768 @ 60 Hz     ",
-	181,	798,	768,	30,	5,
-	0,	"+",	1792,	1366,	72,	136,	10,	85750000,
+	181,	798,	768,	25,	5,
+	0,	"+",	1776,	1360,	208,	208,	0,	85000000,
 	"-",	0,	0,	0,	0,	0} /*Settings to be define*/
 };
 
@@ -800,9 +807,9 @@ static void to_scan_mode_2(struct av8100_device *adev)
 	/* Remove APE OPP requirement */
 	if (adev->params.opp_requested) {
 		prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP,
-				(char *)adev->miscdev.name);
+				adev->miscdev.name);
 		prcmu_qos_remove_requirement(PRCMU_QOS_DDR_OPP,
-				(char *)adev->miscdev.name);
+				adev->miscdev.name);
 		adev->params.opp_requested = false;
 	}
 
@@ -1102,11 +1109,8 @@ static void av8100_powerdown_timer_event_handle(struct av8100_device *adev)
 {
 	dev_dbg(adev->dev, "Tpwrdown\n");
 
-	/* Power down only if suspended and audio is not a user. */
-	if ((adev->params.suspended) && (!adev->usr_audio))
+	if (!adev->usr_audio)
 		(void)av8100_powerdown();
-	else
-		dev_dbg(adev->dev, "Tpwrdown no action\n");
 }
 
 static int cci_handle(struct av8100_device *adev, u8 hpdi)
@@ -1938,8 +1942,8 @@ static int read_single_byte(struct i2c_client *client, u8 reg, u8 *val)
 
 	value = i2c_smbus_read_byte_data(client, reg);
 	if (value < 0) {
-		dev_dbg(dev, "i2c smbus read byte failed,read data = %x "
-			"from offset:%x\n" , value, reg);
+		dev_dbg(dev, "i2c smbus read byte failed,read data = %x from offset:%x\n",
+							value, reg);
 		return -EFAULT;
 	}
 
@@ -2258,9 +2262,26 @@ static int configuration_infoframe_get(struct av8100_device *adev,
 	buffer[2] = adev->config.hdmi_infoframes_cmd.length;
 	buffer[3] = adev->config.hdmi_infoframes_cmd.crc;
 	memcpy(&buffer[4], adev->config.hdmi_infoframes_cmd.data,
-	HDMI_INFOFRAME_DATA_SIZE);
+					HDMI_INFOFRAME_DATA_SIZE);
 
 	*length = adev->config.hdmi_infoframes_cmd.length + 4;
+	return 0;
+}
+
+static int configuration_audio_infoframe_get(struct av8100_device *adev,
+			char *buffer, unsigned int *length)
+{
+	buffer[0] = adev->config.hdmi_audio_infoframe.type;
+	if (buffer[0] != INFOFRAME_TYPE_AUDIO)
+		return -EINVAL;
+
+	buffer[1] = adev->config.hdmi_audio_infoframe.version;
+	buffer[2] = adev->config.hdmi_audio_infoframe.length;
+	buffer[3] = adev->config.hdmi_audio_infoframe.crc;
+	memcpy(&buffer[4], adev->config.hdmi_audio_infoframe.data,
+					HDMI_INFOFRAME_DATA_SIZE);
+
+	*length = adev->config.hdmi_audio_infoframe.length + 4;
 	return 0;
 }
 
@@ -2356,6 +2377,7 @@ static int get_command_return_data(struct i2c_client *i2c,
 	case AV8100_COMMAND_DENC:
 	case AV8100_COMMAND_HDMI:
 	case AV8100_COMMAND_INFOFRAMES:
+	case AV8100_COMMAND_AUDIO_INFOFRAME:
 	case AV8100_COMMAND_PATTERNGENERATOR:
 		/* Get the second return byte */
 		retval = read_single_byte(i2c,
@@ -2658,8 +2680,14 @@ static int av8100_powerup1(struct av8100_device *adev)
 	int retval;
 	struct av8100_platform_data *pdata = adev->dev->platform_data;
 
-	if (pdata->init())
-		return -EFAULT;
+	/* Optionaly enable pins to be muxed in and configured */
+	if (!IS_ERR(adev->params.pins_default)) {
+		retval = pinctrl_select_state(adev->params.pinctrl,
+				adev->params.pins_default);
+		if (retval)
+			dev_err(adev->dev,
+				"could not set default pins\n");
+	}
 
 	/* Regulator enable */
 	if ((adev->params.regulator_pwr) &&
@@ -2880,23 +2908,20 @@ av8100_powerscan_end:
 
 static void put_handle(struct av8100_device *adev)
 {
-	bool powerscan = false;
-
-	if ((adev->params.pwr_recover) && (!adev->usr_audio)) {
-		adev->params.pwr_recover = false;
+	if (adev->params.suspended) {
+		adev->params.disp_on = false;
 		av8100_powerdown();
-		usleep_range(AV8100_WAITTIME_5MS,
-				AV8100_WAITTIME_5MS_MAX);
-		av8100_powerup();
-
-		powerscan = true;
-	} else if (adev->params.suspended) {
-		powerscan = true;
+	} else if (adev->params.plug_state == AV8100_UNPLUGGED) {
+		if (adev->params.pwr_recover) {
+			adev->params.pwr_recover = false;
+			av8100_powerdown();
+			usleep_range(AV8100_WAITTIME_5MS,
+					AV8100_WAITTIME_5MS_MAX);
+			av8100_powerup();
+			if (av8100_powerscan(true))
+				dev_err(adev->dev, "av8100_powerscan failed\n");
+		}
 	}
-
-	if (powerscan)
-		if (av8100_powerscan(true))
-			dev_err(adev->dev, "av8100_powerscan failed\n");
 }
 
 int av8100_hdmi_get(enum av8100_hdmi_user user)
@@ -3169,9 +3194,9 @@ int av8100_powerdown(void)
 	/* Remove APE OPP requirement */
 	if (adev->params.opp_requested) {
 		prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP,
-				(char *)adev->miscdev.name);
+				adev->miscdev.name);
 		prcmu_qos_remove_requirement(PRCMU_QOS_DDR_OPP,
-				(char *)adev->miscdev.name);
+				adev->miscdev.name);
 		adev->params.opp_requested = false;
 	}
 
@@ -3195,10 +3220,17 @@ int av8100_powerdown(void)
 		adev->params.regulator_requested = false;
 	}
 
+	/* Optionally let pins go into sleep states */
+	if (!IS_ERR(adev->params.pins_sleep)) {
+		retval = pinctrl_select_state(adev->params.pinctrl,
+				adev->params.pins_sleep);
+		if (retval)
+			dev_err(adev->dev,
+				"could not set pins to sleep state\n");
+	}
+
 	if (pdata->alt_powerupseq)
 		usleep_range(AV8100_WAITTIME_5MS, AV8100_WAITTIME_5MS_MAX);
-
-	pdata->exit();
 
 av8100_powerdown_end:
 	return retval;
@@ -3284,16 +3316,16 @@ int av8100_download_firmware(enum interface_type if_type)
 	/* Request 100% APE OPP */
 	if (adev->params.opp_requested == false) {
 		if (prcmu_qos_add_requirement(PRCMU_QOS_APE_OPP,
-				(char *)adev->miscdev.name, 100)) {
+				adev->miscdev.name, 100)) {
 			dev_err(adev->dev, "APE OPP 100 failed\n");
 			retval = -EFAULT;
 			goto av8100_download_firmware_err;
 		}
 		if (prcmu_qos_add_requirement(PRCMU_QOS_DDR_OPP,
-				(char *)adev->miscdev.name, 100)) {
+				adev->miscdev.name, 100)) {
 			dev_err(adev->dev, "DDR OPP 100 failed\n");
 			prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP,
-					(char *)adev->miscdev.name);
+					adev->miscdev.name);
 			retval = -EFAULT;
 			goto av8100_download_firmware_err;
 		}
@@ -3330,8 +3362,8 @@ int av8100_download_firmware(enum interface_type if_type)
 		retval = -EFAULT;
 		goto av8100_download_firmware_err;
 	} else {
-		dev_dbg(adev->dev, "GENERAL_CONTROL_REG register fdl:%d "
-			"hld:%d wa:%d ra:%d\n", fdl, hld, wa, ra);
+		dev_dbg(adev->dev, "GENERAL_CONTROL_REG register fdl:%d hld:%d wa:%d ra:%d\n",
+							fdl, hld, wa, ra);
 	}
 
 	LOCK_AV8100_HW;
@@ -3344,8 +3376,7 @@ int av8100_download_firmware(enum interface_type if_type)
 				AV8100_FIRMWARE_DOWNLOAD_ENTRY, fw_buff + size,
 				increment);
 			if (retval) {
-				dev_dbg(adev->dev, "Failed to download the "
-					"av8100 firmware\n");
+				dev_dbg(adev->dev, "Failed to download the av8100 firmware\n");
 				UNLOCK_AV8100_HW;
 				retval = -EFAULT;
 				goto av8100_download_firmware_err;
@@ -4558,6 +4589,13 @@ int av8100_conf_prep(enum av8100_command_type command_type,
 		memcpy(&adev->config.hdmi_infoframes_cmd,
 			&config->infoframes_format,
 			sizeof(struct av8100_infoframes_format_cmd));
+		/* If Audio Infoframe: save for later usage */
+		if (adev->config.hdmi_infoframes_cmd.type ==
+						INFOFRAME_TYPE_AUDIO) {
+			memcpy(&adev->config.hdmi_audio_infoframe,
+				&config->infoframes_format,
+				sizeof(struct av8100_infoframes_format_cmd));
+		}
 		break;
 
 	case AV8100_COMMAND_EDID_SECTION_READBACK:
@@ -4698,11 +4736,22 @@ int av8100_conf_w(enum av8100_command_type command_type,
 		configuration_fuse_aes_key_get(adev, cmd_buffer, &cmd_length);
 		break;
 
+	case AV8100_COMMAND_AUDIO_INFOFRAME:
+		PRNK_MODE(AV8100_COMMAND_AUDIO_INFOFRAME);
+		command_type = AV8100_COMMAND_INFOFRAMES;
+		if (configuration_audio_infoframe_get(adev, cmd_buffer,
+								&cmd_length))
+			retval = -EINVAL;
+		break;
+
 	default:
 		dev_dbg(adev->dev, "Invalid command type\n");
 		retval = -EFAULT;
 		break;
 	}
+
+	if (retval)
+		return retval;
 
 	LOCK_AV8100_HW;
 
@@ -4947,6 +4996,26 @@ bool av8100_encryption_ongoing(void)
 }
 EXPORT_SYMBOL(av8100_encryption_ongoing);
 
+void av8100_video_mode_changed(void)
+{
+	/*
+	 * Resolution has been changed. If audio is a user, Audio Infoframe
+	 * shall be reconfigured, since HDMI has been off when changing
+	 * video_mode.
+	 */
+	struct av8100_device *adev;
+
+	adev = devnr_to_adev(AV8100_DEVNR_DEFAULT);
+	if (!adev || !adev->usr_audio)
+		return;
+
+	/* Reconfigure Audio Infoframe with latest config data */
+	if (av8100_conf_w(AV8100_COMMAND_AUDIO_INFOFRAME, NULL, NULL,
+							I2C_INTERFACE))
+		dev_info(adev->dev, "Failed to send Infoframe\n");
+}
+EXPORT_SYMBOL(av8100_video_mode_changed);
+
 static const struct color_conversion_cmd *get_color_transform_cmd(
 			struct av8100_device *adev,
 			enum av8100_color_transform transform)
@@ -5003,28 +5072,10 @@ static void late_resume(struct early_suspend *data)
 	set_flag(adev, AV8100_LATE_RESUME_EVENT);
 }
 
-static void late_resume_pd_cancel(struct av8100_device *adev)
-{
-	u8 hpds;
-
-	adev->params.busy = false;
-	adev->timer_flag = TIMER_UNSET;
-	if (av8100_status_get().av8100_state <= AV8100_OPMODE_SHUTDOWN)
-		return;
-
-	av8100_enable_interrupt();
-	if ((av8100_reg_stby_r(NULL, NULL, &hpds, NULL, NULL)) == 0)
-		if (hpds)
-			set_plug_status(adev, AV8100_HDMI_PLUGIN);
-}
-
 static void late_resume_handle(struct av8100_device *adev)
 {
 	adev->params.suspended = false;
-	if (!adev->params.disp_on ||
-		    av8100_status_get().av8100_state < AV8100_OPMODE_STANDBY) {
-		if (adev->timer_flag == TIMER_POWERDOWN)
-			late_resume_pd_cancel(adev);
+	if (!adev->params.disp_on) {
 		clr_flag(adev, AV8100_EVENTS);
 		hrtimer_cancel(&adev->hrtimer);
 		(void)av8100_powerwakeup(false);
@@ -5129,6 +5180,23 @@ static int __devinit av8100_probe(struct i2c_client *i2c_client,
 
 	kthread_run(av8100_thread, adev, "av8100_thread");
 
+	/* get pin config */
+	adev->params.pinctrl = devm_pinctrl_get(dev);
+	if (IS_ERR(adev->params.pinctrl)) {
+		ret = PTR_ERR(adev->params.pinctrl);
+		goto err_pinctrl;
+	}
+
+	adev->params.pins_default = pinctrl_lookup_state(adev->params.pinctrl,
+			PINCTRL_STATE_DEFAULT);
+	if (IS_ERR(adev->params.pins_default))
+		dev_err(dev, "could not get default pinstate\n");
+
+	adev->params.pins_sleep = pinctrl_lookup_state(adev->params.pinctrl,
+			PINCTRL_STATE_SLEEP);
+	if (IS_ERR(adev->params.pins_sleep))
+		dev_dbg(dev, "could not get sleep pinstate\n");
+
 	/* Get regulator resource */
 	if (pdata->regulator_pwr_id) {
 		adev->params.regulator_pwr = regulator_get(dev,
@@ -5197,6 +5265,7 @@ static int __devinit av8100_probe(struct i2c_client *i2c_client,
 
 err2:
 	(void) av8100_powerdown();
+err_pinctrl:
 err1:
 	return ret;
 }

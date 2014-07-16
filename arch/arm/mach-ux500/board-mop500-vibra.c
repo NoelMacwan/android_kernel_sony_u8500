@@ -16,24 +16,22 @@
 /* For details check ste_timed_vibra docbook */
 static struct ste_timed_vibra_platform_data rotary_vibra_plat_data = {
 	.is_linear_vibra = false,
-	.reverse_polarity = false,
 	.boost_level    = 100,
 	.boost_time     = 60,
-	.on_level       = 50,
-	.off_level      = 50,
+	.on_level       = 100,
+	.off_level      = 100,
 	.off_time       = 60,
-	.timed_vibra_control = ux500_ab8500_audio_pwm_vibra,
+	.timed_vibra_control = ux500_ab850x_audio_pwm_vibra,
 };
 
 static struct ste_timed_vibra_platform_data linear_vibra_plat_data = {
 	.is_linear_vibra = true,
-	.reverse_polarity = false,
-	.boost_level    = 80,
+	.boost_level    = 95,
 	.boost_time     = 40,
 	.on_level       = 80,
 	.off_level      = 80,
-	.off_time       = 0,
-	.timed_vibra_control = ux500_ab8500_audio_pwm_vibra,
+	.off_time       = 30,
+	.timed_vibra_control = ux500_ab850x_audio_pwm_vibra,
 };
 
 /* Timed output vibrator device */
@@ -45,10 +43,12 @@ void __init mop500_vibra_init(void)
 {
 	int ret;
 
-	if (machine_is_hrefv60())
+	/*if (machine_is_hrefv60()|| machine_is_u8520() || machine_is_u9540() || machine_is_a9500())
 		ux500_vibra_device.dev.platform_data = &linear_vibra_plat_data;
 	else
 		ux500_vibra_device.dev.platform_data = &rotary_vibra_plat_data;
+*/
+	ux500_vibra_device.dev.platform_data = &rotary_vibra_plat_data;
 
 	ret = platform_device_register(&ux500_vibra_device);
 	if (ret < 0)

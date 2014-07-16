@@ -444,7 +444,7 @@ static int av8100_codec_remove(struct snd_soc_codec *codec)
 	return 0;
 }
 
-static int av8100_codec_suspend(struct snd_soc_codec *codec, pm_message_t state)
+static int av8100_codec_suspend(struct snd_soc_codec *codec)
 {
 	pr_debug("%s: Enter (codec->name = %s).\n", __func__, codec->name);
 
@@ -547,4 +547,3 @@ module_init(av8100_codec_platform_drv_init);
 module_exit(av8100_codec_platform_drv_exit);
 
 MODULE_LICENSE("GPL v2");
-

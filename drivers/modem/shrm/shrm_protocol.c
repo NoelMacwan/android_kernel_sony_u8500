@@ -21,6 +21,10 @@
 #include <mach/reboot_reasons.h>
 #include <mach/suspend.h>
 #include <mach/prcmu-debug.h>
+#include <mach/open_modem_shared_memory.h>
+
+#define CREATE_TRACE_POINTS
+#include "shrm-trace.h"
 
 #define L2_HEADER_ISI		0x0
 #define L2_HEADER_RPC		0x1
@@ -90,7 +94,41 @@ enum shrm_nl {
 	SHRM_NL_STATUS_MOD_OFFLINE,
 };
 
-static int check_modem_in_reset(void);
+static int check_modem_in_reset(struct shrm_dev *shrm);
+
+static inline int shm_chk_and_req_mod(struct shrm_dev *shrm)
+{
+	int err = 0;
+
+	if (!modem_is_requested(shrm->modem)) {
+		err = clk_enable(shrm->clk);
+		if (err) {
+			dev_err(shrm->dev, "failed to enable sysclk\n");
+			shrm->clk_enabled = false;
+		} else {
+			shrm->clk_enabled = true;
+		}
+	}
+	if (modem_request(shrm->modem) < 0) {
+		dev_err(shrm->dev,
+				"prcmu_ac_wake_req failed, initiating MSR\n");
+		queue_kthread_work(&shrm->shm_mod_stuck_kw,
+					&shrm->shm_print_dbg_info);
+		queue_kthread_work(&shrm->shm_mod_stuck_kw,
+					&shrm->shm_mod_reset_req);
+		err = -EFAULT;
+	}
+	return err;
+}
+
+static void shm_sysclk_disable_work(struct kthread_work *work)
+{
+	struct shrm_dev *shrm = container_of(work,
+			struct shrm_dev, shm_clk_disable_req);
+
+	clk_disable(shrm->clk);
+	shrm->clk_enabled = false;
+}
 
 void shm_print_dbg_info_work(struct kthread_work *work)
 {
@@ -102,32 +140,44 @@ void shm_print_dbg_info_work(struct kthread_work *work)
 void shm_mod_reset_req_work(struct kthread_work *work)
 {
 	unsigned long flags;
+	struct shrm_dev *shrm = container_of(work,
+			struct shrm_dev, shm_mod_reset_req);
 
 	/* update the boot_state */
 	spin_lock_irqsave(&boot_lock, flags);
 	if (boot_state != BOOT_DONE) {
-		dev_info(shm_dev->dev, "Modem in reset state\n");
+		dev_info(shrm->dev, "Modem in reset state\n");
 		spin_unlock_irqrestore(&boot_lock, flags);
 		return;
 	}
 	boot_state = BOOT_UNKNOWN;
 	wmb();
 	spin_unlock_irqrestore(&boot_lock, flags);
+	dev_err(shrm->dev, "APE makes modem reset\n");
 	prcmu_modem_reset();
 }
 
 static void shm_ac_sleep_req_work(struct kthread_work *work)
 {
+	struct shrm_dev *shrm = container_of(work,
+			struct shrm_dev, shm_ac_sleep_req);
+
 	mutex_lock(&ac_state_mutex);
 	if (atomic_read(&ac_sleep_disable_count) == 0)
-		modem_release(shm_dev->modem);
+		modem_release(shrm->modem);
 	mutex_unlock(&ac_state_mutex);
 }
 
 static void shm_ac_wake_req_work(struct kthread_work *work)
 {
+	struct shrm_dev *shrm = container_of(work,
+			struct shrm_dev, shm_ac_wake_req);
+
 	mutex_lock(&ac_state_mutex);
-	modem_request(shm_dev->modem);
+	if (shm_chk_and_req_mod(shrm)) {
+		mutex_unlock(&ac_state_mutex);
+		return;
+	}
 	mutex_unlock(&ac_state_mutex);
 }
 
@@ -252,8 +302,7 @@ static void nl_send_unicast_message(int dst_pid)
 	int bt_state;
 	unsigned long flags;
 
-	if (boot_state != BOOT_DONE)
-		dev_info(shm_dev->dev, "Sending unicast message\n");
+	dev_dbg(shm_dev->dev, "Sending unicast message\n");
 
 	/* prepare the NL message for unicast */
 	skb = alloc_skb(NLMSG_SPACE(MAX_PAYLOAD), GFP_KERNEL);
@@ -289,7 +338,7 @@ static void nl_send_unicast_message(int dst_pid)
 }
 
 
-static int check_modem_in_reset(void)
+static int check_modem_in_reset(struct shrm_dev *shrm)
 {
 	u8 bt_state;
 	unsigned long flags;
@@ -299,7 +348,8 @@ static int check_modem_in_reset(void)
 	spin_unlock_irqrestore(&boot_lock, flags);
 
 #ifdef CONFIG_U8500_SHRM_MODEM_SILENT_RESET
-	if (bt_state != BOOT_UNKNOWN)
+	if (bt_state != BOOT_UNKNOWN &&
+			(!readl(shrm->ca_reset_status_rptr)))
 		return 0;
 	else
 		return -ENODEV;
@@ -323,6 +373,14 @@ void shm_ca_msgpending_0_tasklet(unsigned long tasklet_data)
 	unsigned long flags;
 
 	dev_dbg(shrm->dev, "%s IN\n", __func__);
+
+	/*
+	 * if sysclk is enabled then disable, as modem is awake it would
+	 * have requested for sysclk
+	 */
+	if (shrm->clk_enabled)
+		queue_kthread_work(&shrm->shm_mod_stuck_kw,
+					&shrm->shm_clk_disable_req);
 
 	/* Interprocess locking */
 	spin_lock(&ca_common_lock);
@@ -393,7 +451,15 @@ void shm_ca_msgpending_1_tasklet(unsigned long tasklet_data)
 
 	dev_dbg(shrm->dev, "%s IN\n", __func__);
 
-	if (check_modem_in_reset()) {
+	/*
+	 * if sysclk is enabled then disable, as modem is awake it would have
+	 * reqested for sysclk
+	 */
+	if (shrm->clk_enabled)
+		queue_kthread_work(&shrm->shm_mod_stuck_kw,
+					&shrm->shm_clk_disable_req);
+
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown\n",
 				__func__);
 		return;
@@ -445,7 +511,7 @@ void shm_ac_read_notif_0_tasklet(unsigned long tasklet_data)
 	get_writer_pointers(COMMON_CHANNEL, &writer_local_rptr,
 				&writer_local_wptr, &shared_wptr);
 
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown\n",
 				__func__);
 		return;
@@ -480,7 +546,7 @@ void shm_ac_read_notif_0_tasklet(unsigned long tasklet_data)
 		dev_err(shrm->dev, "Invalid boot state\n");
 	}
 	/* start timer here */
-	hrtimer_start(&timer, ktime_set(0, 50*NSEC_PER_MSEC),
+	hrtimer_start(&timer, ktime_set(0, 25*NSEC_PER_MSEC),
 			HRTIMER_MODE_REL);
 	atomic_dec(&ac_sleep_disable_count);
 
@@ -496,7 +562,7 @@ void shm_ac_read_notif_1_tasklet(unsigned long tasklet_data)
 
 	dev_dbg(shrm->dev, "%s IN\n", __func__);
 
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown\n",
 				__func__);
 		return;
@@ -518,30 +584,27 @@ void shm_ac_read_notif_1_tasklet(unsigned long tasklet_data)
 		shrm_audio_tx_state = SHRM_IDLE;
 	}
 	/* start timer here */
-	hrtimer_start(&timer, ktime_set(0, 50*NSEC_PER_MSEC),
+	hrtimer_start(&timer, ktime_set(0, 25*NSEC_PER_MSEC),
 			HRTIMER_MODE_REL);
-	if (atomic_read(&ac_msg_pend_1)) {
-		atomic_dec(&ac_sleep_disable_count);
-		atomic_dec(&ac_msg_pend_1);
-	}
+	atomic_dec(&ac_sleep_disable_count);
+	atomic_dec(&ac_msg_pend_1);
 
 	dev_dbg(shrm->dev, "%s OUT\n", __func__);
 }
 
 void shm_ca_sleep_req_work(struct kthread_work *work)
 {
-	u8 bt_state;
 	unsigned long flags;
+	struct shrm_dev *shrm = container_of(work,
+			struct shrm_dev, shm_ca_sleep_req);
 
-	dev_dbg(shm_dev->dev, "%s:IRQ_PRCMU_CA_SLEEP\n", __func__);
-
-	spin_lock_irqsave(&boot_lock, flags);
-	bt_state = boot_state;
-	spin_unlock_irqrestore(&boot_lock, flags);
+	dev_dbg(shrm->dev, "%s:IRQ_PRCMU_CA_SLEEP\n", __func__);
 
 	local_irq_save(flags);
 	preempt_disable();
-	if (bt_state != BOOT_DONE) {
+
+	if ((boot_state != BOOT_DONE) ||
+	    (readl(shm_dev->ca_reset_status_rptr))) {
 		dev_err(shm_dev->dev, "%s:Modem state reset or unknown\n",
 				__func__);
 		preempt_enable();
@@ -552,15 +615,17 @@ void shm_ca_sleep_req_work(struct kthread_work *work)
 	shrm_audio_rx_state =  SHRM_IDLE;
 
 	if (!get_host_accessport_val()) {
-		dev_err(shm_dev->dev, "%s: host_accessport is low\n", __func__);
-		queue_kthread_work(&shm_dev->shm_mod_stuck_kw,
-				&shm_dev->shm_mod_reset_req);
+		dev_err(shrm->dev, "%s: host_accessport is low\n", __func__);
+		queue_kthread_work(&shrm->shm_mod_stuck_kw,
+				&shrm->shm_mod_reset_req);
 		preempt_enable();
 		local_irq_restore(flags);
 		return;
 	}
+
+	trace_shrm_ca_sleep_req(0);
 	writel((1<<GOP_CA_WAKE_ACK_BIT),
-		shm_dev->intr_base + GOP_SET_REGISTER_BASE);
+		shrm->intr_base + GOP_SET_REGISTER_BASE);
 	preempt_enable();
 	local_irq_restore(flags);
 
@@ -579,17 +644,26 @@ void shm_ca_wake_req_work(struct kthread_work *work)
 			struct shrm_dev, shm_ca_wake_req);
 
 	/* initialize the FIFO Variables */
-	if (boot_state == BOOT_INIT)
+	if (boot_state == BOOT_INIT) {
+		/* Unlock the shared memory before accessing it */
+		if (open_modem_shared_memory()) {
+			dev_err(shrm->dev,
+				"Unable to unlock the shared memory\n");
+			//return;
+		}
 		shm_fifo_init(shrm);
-
+	}
 	mutex_lock(&ac_state_mutex);
-	modem_request(shrm->modem);
+	if (shm_chk_and_req_mod(shrm)) {
+		mutex_unlock(&ac_state_mutex);
+		return;
+	}
 	mutex_unlock(&ac_state_mutex);
 
 	local_irq_save(flags);
 	preempt_disable();
 	/* send ca_wake_ack_interrupt to CMU */
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown\n",
 			__func__);
 		preempt_enable();
@@ -599,20 +673,21 @@ void shm_ca_wake_req_work(struct kthread_work *work)
 
 	if (!get_host_accessport_val()) {
 		dev_err(shrm->dev, "%s: host_accessport is low\n", __func__);
-		queue_kthread_work(&shm_dev->shm_mod_stuck_kw,
-				&shm_dev->shm_mod_reset_req);
+		queue_kthread_work(&shrm->shm_mod_stuck_kw,
+				&shrm->shm_mod_reset_req);
 		preempt_enable();
 		local_irq_restore(flags);
 	}
 
+	trace_shrm_ca_wake_req(0);
 	/* send ca_wake_ack_interrupt to CMU */
 	writel((1<<GOP_CA_WAKE_ACK_BIT),
-			shm_dev->intr_base + GOP_SET_REGISTER_BASE);
+			shrm->intr_base + GOP_SET_REGISTER_BASE);
 	preempt_enable();
 	local_irq_restore(flags);
 }
 #ifdef CONFIG_U8500_SHRM_MODEM_SILENT_RESET
-static int shrm_modem_reset_sequence(void)
+static int shrm_modem_reset_sequence(struct shrm_dev *shrm)
 {
 	int err;
 	unsigned long flags;
@@ -636,11 +711,11 @@ static int shrm_modem_reset_sequence(void)
 	atomic_set(&ac_msg_pend_1, 0);
 
 	/* workaround for MSR */
-	queue_kthread_work(&shm_dev->shm_ac_wake_kw,
-			&shm_dev->shm_ac_wake_req);
+	queue_kthread_work(&shrm->shm_ac_wake_kw,
+			&shrm->shm_ac_wake_req);
 
 	/* reset char device queues */
-	shrm_char_reset_queues(shm_dev);
+	shrm_char_reset_queues(shrm);
 
 	/* reset protocol states */
 	shrm_common_tx_state = SHRM_SLEEP_STATE;
@@ -649,7 +724,7 @@ static int shrm_modem_reset_sequence(void)
 	shrm_audio_rx_state = SHRM_SLEEP_STATE;
 
 	/* set the msr flag */
-	shm_dev->msr_flag = 1;
+	shrm->msr_flag = 1;
 
 	/* multicast that modem is going to reset */
 	err = nl_send_multicast_message(SHRM_NL_MOD_RESET, GFP_ATOMIC);
@@ -664,10 +739,10 @@ static int shrm_modem_reset_sequence(void)
 	tasklet_enable(&shm_ca_0_tasklet);
 	tasklet_enable(&shm_ca_1_tasklet);
 	/* re-enable irqs */
-	enable_irq(shm_dev->ac_read_notif_0_irq);
-	enable_irq(shm_dev->ac_read_notif_1_irq);
-	enable_irq(shm_dev->ca_msg_pending_notif_0_irq);
-	enable_irq(shm_dev->ca_msg_pending_notif_1_irq);
+	enable_irq(shrm->ac_read_notif_0_irq);
+	enable_irq(shrm->ac_read_notif_1_irq);
+	enable_irq(shrm->ca_msg_pending_notif_0_irq);
+	enable_irq(shrm->ca_msg_pending_notif_1_irq);
 	enable_irq(IRQ_PRCMU_CA_WAKE);
 	enable_irq(IRQ_PRCMU_CA_SLEEP);
 
@@ -679,22 +754,24 @@ static int shrm_modem_reset_sequence(void)
 }
 #endif
 
-static void shrm_modem_reset_callback(unsigned long irq)
+static void shrm_modem_reset_callback(unsigned long tasklet_data)
 {
-	dev_err(shm_dev->dev, "Received mod_reset_req interrupt\n");
+	struct shrm_dev *shrm = (struct shrm_dev *)tasklet_data;
+
+	dev_err(shrm->dev, "Received mod_reset_req interrupt\n");
 
 #ifdef CONFIG_U8500_SHRM_MODEM_SILENT_RESET
 	{
 		int err;
-		dev_info(shm_dev->dev, "Initiating Modem silent reset\n");
+		dev_info(shrm->dev, "Initiating Modem silent reset\n");
 
-		err = shrm_modem_reset_sequence();
+		err = shrm_modem_reset_sequence(shrm);
 		if (err)
-			dev_err(shm_dev->dev,
+			dev_err(shrm->dev,
 				"Failed multicast of modem reset\n");
 	}
 #else
-	dev_info(shm_dev->dev, "Modem in reset loop, doing System reset\n");
+	dev_info(shrm->dev, "Modem in reset loop, doing System reset\n");
 
 	/* Call the PRCMU reset API */
 	prcmu_system_reset(SW_RESET_NO_ARGUMENT);
@@ -743,8 +820,9 @@ static irqreturn_t shrm_prcmu_irq_handler(int irq, void *data)
 		disable_irq_nosync(IRQ_PRCMU_CA_SLEEP);
 
 		/* stop network queue */
-		shrm_stop_netdev(shm_dev->ndev);
+		shrm_stop_netdev(shrm->ndev);
 
+		shrm_sw_reset_callback.data = (unsigned long)shrm;
 		tasklet_schedule(&shrm_sw_reset_callback);
 		break;
 	default:
@@ -765,25 +843,29 @@ static void send_ac_msg_pend_notify_0_work(struct kthread_work *work)
 
 	mutex_lock(&ac_state_mutex);
 	atomic_inc(&ac_sleep_disable_count);
-	modem_request(shrm->modem);
+	if (shm_chk_and_req_mod(shrm)) {
+		mutex_unlock(&ac_state_mutex);
+		return;
+	}
 	mutex_unlock(&ac_state_mutex);
 
 	spin_lock_irqsave(&start_timer_lock, flags);
 	if (!get_host_accessport_val()) {
 		dev_err(shrm->dev, "%s: host_accessport is low\n", __func__);
-		queue_kthread_work(&shm_dev->shm_mod_stuck_kw,
-				&shm_dev->shm_mod_reset_req);
+		queue_kthread_work(&shrm->shm_mod_stuck_kw,
+				&shrm->shm_mod_reset_req);
 		spin_unlock_irqrestore(&start_timer_lock, flags);
 		return;
 	}
 
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		spin_unlock_irqrestore(&start_timer_lock, flags);
 		return;
 	}
 
+	trace_shrm_send_ac_msg_pend_notify_0(0);
 	/* Trigger AcMsgPendingNotification to CMU */
 	writel((1<<GOP_COMMON_AC_MSG_PENDING_NOTIFICATION_BIT),
 			shrm->intr_base + GOP_SET_REGISTER_BASE);
@@ -813,25 +895,29 @@ static void send_ac_msg_pend_notify_1_work(struct kthread_work *work)
 		atomic_inc(&ac_sleep_disable_count);
 		atomic_inc(&ac_msg_pend_1);
 	}
-	modem_request(shrm->modem);
+	if (shm_chk_and_req_mod(shrm)) {
+		mutex_unlock(&ac_state_mutex);
+		return;
+	}
 	mutex_unlock(&ac_state_mutex);
 
 	spin_lock_irqsave(&start_timer_lock, flags);
 	if (!get_host_accessport_val()) {
 		dev_err(shrm->dev, "%s: host_accessport is low\n", __func__);
-		queue_kthread_work(&shm_dev->shm_mod_stuck_kw,
-				&shm_dev->shm_mod_reset_req);
+		queue_kthread_work(&shrm->shm_mod_stuck_kw,
+				&shrm->shm_mod_reset_req);
 		spin_unlock_irqrestore(&start_timer_lock, flags);
 		return;
 	}
 
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		spin_unlock_irqrestore(&start_timer_lock, flags);
 		return;
 	}
 
+	trace_shrm_send_ac_msg_pend_notify_1(0);
 	/* Trigger AcMsgPendingNotification to CMU */
 	writel((1<<GOP_AUDIO_AC_MSG_PENDING_NOTIFICATION_BIT),
 			shrm->intr_base + GOP_SET_REGISTER_BASE);
@@ -857,14 +943,13 @@ void shm_nl_receive(struct sk_buff *skb)
 	msg = *((int *)(NLMSG_DATA(nlh)));
 	switch (msg) {
 	case SHRM_NL_MOD_QUERY_STATE:
-		if (boot_state != BOOT_DONE)
-			dev_info(shm_dev->dev, "mod-query-state from user-space\n");
+		dev_dbg(shm_dev->dev, "mod-query-state from user-space\n");
 		nl_send_unicast_message(nlh->nlmsg_pid);
 		break;
 
 	case SHRM_NL_USER_MOD_RESET:
 		dev_info(shm_dev->dev, "user-space inited mod-reset-req\n");
-		dev_info(shm_dev->dev, "PRCMU resets modem\n");
+		dev_info(shm_dev->dev, "PCRMU resets modem\n");
 		if (atomic_read(&mod_stuck) || atomic_read(&fifo_full)) {
 			dev_info(shm_dev->dev,
 					"Modem reset already in progress\n");
@@ -978,6 +1063,7 @@ int shrm_protocol_init(struct shrm_dev *shrm,
 	init_kthread_work(&shrm->shm_ac_wake_req, shm_ac_wake_req_work);
 	init_kthread_work(&shrm->shm_mod_reset_req, shm_mod_reset_req_work);
 	init_kthread_work(&shrm->shm_print_dbg_info, shm_print_dbg_info_work);
+	init_kthread_work(&shrm->shm_clk_disable_req, shm_sysclk_disable_work);
 
 	/* set tasklet data */
 	shm_ca_0_tasklet.data = (unsigned long)shrm;
@@ -1077,6 +1163,7 @@ irqreturn_t ca_wake_irq_handler(int irq, void *ctrlr)
 
 	dev_dbg(shrm->dev, "Inside ca_wake_irq_handler\n");
 
+	trace_shrm_wake_irq_handler(0);
 	/* Clear the interrupt */
 	writel((1 << GOP_CA_WAKE_REQ_BIT),
 				shrm->intr_base + GOP_CLEAR_REGISTER_BASE);
@@ -1106,7 +1193,7 @@ irqreturn_t ac_read_notif_0_irq_handler(int irq, void *ctrlr)
 		hrtimer_cancel(&fifo_full_timer);
 	}
 
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		return IRQ_NONE;
@@ -1117,7 +1204,7 @@ irqreturn_t ac_read_notif_0_irq_handler(int irq, void *ctrlr)
 
 	local_irq_save(flags);
 	preempt_disable();
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		preempt_enable();
@@ -1158,7 +1245,7 @@ irqreturn_t ac_read_notif_1_irq_handler(int irq, void *ctrlr)
 		hrtimer_cancel(&fifo_full_timer);
 	}
 
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		return IRQ_NONE;
@@ -1169,7 +1256,7 @@ irqreturn_t ac_read_notif_1_irq_handler(int irq, void *ctrlr)
 
 	local_irq_save(flags);
 	preempt_disable();
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		preempt_enable();
@@ -1202,7 +1289,7 @@ irqreturn_t ca_msg_pending_notif_0_irq_handler(int irq, void *ctrlr)
 
 	dev_dbg(shrm->dev, "%s IN\n", __func__);
 
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		return IRQ_NONE;
@@ -1212,7 +1299,7 @@ irqreturn_t ca_msg_pending_notif_0_irq_handler(int irq, void *ctrlr)
 
 	local_irq_save(flags);
 	preempt_disable();
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		preempt_enable();
@@ -1228,6 +1315,8 @@ irqreturn_t ca_msg_pending_notif_0_irq_handler(int irq, void *ctrlr)
 		local_irq_restore(flags);
 		return IRQ_NONE;
 	}
+
+	trace_shrm_ca_msg_pending_notify_0_irq_handler(0);
 	/* Clear the interrupt */
 	writel((1 << GOP_COMMON_CA_MSG_PENDING_NOTIFICATION_BIT),
 			shrm->intr_base + GOP_CLEAR_REGISTER_BASE);
@@ -1245,7 +1334,7 @@ irqreturn_t ca_msg_pending_notif_1_irq_handler(int irq, void *ctrlr)
 
 	dev_dbg(shrm->dev, "%s IN\n", __func__);
 
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		return IRQ_NONE;
@@ -1255,7 +1344,7 @@ irqreturn_t ca_msg_pending_notif_1_irq_handler(int irq, void *ctrlr)
 
 	local_irq_save(flags);
 	preempt_disable();
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		preempt_enable();
@@ -1271,6 +1360,8 @@ irqreturn_t ca_msg_pending_notif_1_irq_handler(int irq, void *ctrlr)
 		local_irq_restore(flags);
 		return IRQ_NONE;
 	}
+
+	trace_shrm_ca_msg_pending_notify_1_irq_handler(0);
 	/* Clear the interrupt */
 	writel((1<<GOP_AUDIO_CA_MSG_PENDING_NOTIFICATION_BIT),
 			shrm->intr_base+GOP_CLEAR_REGISTER_BASE);
@@ -1299,7 +1390,8 @@ int shm_write_msg(struct shrm_dev *shrm, u8 l2_header,
 					void *addr, u32 length)
 {
 	u8 channel = 0;
-	int ret;
+	int ret, i;
+	u8 *temp;
 
 	dev_dbg(shrm->dev, "%s IN\n", __func__);
 
@@ -1307,7 +1399,17 @@ int shm_write_msg(struct shrm_dev *shrm, u8 l2_header,
 		dev_err(shrm->dev,
 			"error:after boot done  call this fn, L2Header = %d\n",
 			l2_header);
-		ret = -ENODEV;
+		dev_err(shrm->dev, "packet not sent, modem in reset");
+		temp = (u8 *)addr;
+		for (i = 0; i < length; i++)
+			dev_dbg(shrm->dev, "data[%d]=%02x\t", i, temp[i]);
+		dev_dbg(shrm->dev, "\n");
+		/*
+		 * If error is returned then phonet tends to resend the msg
+		 * this will lead to the msg bouncing to and fro between
+		 * phonet and shrm, hence dont return error.
+		*/
+		ret = 0;
 		goto out;
 	}
 
@@ -1384,7 +1486,7 @@ void ca_msg_read_notification_0(struct shrm_dev *shrm)
 
 		local_irq_save(flags);
 		preempt_disable();
-		if (check_modem_in_reset()) {
+		if (check_modem_in_reset(shrm)) {
 			dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 					__func__);
 			preempt_enable();
@@ -1401,6 +1503,8 @@ void ca_msg_read_notification_0(struct shrm_dev *shrm)
 			local_irq_restore(flags);
 			return;
 		}
+
+		trace_shrm_ca_msg_read_notification_0(0);
 		/* Trigger CaMsgReadNotification to CMU */
 		writel((1 << GOP_COMMON_CA_READ_NOTIFICATION_BIT),
 			shrm->intr_base + GOP_SET_REGISTER_BASE);
@@ -1423,7 +1527,7 @@ void ca_msg_read_notification_1(struct shrm_dev *shrm)
 
 		local_irq_save(flags);
 		preempt_disable();
-		if (check_modem_in_reset()) {
+		if (check_modem_in_reset(shrm)) {
 			dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 					__func__);
 			preempt_enable();
@@ -1440,6 +1544,8 @@ void ca_msg_read_notification_1(struct shrm_dev *shrm)
 			local_irq_restore(flags);
 			return;
 		}
+
+		trace_shrm_ca_msg_read_notification_1(0);
 		/* Trigger CaMsgReadNotification to CMU */
 		writel((1<<GOP_AUDIO_CA_READ_NOTIFICATION_BIT),
 			shrm->intr_base+GOP_SET_REGISTER_BASE);
@@ -1468,7 +1574,7 @@ void receive_messages_common(struct shrm_dev *shrm)
 	u8 l2_header;
 	u32 len;
 
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		return;
@@ -1486,7 +1592,7 @@ void receive_messages_common(struct shrm_dev *shrm)
 	ca_msg_read_notification_0(shrm);
 
 	while (read_remaining_messages_common()) {
-		if (check_modem_in_reset()) {
+		if (check_modem_in_reset(shrm)) {
 			dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 					__func__);
 			return;
@@ -1516,7 +1622,7 @@ void receive_messages_audio(struct shrm_dev *shrm)
 	u8 l2_header;
 	u32 len;
 
-	if (check_modem_in_reset()) {
+	if (check_modem_in_reset(shrm)) {
 		dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 				__func__);
 		return;
@@ -1535,7 +1641,7 @@ void receive_messages_audio(struct shrm_dev *shrm)
 	/* SendReadNotification */
 	ca_msg_read_notification_1(shrm);
 	while (read_remaining_messages_audio())	{
-		if (check_modem_in_reset()) {
+		if (check_modem_in_reset(shrm)) {
 			dev_err(shrm->dev, "%s:Modem state reset or unknown.\n",
 					__func__);
 			return;

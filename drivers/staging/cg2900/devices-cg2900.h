@@ -9,6 +9,7 @@
 #define __DEVICES_CG2900_H
 
 #include "cg2900.h"
+#include "mfd/cg2900_chip.h"
 #include <linux/clk.h>
 
 #define CHIP_ENABLE_PDB_LOW_TIMEOUT     100 /* ms */
@@ -21,21 +22,20 @@ struct dcg2900_info {
 	bool	sleep_gpio_set;
 	u8	gpio_0_7_pull_up;
 	u8	gpio_8_15_pull_up;
-	u8	gpio_16_20_pull_up;
+	u8	gpio_16_22_pull_up;
 	u8	gpio_0_7_pull_down;
 	u8	gpio_8_15_pull_down;
-	u8	gpio_16_20_pull_down;
+	u8	gpio_16_22_pull_down;
+	bool	regulator_enabled;
+	bool	regulator_wlan_enabled;
 	struct clk	*lpoclk;
+	struct regulator        *regulator;
 	struct regulator        *regulator_wlan;
 };
 
-extern void dcg2900_u8500_enable_chip(struct cg2900_chip_dev *dev);
-extern void dcg2900_u8500_disable_chip(struct cg2900_chip_dev *dev);
-extern int dcg2900_u8500_setup(struct cg2900_chip_dev *dev,
-				struct dcg2900_info *info);
-extern void dcg2900_u5500_enable_chip(struct cg2900_chip_dev *dev);
-extern void dcg2900_u5500_disable_chip(struct cg2900_chip_dev *dev);
-extern int dcg2900_u5500_setup(struct cg2900_chip_dev *dev,
+extern void dcg2900_enable_chip(struct cg2900_chip_dev *dev);
+extern void dcg2900_disable_chip(struct cg2900_chip_dev *dev);
+extern int dcg2900_resource_setup(struct cg2900_chip_dev *dev,
 				struct dcg2900_info *info);
 
 /**

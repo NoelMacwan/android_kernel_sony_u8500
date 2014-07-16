@@ -19,9 +19,10 @@
 #include <linux/ktime.h>
 #include <linux/cpufreq.h>
 #include <linux/mfd/dbx500-prcmu.h>
+#include <linux/module.h>
+#include <linux/platform_device.h>
 
-#include "../../../../drivers/cpuidle/cpuidle-dbx500.h"
-
+#include <mach/usecase_gov.h>
 
 #define CPULOAD_MEAS_DELAY	3000 /* 3 secondes of delta */
 
@@ -32,38 +33,16 @@ static unsigned long debug;
 	if (debug) \
 		printk \
 
-enum ux500_uc {
-	UX500_UC_NORMAL	=  0,
-	UX500_UC_AUTO, /* Add use case below this. */
-	UX500_UC_VC,
-	UX500_UC_LPA,
-	UX500_UC_USER, /* Add use case above this. */
-	UX500_UC_MAX,
-};
-
 /* cpu load monitor struct */
-#define LOAD_MONITOR 4
 struct hotplug_cpu_info {
 	cputime64_t prev_cpu_wall;
 	cputime64_t prev_cpu_idle;
-	cputime64_t prev_cpu_io;
-	unsigned int load[LOAD_MONITOR];
-	unsigned int idx;
 };
 
 static DEFINE_PER_CPU(struct hotplug_cpu_info, hotplug_info);
 
-/* Auto trigger criteria */
-/* loadavg threshold */
-static unsigned long lower_threshold = 175;
-static unsigned long upper_threshold = 450;
-/* load balancing */
-static unsigned long max_unbalance = 210;
-/* trend load */
-static unsigned long trend_unbalance = 40;
-static unsigned long min_trend = 5;
 /* instant load */
-static unsigned long max_instant = 85;
+static unsigned long max_instant_load = 85;
 
 /* Number of interrupts per second before exiting auto mode */
 static u32 exit_irq_per_s = 1000;
@@ -71,66 +50,13 @@ static u64 old_num_irqs;
 
 static DEFINE_MUTEX(usecase_mutex);
 static DEFINE_MUTEX(state_mutex);
-static bool user_config_updated;
-static enum ux500_uc current_uc = UX500_UC_MAX;
+static enum ux500_uc current_uc = UX500_UC_NORMAL;
+static enum ux500_uc enabled_uc = UX500_UC_NORMAL;
 static bool is_work_scheduled;
 static bool is_early_suspend;
 static bool uc_master_enable = true;
 
-static unsigned int cpuidle_deepest_state;
-
-struct usecase_config {
-	char *name;
-	unsigned int min_arm;
-	unsigned int max_arm;
-	unsigned long cpuidle_multiplier;
-	bool second_cpu_online;
-	bool l2_prefetch_en;
-	bool enable;
-	unsigned int forced_state; /* Forced cpu idle state. */
-	bool vc_override; /* QOS override for voice-call. */
-};
-
-static struct usecase_config usecase_conf[UX500_UC_MAX] = {
-	[UX500_UC_NORMAL] = {
-		.name			= "normal",
-		.cpuidle_multiplier	= 1024,
-		.second_cpu_online	= true,
-		.l2_prefetch_en		= true,
-		.enable			= true,
-		.forced_state		= 0,
-		.vc_override		= false,
-	},
-	[UX500_UC_AUTO] = {
-		.name			= "auto",
-		.cpuidle_multiplier	= 0,
-		.second_cpu_online	= false,
-		.l2_prefetch_en		= true,
-		.enable			= false,
-		.forced_state		= 0,
-		.vc_override		= false,
-	},
-	[UX500_UC_VC] = {
-		.name			= "voice-call",
-		.min_arm		= 400000,
-		.cpuidle_multiplier	= 0,
-		.second_cpu_online	= true,
-		.l2_prefetch_en		= false,
-		.enable			= false,
-		.forced_state		= 0,
-		.vc_override		= true,
-	},
-	[UX500_UC_LPA] = {
-		.name			= "low-power-audio",
-		.min_arm		= 400000,
-		.cpuidle_multiplier	= 0,
-		.second_cpu_online	= false,
-		.l2_prefetch_en		= false,
-		.enable			= false,
-		.forced_state		= 0, /* Updated dynamically */
-		.vc_override		= false,
-	},
-};
+static struct usecase_config *usecase_conf;
 
 /* daemon */
 static struct delayed_work work_usecase;
@@ -139,24 +65,9 @@ static struct early_suspend usecase_early_suspend;
 static unsigned int system_min_freq;
 static unsigned int system_max_freq;
 
-/* calculate loadavg */
-#define LOAD_INT(x) ((x) >> FSHIFT)
-#define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1-1)) * 100)
-
 extern int cpufreq_update_freq(int cpu, unsigned int min, unsigned int max);
 extern int cpuidle_set_multiplier(unsigned int value);
 extern int cpuidle_force_state(unsigned int state);
-
-static unsigned long determine_loadavg(void)
-{
-	unsigned long  avg = 0;
-	unsigned long avnrun[3];
-
-	get_avenrun(avnrun, FIXED_1 / 200, 0);
-	avg += (LOAD_INT(avnrun[0]) * 100) + (LOAD_FRAC(avnrun[0]) % 100);
-
-	return avg;
-}
 
 static unsigned long determine_cpu_load(void)
 {
@@ -176,13 +87,13 @@ static unsigned long determine_cpu_load(void)
 		cur_idle_time = get_cpu_idle_time_us(i, &cur_wall_time);
 
 		/* how much wall time has passed since last iteration? */
-		wall_time = (unsigned int) cputime64_sub(cur_wall_time,
-							info->prev_cpu_wall);
+		wall_time = (unsigned int) (cur_wall_time -
+					    info->prev_cpu_wall);
 		info->prev_cpu_wall = cur_wall_time;
 
 		/* how much idle time has passed since last iteration? */
-		idle_time = (unsigned int) cputime64_sub(cur_idle_time,
-							info->prev_cpu_idle);
+		idle_time = (unsigned int) (cur_idle_time -
+					    info->prev_cpu_idle);
 		info->prev_cpu_idle = cur_idle_time;
 
 		if (unlikely(!wall_time || wall_time < idle_time))
@@ -190,71 +101,13 @@ static unsigned long determine_cpu_load(void)
 
 		/* load is the percentage of time not spent in idle */
 		load = 100 * (wall_time - idle_time) / wall_time;
-		info->load[info->idx++] = load;
-		if (info->idx >= LOAD_MONITOR)
-			info->idx = 0;
 
-		hp_printk("cpu %d load %u ", i, load);
+		hp_printk("cpu %d load %u, ", i, load);
 
 		total_load += load;
 	}
 
-	return total_load;
-}
-
-static unsigned long determine_cpu_load_trend(void)
-{
-	int i, k;
-	unsigned long total_load = 0;
-
-	/* Get cpu load of each cpu */
-	for_each_online_cpu(i) {
-		unsigned int load = 0;
-		struct hotplug_cpu_info *info;
-
-		info = &per_cpu(hotplug_info, i);
-
-		for (k = 0; k < LOAD_MONITOR; k++)
-			load +=	info->load[k];
-
-		load /= LOAD_MONITOR;
-
-		hp_printk("cpu %d load trend %u\n", i, load);
-
-		total_load += load;
-	}
-
-	return total_load;
-}
-
-static unsigned long determine_cpu_balance_trend(void)
-{
-	int i, k;
-	unsigned long total_load = 0;
-	unsigned long min_load = (unsigned long) (-1);
-
-	/* Get cpu load of each cpu */
-	for_each_online_cpu(i) {
-		unsigned int load = 0;
-		struct hotplug_cpu_info *info;
-		info = &per_cpu(hotplug_info, i);
-
-		for (k = 0; k < LOAD_MONITOR; k++)
-			load +=	info->load[k];
-
-		load /= LOAD_MONITOR;
-
-		if (min_load > load)
-			min_load = load;
-		total_load += load;
-	}
-
-	if (min_load > min_trend)
-		total_load = (100 * total_load) / min_load;
-	else
-		total_load = 50 << num_online_cpus();
-
-	return total_load;
+	return total_load / num_online_cpus();
 }
 
 static void init_cpu_load_trend(void)
@@ -263,19 +116,11 @@ static void init_cpu_load_trend(void)
 
 	for_each_possible_cpu(i) {
 		struct hotplug_cpu_info *info;
-		int j;
 
 		info = &per_cpu(hotplug_info, i);
 
 		info->prev_cpu_idle = get_cpu_idle_time_us(i,
 						&(info->prev_cpu_wall));
-		info->prev_cpu_io = get_cpu_iowait_time_us(i,
-						&(info->prev_cpu_wall));
-
-		for (j = 0; j < LOAD_MONITOR; j++) {
-			info->load[j] = 100;
-		}
-		info->idx = 0;
 	}
 }
 
@@ -300,6 +145,8 @@ static u32 get_num_interrupts_per_s(void)
 
 	if (old_num_irqs > 0) {
 		delta = (u32)ktime_to_ms(ktime_sub(now, last)) / 1000;
+		if (!delta)
+			delta = 1;
 		irqs = ((u32)(num_irqs - old_num_irqs)) / delta;
 	}
 
@@ -344,20 +191,14 @@ static int set_cpufreq(int cpu, int min_freq, int max_freq)
 
 static void set_cpu_config(enum ux500_uc new_uc)
 {
-	bool update = false;
 	int cpu;
 	int min_freq, max_freq;
 
-	if (new_uc != current_uc)
-		update = true;
-	else if ((user_config_updated) && (new_uc == UX500_UC_USER))
-		update = true;
+	pr_debug("%s: new_usecase=%d, current_usecase=%d\n",
+		__func__, new_uc, current_uc);
 
-	pr_debug("%s: new_usecase=%d, current_usecase=%d, update=%d\n",
-		__func__, new_uc, current_uc, update);
-
-	if (!update)
-		goto exit;
+	if (new_uc == current_uc)
+		return;
 
 	/* Cpu hotplug */
 	if (!(usecase_conf[new_uc].second_cpu_online) &&
@@ -382,7 +223,9 @@ static void set_cpu_config(enum ux500_uc new_uc)
 			    min_freq,
 			    max_freq);
 
-	/* Kinda doing the job twice, but this is needed for reference keeping */
+	/*
+	 * Kinda doing the job twice, but this is needed for reference keeping
+	 */
 	if (usecase_conf[new_uc].min_arm)
 		prcmu_qos_update_requirement(PRCMU_QOS_ARM_KHZ,
 					     "usecase",
@@ -402,16 +245,12 @@ static void set_cpu_config(enum ux500_uc new_uc)
 		outer_prefetch_disable();
 
 	/* Force cpuidle state */
-	cpuidle_force_state(usecase_conf[new_uc].forced_state);
+	cpuidle_force_state(usecase_conf[new_uc].cpuidle_force_state);
 
 	/* QOS override */
 	prcmu_qos_voice_call_override(usecase_conf[new_uc].vc_override);
 
 	current_uc = new_uc;
-
-exit:
-	/* Its ok to clear even if new_uc != UX500_UC_USER */
-	user_config_updated = false;
 }
 
 void usecase_update_governor_state(void)
@@ -426,8 +265,7 @@ void usecase_update_governor_state(void)
 	mutex_lock(&state_mutex);
 	mutex_lock(&usecase_mutex);
 
-	if (uc_master_enable && (usecase_conf[UX500_UC_AUTO].enable ||
-		usecase_conf[UX500_UC_USER].enable)) {
+	if (uc_master_enable && (enabled_uc != UX500_UC_NORMAL)) {
 		/*
 		 * Usecases are enabled. If we are in early suspend put
 		 * governor to work.
@@ -489,29 +327,13 @@ static void usecase_lateresume_callback(struct early_suspend *h)
 
 static void delayed_usecase_work(struct work_struct *work)
 {
-	unsigned long avg, load, trend, balance;
+	unsigned long load;
 	bool inc_perf = false;
-	bool dec_perf = false;
 	u32 irqs_per_s;
-
-	/* determine loadavg  */
-	avg = determine_loadavg();
-	hp_printk("loadavg = %lu lower th %lu upper th %lu\n",
-					avg, lower_threshold, upper_threshold);
 
 	/* determine instant load */
 	load = determine_cpu_load();
-	hp_printk("cpu instant load = %lu max %lu\n", load, max_instant);
-
-	/* determine load trend */
-	trend = determine_cpu_load_trend();
-	hp_printk("cpu load trend = %lu min %lu unbal %lu\n",
-					trend, min_trend, trend_unbalance);
-
-	/* determine load balancing */
-	balance = determine_cpu_balance_trend();
-	hp_printk("load balancing trend = %lu min %lu\n",
-					balance, max_unbalance);
+	hp_printk("cpu instant load = %lu max %lu\n", load, max_instant_load);
 
 	irqs_per_s = get_num_interrupts_per_s();
 
@@ -519,50 +341,23 @@ static void delayed_usecase_work(struct work_struct *work)
 	mutex_lock(&usecase_mutex);
 
 	/* detect "instant" load increase */
-	if (load > max_instant || irqs_per_s > exit_irq_per_s) {
+	if (load > max_instant_load || irqs_per_s > exit_irq_per_s)
 		inc_perf = true;
-	} else if (!usecase_conf[UX500_UC_USER].enable &&
-			usecase_conf[UX500_UC_AUTO].enable) {
-		/* detect high loadavg use case */
-		if (avg > upper_threshold)
-			inc_perf = true;
-		/* detect idle use case */
-		else if (trend < min_trend)
-			dec_perf = true;
-		/* detect unbalanced low cpu load use case */
-		else if ((balance > max_unbalance) && (trend < trend_unbalance))
-			dec_perf = true;
-		/* detect low loadavg use case */
-		else if (avg < lower_threshold)
-			dec_perf = true;
-		/* All user use cases disabled, current load not triggering
-		 * any change.
-		 */
-		else if (user_config_updated)
-			dec_perf = true;
-	} else {
-		dec_perf = true;
-	}
 
 	/*
 	 * set_cpu_config() will not update the config unless it has been
 	 * changed.
 	 */
-	if (dec_perf) {
-		if (usecase_conf[UX500_UC_USER].enable)
-			set_cpu_config(UX500_UC_USER);
-		else if (usecase_conf[UX500_UC_AUTO].enable)
-			set_cpu_config(UX500_UC_AUTO);
-	} else if (inc_perf) {
+	if (inc_perf)
 		set_cpu_config(UX500_UC_NORMAL);
-	}
+	else
+		set_cpu_config(enabled_uc);
 
 	mutex_unlock(&usecase_mutex);
 
 	/* reprogramm scheduled work */
 	schedule_delayed_work_on(0, &work_usecase,
 				msecs_to_jiffies(CPULOAD_MEAS_DELAY));
-
 }
 
 static struct dentry *usecase_dir;
@@ -587,12 +382,7 @@ static ssize_t set_##_name(struct file *file, \
 	return count; \
 }
 
-define_set(upper_threshold);
-define_set(lower_threshold);
-define_set(max_unbalance);
-define_set(trend_unbalance);
-define_set(min_trend);
-define_set(max_instant);
+define_set(max_instant_load);
 define_set(debug);
 
 #define define_print(_name) \
@@ -601,12 +391,7 @@ static ssize_t print_##_name(struct seq_file *s, void *p) \
 	return seq_printf(s, "%lu\n", _name); \
 }
 
-define_print(upper_threshold);
-define_print(lower_threshold);
-define_print(max_unbalance);
-define_print(trend_unbalance);
-define_print(min_trend);
-define_print(max_instant);
+define_print(max_instant_load);
 define_print(debug);
 
 #define define_open(_name) \
@@ -615,12 +400,7 @@ static ssize_t open_##_name(struct inode *inode, struct file *file) \
 	return single_open(file, print_##_name, inode->i_private); \
 }
 
-define_open(upper_threshold);
-define_open(lower_threshold);
-define_open(max_unbalance);
-define_open(trend_unbalance);
-define_open(min_trend);
-define_open(max_instant);
+define_open(max_instant_load);
 define_open(debug);
 
 #define define_dbg_file(_name) \
@@ -634,12 +414,7 @@ static const struct file_operations fops_##_name = { \
 }; \
 static struct dentry *file_##_name;
 
-define_dbg_file(upper_threshold);
-define_dbg_file(lower_threshold);
-define_dbg_file(max_unbalance);
-define_dbg_file(trend_unbalance);
-define_dbg_file(min_trend);
-define_dbg_file(max_instant);
+define_dbg_file(max_instant_load);
 define_dbg_file(debug);
 
 struct dbg_file {
@@ -656,12 +431,7 @@ struct dbg_file {
 }
 
 static struct dbg_file debug_entry[] = {
-	define_dbg_entry(upper_threshold),
-	define_dbg_entry(lower_threshold),
-	define_dbg_entry(max_unbalance),
-	define_dbg_entry(trend_unbalance),
-	define_dbg_entry(min_trend),
-	define_dbg_entry(max_instant),
+	define_dbg_entry(max_instant_load),
 	define_dbg_entry(debug),
 };
 
@@ -698,75 +468,17 @@ static int setup_debugfs(void)
 }
 #endif
 
-static void usecase_update_user_config(void)
-{
-	int i;
-	bool config_enable = false;
-	struct usecase_config *user_conf = &usecase_conf[UX500_UC_USER];
-
-	mutex_lock(&usecase_mutex);
-
-	user_conf->min_arm = system_min_freq;
-	user_conf->max_arm = system_max_freq;
-	user_conf->cpuidle_multiplier = 0;
-	user_conf->second_cpu_online = false;
-	user_conf->l2_prefetch_en = false;
-	user_conf->forced_state = cpuidle_deepest_state;
-	user_conf->vc_override = true; /* A single false will clear it. */
-
-	/* Dont include Auto and Normal modes in this */
-	for (i = (UX500_UC_AUTO + 1); i < UX500_UC_USER; i++) {
-		if (!usecase_conf[i].enable)
-			continue;
-
-		config_enable = true;
-
-		/* It's the highest arm opp requirement that should be used */
-		if (usecase_conf[i].min_arm > user_conf->min_arm)
-			user_conf->min_arm = usecase_conf[i].min_arm;
-
-		if (usecase_conf[i].max_arm > user_conf->max_arm)
-			user_conf->max_arm = usecase_conf[i].max_arm;
-
-		if (usecase_conf[i].cpuidle_multiplier >
-					user_conf->cpuidle_multiplier)
-			user_conf->cpuidle_multiplier =
-				usecase_conf[i].cpuidle_multiplier;
-
-		user_conf->second_cpu_online |=
-				usecase_conf[i].second_cpu_online;
-
-		user_conf->l2_prefetch_en |=
-				usecase_conf[i].l2_prefetch_en;
-
-		/* Take the shallowest state. */
-		if (usecase_conf[i].forced_state < user_conf->forced_state)
-			user_conf->forced_state = usecase_conf[i].forced_state;
-
-		/* Only override QOS if all enabled configurations are
-		 * requesting it.
-		 */
-		if (!usecase_conf[i].vc_override)
-			user_conf->vc_override = false;
-	}
-
-	user_conf->enable = config_enable;
-	user_config_updated = true;
-
-	mutex_unlock(&usecase_mutex);
-}
-
-struct usecase_devclass_attr {
-	struct sysdev_class_attribute class_attr;
+struct usecase_dev_attr {
+	struct device_attribute dev_attr;
 	u32 index;
 };
 
-/* One for each usecase except "user" + current + enable */
-#define UX500_NUM_SYSFS_NODES (UX500_UC_USER + 2)
+/* One for each usecase + current + enable */
+#define UX500_NUM_SYSFS_NODES (UX500_UC_MAX + 2)
 #define UX500_CURRENT_NODE_INDEX (UX500_NUM_SYSFS_NODES - 1)
 #define UX500_ENABLE_NODE_INDEX (UX500_NUM_SYSFS_NODES - 2)
 
-static struct usecase_devclass_attr usecase_dc_attr[UX500_NUM_SYSFS_NODES];
+static struct usecase_dev_attr usecase_dc_attr[UX500_NUM_SYSFS_NODES];
 
 static struct attribute *dbs_attributes[UX500_NUM_SYSFS_NODES + 1] = {NULL};
 
@@ -775,36 +487,33 @@ static struct attribute_group dbs_attr_group = {
 	.name = "usecase",
 };
 
-static ssize_t show_current(struct sysdev_class *class,
-			struct sysdev_class_attribute *attr, char *buf)
+static ssize_t show_current(struct device *device,
+			    struct device_attribute *attr, char *buf)
 {
-	enum ux500_uc display_uc = (current_uc == UX500_UC_MAX) ?
-					UX500_UC_NORMAL : current_uc;
-
 	return sprintf(buf, "min_arm: %d\n"
 		"max_arm: %d\n"
 		"cpuidle_multiplier: %ld\n"
 		"second_cpu_online: %s\n"
 		"l2_prefetch_en: %s\n"
-		"forced_state: %d\n"
+		"cpuidle_force_state: %d\n"
 		"vc_override: %s\n",
-		usecase_conf[display_uc].min_arm,
-		usecase_conf[display_uc].max_arm,
-		usecase_conf[display_uc].cpuidle_multiplier,
-		usecase_conf[display_uc].second_cpu_online ? "true" : "false",
-		usecase_conf[display_uc].l2_prefetch_en ? "true" : "false",
-		usecase_conf[display_uc].forced_state,
-		usecase_conf[display_uc].vc_override ? "true" : "false");
+		usecase_conf[current_uc].min_arm,
+		usecase_conf[current_uc].max_arm,
+		usecase_conf[current_uc].cpuidle_multiplier,
+		usecase_conf[current_uc].second_cpu_online ? "true" : "false",
+		usecase_conf[current_uc].l2_prefetch_en ? "true" : "false",
+		usecase_conf[current_uc].cpuidle_force_state,
+		usecase_conf[current_uc].vc_override ? "true" : "false");
 }
 
-static ssize_t show_enable(struct sysdev_class *class,
-			struct sysdev_class_attribute *attr, char *buf)
+static ssize_t show_enable(struct device *device,
+			struct device_attribute *attr, char *buf)
 {
 	return sprintf(buf, "%d\n", uc_master_enable);
 }
 
-static ssize_t store_enable(struct sysdev_class *class,
-					struct sysdev_class_attribute *attr,
+static ssize_t store_enable(struct device *device,
+					struct device_attribute *attr,
 				    const char *buf, size_t count)
 {
 	unsigned int input;
@@ -821,38 +530,57 @@ static ssize_t store_enable(struct sysdev_class *class,
 	return count;
 }
 
-static ssize_t show_dc_attr(struct sysdev_class *class,
-			struct sysdev_class_attribute *attr, char *buf)
+static ssize_t show_dc_attr(struct device *device,
+			struct device_attribute *attr, char *buf)
 {
-	struct usecase_devclass_attr *uattr =
-		container_of(attr, struct usecase_devclass_attr, class_attr);
+	struct usecase_dev_attr *uattr =
+		container_of(attr, struct usecase_dev_attr, dev_attr);
 
 	return sprintf(buf, "%u\n",
-				usecase_conf[uattr->index].enable);
+				(uattr->index == enabled_uc));
 }
 
-static ssize_t store_dc_attr(struct sysdev_class *class,
-					struct sysdev_class_attribute *attr,
+static ssize_t store_dc_attr(struct device *device,
+					struct device_attribute *attr,
 				    const char *buf, size_t count)
 {
 	unsigned int input;
 	int ret;
 
-	struct usecase_devclass_attr *uattr =
-		container_of(attr, struct usecase_devclass_attr, class_attr);
+	struct usecase_dev_attr *uattr =
+		container_of(attr, struct usecase_dev_attr, dev_attr);
 
 	ret = sscanf(buf, "%u", &input);
 
 	/* Normal mode cant be changed. */
-	if ((ret != 1) || (uattr->index == 0))
+	if ((ret != 1) || (uattr->index == UX500_UC_NORMAL))
 		return -EINVAL;
 
-	usecase_conf[uattr->index].enable = (bool)input;
+	if (input) {
+		/* Check if any usecase is already enabled */
+		if (enabled_uc != UX500_UC_NORMAL) {
+			pr_err("usecase governor: %s already enabled\n",
+					usecase_conf[enabled_uc].name);
+			return -EINVAL;
+		}
+
+		enabled_uc = uattr->index;
+		pr_info("usecase governor: %s enabled\n",
+				usecase_conf[enabled_uc].name);
+	} else {
+		if (uattr->index == enabled_uc) {
+			pr_info("usecase governor: %s disabled\n",
+					usecase_conf[enabled_uc].name);
+			enabled_uc = UX500_UC_NORMAL;
+		} else {
+			pr_err("usecase governor: %s not enabled\n",
+				usecase_conf[uattr->index].name);
+			return -EINVAL;
+		}
+	}
 
 	if (uattr->index == UX500_UC_VC)
-		prcmu_vc(usecase_conf[UX500_UC_VC].enable);
-
-	usecase_update_user_config();
+		prcmu_vc((bool)input);
 
 	usecase_update_governor_state();
 
@@ -866,75 +594,62 @@ static int usecase_sysfs_init(void)
 
 	/* Last two nodes are not based on usecase configurations */
 	for (i = 0; i < (UX500_NUM_SYSFS_NODES - 2); i++) {
-		usecase_dc_attr[i].class_attr.attr.name = usecase_conf[i].name;
-		usecase_dc_attr[i].class_attr.attr.mode = 0644;
-		usecase_dc_attr[i].class_attr.show = show_dc_attr;
-		usecase_dc_attr[i].class_attr.store = store_dc_attr;
+		usecase_dc_attr[i].dev_attr.attr.name = usecase_conf[i].name;
+		usecase_dc_attr[i].dev_attr.attr.mode = 0644;
+		usecase_dc_attr[i].dev_attr.show = show_dc_attr;
+		usecase_dc_attr[i].dev_attr.store = store_dc_attr;
 		usecase_dc_attr[i].index = i;
 
-		dbs_attributes[i] = &(usecase_dc_attr[i].class_attr.attr);
+		dbs_attributes[i] = &(usecase_dc_attr[i].dev_attr.attr);
 	}
 
 	/* sysfs current */
-	usecase_dc_attr[UX500_CURRENT_NODE_INDEX].class_attr.attr.name =
+	usecase_dc_attr[UX500_CURRENT_NODE_INDEX].dev_attr.attr.name =
 		"current";
-	usecase_dc_attr[UX500_CURRENT_NODE_INDEX].class_attr.attr.mode =
+	usecase_dc_attr[UX500_CURRENT_NODE_INDEX].dev_attr.attr.mode =
 		0644;
-	usecase_dc_attr[UX500_CURRENT_NODE_INDEX].class_attr.show =
+	usecase_dc_attr[UX500_CURRENT_NODE_INDEX].dev_attr.show =
 		show_current;
-	usecase_dc_attr[UX500_CURRENT_NODE_INDEX].class_attr.store =
+	usecase_dc_attr[UX500_CURRENT_NODE_INDEX].dev_attr.store =
 		NULL;
 	usecase_dc_attr[UX500_CURRENT_NODE_INDEX].index =
 		0;
 	dbs_attributes[UX500_CURRENT_NODE_INDEX] =
-		&(usecase_dc_attr[UX500_CURRENT_NODE_INDEX].class_attr.attr);
+		&(usecase_dc_attr[UX500_CURRENT_NODE_INDEX].dev_attr.attr);
 
 	/* sysfs enable */
-	usecase_dc_attr[UX500_ENABLE_NODE_INDEX].class_attr.attr.name =
+	usecase_dc_attr[UX500_ENABLE_NODE_INDEX].dev_attr.attr.name =
 		"enable";
-	usecase_dc_attr[UX500_ENABLE_NODE_INDEX].class_attr.attr.mode =
+	usecase_dc_attr[UX500_ENABLE_NODE_INDEX].dev_attr.attr.mode =
 		0644;
-	usecase_dc_attr[UX500_ENABLE_NODE_INDEX].class_attr.show =
+	usecase_dc_attr[UX500_ENABLE_NODE_INDEX].dev_attr.show =
 		show_enable;
-	usecase_dc_attr[UX500_ENABLE_NODE_INDEX].class_attr.store =
+	usecase_dc_attr[UX500_ENABLE_NODE_INDEX].dev_attr.store =
 		store_enable;
 	usecase_dc_attr[UX500_ENABLE_NODE_INDEX].index =
 		0;
 	dbs_attributes[UX500_ENABLE_NODE_INDEX] =
-		&(usecase_dc_attr[UX500_ENABLE_NODE_INDEX].class_attr.attr);
+		&(usecase_dc_attr[UX500_ENABLE_NODE_INDEX].dev_attr.attr);
 
-	err = sysfs_create_group(&(cpu_sysdev_class.kset.kobj),
-						&dbs_attr_group);
+	err = sysfs_create_group(&cpu_subsys.dev_root->kobj,
+				 &dbs_attr_group);
 	if (err)
-		pr_err("usecase-gov: sysfs_create_group"
+		pr_err("usecase governor: sysfs_create_group"
 				" failed with error = %d\n", err);
 
 	return err;
 }
 
-static void usecase_cpuidle_init(void)
-{
-	int max_states;
-	int i;
-	struct cstate *state = ux500_ci_get_cstates(&max_states);
-
-	for (i = 0; i < max_states; i++)
-		if ((state[i].APE == APE_OFF) && (state[i].ARM == ARM_RET))
-			break;
-
-	usecase_conf[UX500_UC_LPA].forced_state = i;
-
-	cpuidle_deepest_state = max_states - 1;
-}
-
 /*  initialize devices */
-static int __init init_usecase_devices(void)
+static int __init probe_usecase_devices(struct platform_device *pdev)
 {
 	int err;
 	struct cpufreq_frequency_table *table;
 	unsigned int min_freq = UINT_MAX;
 	unsigned int max_freq = 0;
 	int i;
+
+	usecase_conf = dev_get_platdata(&pdev->dev);
 
 	table = cpufreq_frequency_get_table(0);
 
@@ -967,12 +682,10 @@ static int __init init_usecase_devices(void)
 	if (err)
 		goto error2;
 
-	usecase_cpuidle_init();
-
 	prcmu_qos_add_requirement(PRCMU_QOS_ARM_KHZ, "usecase",
 				  PRCMU_QOS_DEFAULT_VALUE);
 
-	pr_info("Use-case governor initialized\n");
+	pr_info("usecase governor initialized\n");
 
 	return 0;
 error2:
@@ -980,6 +693,18 @@ error2:
 error:
 	unregister_early_suspend(&usecase_early_suspend);
 	return err;
+}
+static struct platform_driver dbx500_usecase_gov = {
+	.driver = {
+		.name = "dbx500-usecase-gov",
+		.owner = THIS_MODULE,
+	},
+};
+
+static int __init init_usecase_devices(void)
+{
+	return platform_driver_probe(&dbx500_usecase_gov,
+					probe_usecase_devices);
 }
 
 late_initcall(init_usecase_devices);

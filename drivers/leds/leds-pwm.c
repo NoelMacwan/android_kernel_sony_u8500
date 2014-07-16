@@ -90,11 +90,20 @@ static void led_pwm_set(struct led_classdev *led_cdev,
 	unsigned int period =  led_dat->period;
 
 	if (brightness == 0) {
+		printk("disable led pwm\n");
 		pwm_config(led_dat->pwm, 0, period);
 		pwm_disable(led_dat->pwm);
 	} else {
-		brightness = led_dat->lth_brightness + (brightness *
-			(led_dat->period - led_dat->lth_brightness) / max);
+		printk("enable led pwm %d\n", brightness);
+		if (brightness <= 25) {
+			led_dat->lth_brightness = 40;
+		} else {
+			led_dat->lth_brightness = 65;
+		}
+		led_dat->lth_brightness = led_dat->lth_brightness * (led_dat->period / max);
+		brightness = led_dat->period - led_dat->lth_brightness - (brightness *(led_dat->period - led_dat->lth_brightness) / max);
+		//brightness = led_dat->lth_brightness + (brightness *
+		//	(led_dat->period - led_dat->lth_brightness) / max);
 		pwm_config(led_dat->pwm, brightness, led_dat->period);
 
 		pwm_enable(led_dat->pwm);
@@ -107,6 +116,7 @@ static int led_pwm_probe(struct platform_device *pdev)
 	struct led_pwm *cur_led;
 	struct led_pwm_data *leds_data, *led_dat;
 	int i, ret = 0;
+
 
 	if (!pdata)
 		return -EBUSY;
@@ -143,11 +153,16 @@ static int led_pwm_probe(struct platform_device *pdev)
 		led_dat->cdev.max_brightness = cur_led->max_brightness;
 		led_dat->cdev.flags |= LED_CORE_SUSPENDRESUME;
 
+		//if (!strcmp(led_dat->cdev.name, "lcd-backlight"))
+			pwm_enable(led_dat->pwm);
+
 		ret = led_classdev_register(&pdev->dev, &led_dat->cdev);
 		if (ret < 0) {
 			pwm_free(led_dat->pwm);
 			goto err;
 		}
+
+
 	}
 
 	platform_set_drvdata(pdev, leds_data);
@@ -194,18 +209,7 @@ static struct platform_driver led_pwm_driver = {
 	},
 };
 
-static int __init led_pwm_init(void)
-{
-	return platform_driver_register(&led_pwm_driver);
-}
-
-static void __exit led_pwm_exit(void)
-{
-	platform_driver_unregister(&led_pwm_driver);
-}
-
-module_init(led_pwm_init);
-module_exit(led_pwm_exit);
+module_platform_driver(led_pwm_driver);
 
 MODULE_AUTHOR("Luotao Fu <l.fu@pengutronix.de>");
 MODULE_DESCRIPTION("PWM LED driver for PXA");

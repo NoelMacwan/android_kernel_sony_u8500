@@ -9,8 +9,12 @@
 #include <linux/module.h>
 #include <linux/tee.h>
 #include <linux/io.h>
+
 #include <mach/hardware.h>
+
 #include <asm/hardware/cache-l2x0.h>
+
+#include "id.h"
 
 static struct tee_session session;
 static struct tee_context context;
@@ -43,10 +47,11 @@ static void prefetch_enable(void)
 		data |= (L2X0_PREFETCH_CTRL_BIT_INST_EN |
 				L2X0_PREFETCH_CTRL_BIT_DATA_EN);
 
-		operation.shm[0].buffer = &data;
-		operation.shm[0].size = sizeof(data);
-		operation.shm[0].flags = TEEC_MEM_INPUT;
-		operation.flags = TEEC_MEMREF_0_USED;
+		operation.param[0].tmpref.buffer = &data;
+		operation.param[0].tmpref.size = sizeof(data);
+		operation.types = TEEC_PARAM_TYPES(
+			TEEC_MEMREF_TEMP_INPUT, TEEC_NONE, TEEC_NONE,
+			TEEC_NONE);
 
 		err = teec_invoke_command(&session,
 			TEE_STA_SET_L2CC_PREFETCH_CTRL_REGISTER,
@@ -76,10 +81,11 @@ static void prefetch_disable(void)
 		data &= ~(L2X0_PREFETCH_CTRL_BIT_INST_EN |
 				L2X0_PREFETCH_CTRL_BIT_DATA_EN);
 
-		operation.shm[0].buffer = &data;
-		operation.shm[0].size = sizeof(data);
-		operation.shm[0].flags = TEEC_MEM_INPUT;
-		operation.flags = TEEC_MEMREF_0_USED;
+		operation.param[0].tmpref.buffer = &data;
+		operation.param[0].tmpref.size = sizeof(data);
+		operation.types = TEEC_PARAM_TYPES(
+			TEEC_MEMREF_TEMP_INPUT, TEEC_NONE, TEEC_NONE,
+			TEEC_NONE);
 
 		err = teec_invoke_command(&session,
 			TEE_STA_SET_L2CC_PREFETCH_CTRL_REGISTER,
@@ -105,9 +111,7 @@ static int __init prefetch_ctrl_init(void)
 	};
 
 	/* Get PL310 base address. It will be used as readonly. */
-	if (cpu_is_u5500())
-		l2x0_base = __io_address(U5500_L2CC_BASE);
-	else if (cpu_is_u8500() || cpu_is_u9540())
+	if (cpu_is_u8500_family() || cpu_is_ux540_family())
 		l2x0_base = __io_address(U8500_L2CC_BASE);
 	else
 		ux500_unknown_soc();

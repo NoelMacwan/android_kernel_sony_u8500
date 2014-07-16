@@ -51,6 +51,7 @@
 
 #define B2R2_HEAP_SIZE (4 * PAGE_SIZE)
 #define MAX_TMP_BUF_SIZE (128 * PAGE_SIZE)
+#define CHARS_IN_REQ (2048)
 
 /*
  * TODO:
@@ -102,6 +103,9 @@ static int resolve_hwmem(struct b2r2_control *cont, struct b2r2_blt_img *img,
 		struct b2r2_blt_rect *rect_2b_used, bool is_dst,
 		struct b2r2_resolved_buf *resolved_buf);
 static void unresolve_hwmem(struct b2r2_resolved_buf *resolved_buf);
+
+static void init_tmp_bufs(struct b2r2_control *cont,
+		enum hwmem_mem_type mem_type);
 
 /**
  * struct sync_args - Data for clean/flush
@@ -389,6 +393,8 @@ int b2r2_control_blt(struct b2r2_blt_request *request)
 	int node_count;
 	struct b2r2_control_instance *instance = request->instance;
 	struct b2r2_control *cont = instance->control;
+	enum hwmem_mem_type mem_type = HWMEM_MEM_CONTIGUOUS_SYS;
+	enum hwmem_access access;
 
 	unsigned long long thread_runtime_at_start = 0;
 
@@ -537,6 +543,18 @@ int b2r2_control_blt(struct b2r2_blt_request *request)
 		request->dst_resolved.file_virtual_start,
 		request->dst_resolved.file_len);
 
+	/* Allocate temp buffers */
+	mutex_lock(&cont->tmp_buf_lock);
+	if (cont->tmp_bufs[0].buf.size == 0) {
+		if (!IS_ERR_OR_NULL(request->dst_resolved.hwmem_alloc)) {
+			hwmem_get_info(request->dst_resolved.hwmem_alloc,
+						&request->dst_resolved.file_len,
+						&mem_type, &access);
+		}
+		init_tmp_bufs(cont, mem_type);
+	}
+	mutex_unlock(&cont->tmp_buf_lock);
+
 	/* Calculate the number of nodes (and resources) needed for this job */
 	ret = b2r2_node_split_analyze(request, MAX_TMP_BUF_SIZE, &node_count,
 		&request->bufs, &request->buf_count,
@@ -673,7 +691,14 @@ int b2r2_control_blt(struct b2r2_blt_request *request)
 
 #ifdef CONFIG_DEBUG_FS
 	/* Remember latest request for debugfs */
-	cont->debugfs_latest_request = *request;
+	mutex_lock(&cont->last_req_lock);
+	cont->latest_request[cont->buf_index] = *request;
+
+	/* Calculate, buf_index = (buf_index + 1) % last_request_count */
+	cont->buf_index++;
+	if (cont->buf_index >= cont->last_request_count)
+		cont->buf_index = 0;
+	mutex_unlock(&cont->last_req_lock);
 #endif
 
 	/* Submit the job */
@@ -1537,7 +1562,14 @@ int b2r2_generic_blt(struct b2r2_blt_request *request)
 
 #ifdef CONFIG_DEBUG_FS
 	/* Remember latest request */
-	cont->debugfs_latest_request = *request;
+	mutex_lock(&cont->last_req_lock);
+	cont->latest_request[cont->buf_index] = *request;
+
+	/* Calculate, buf_index = (buf_index + 1) % last_request_count */
+	cont->buf_index++;
+	if (cont->buf_index >= cont->last_request_count)
+		cont->buf_index = 0;
+	mutex_unlock(&cont->last_req_lock);
 #endif
 
 	/*
@@ -2056,8 +2088,7 @@ static int resolve_hwmem(struct b2r2_control *cont,
 		goto access_check_failed;
 	}
 
-	if (!(mem_type == HWMEM_MEM_CONTIGUOUS_SYS ||
-			mem_type == HWMEM_MEM_PROTECTED_SYS)) {
+	if (mem_type == HWMEM_MEM_SCATTERED_SYS) {
 		b2r2_log_info(cont->dev, "%s: Hwmem buffer is scattered.\n",
 			__func__);
 		return_value = -EINVAL;
@@ -2503,7 +2534,8 @@ static void dec_stat(struct b2r2_control *cont, unsigned long *stat)
 
 #ifdef CONFIG_DEBUG_FS
 /**
- * debugfs_b2r2_blt_request_read() - Implements debugfs read for B2R2 register
+ * debugfs_b2r2_blt_request_read() - Implements debugfs read for B2R2
+ * previous blits. Number of previous blits set using last_request_count.
  *
  * @filp: File pointer
  * @buf: User space buffer
@@ -2516,17 +2548,52 @@ static int debugfs_b2r2_blt_request_read(struct file *filp, char __user *buf,
 			size_t count, loff_t *f_pos)
 {
 	size_t dev_size = 0;
-	int ret = 0;
-	char *Buf = kmalloc(sizeof(char) * 4096, GFP_KERNEL);
+	size_t max_size = 0;
+	int i = 0, index = 0, ret = 0;
+	unsigned int last_request_count = 0;
+	char *req_buf = NULL;
+	char tmpbuf[9];
+
 	struct b2r2_control *cont = filp->f_dentry->d_inode->i_private;
 
-	if (Buf == NULL) {
+	mutex_lock(&cont->last_req_lock);
+	last_request_count = cont->last_request_count;
+
+	/* Buffer size for one blit is below 2048 */
+	max_size = sizeof(char) * last_request_count * CHARS_IN_REQ;
+	req_buf = kmalloc(max_size, GFP_KERNEL);
+
+	if (req_buf == NULL) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
-	dev_size = sprintf_req(&cont->debugfs_latest_request, Buf,
-		sizeof(char) * 4096);
+	/* buf_index is location to store next request */
+	index = cont->buf_index;
+
+	for (i = last_request_count; i > 0; i--) {
+		if (--index < 0)
+			index = last_request_count - 1;
+
+		if (i == last_request_count)
+			snprintf(tmpbuf, sizeof(tmpbuf), "(latest)");
+		else if (i == 1)
+			snprintf(tmpbuf, sizeof(tmpbuf), "(oldest)");
+		else
+			tmpbuf[0] = '\0';
+
+		dev_size += snprintf(req_buf + dev_size,
+			max_size - dev_size,
+			"Details of blit request [%d]%s\n",
+			last_request_count - i, tmpbuf);
+
+		if (dev_size > max_size)
+			goto out;
+
+		dev_size += sprintf_req(&cont->latest_request[index],
+			req_buf + dev_size,
+			max_size - dev_size);
+	}
 
 	/* No more to read if offset != 0 */
 	if (*f_pos > dev_size)
@@ -2535,14 +2602,16 @@ static int debugfs_b2r2_blt_request_read(struct file *filp, char __user *buf,
 	if (*f_pos + count > dev_size)
 		count = dev_size - *f_pos;
 
-	if (copy_to_user(buf, Buf, count))
+	if (copy_to_user(buf, &req_buf[*f_pos], count))
 		ret = -EINVAL;
+
 	*f_pos += count;
 	ret = count;
 
 out:
-	if (Buf != NULL)
-		kfree(Buf);
+	mutex_unlock(&cont->last_req_lock);
+	if (req_buf != NULL)
+		kfree(req_buf);
 	return ret;
 }
 
@@ -2552,6 +2621,105 @@ out:
 static const struct file_operations debugfs_b2r2_blt_request_fops = {
 	.owner = THIS_MODULE,
 	.read  = debugfs_b2r2_blt_request_read,
+};
+
+/**
+ * debugfs_b2r2_req_count_read() - Implements debugfs read for
+ *                             previous request count
+ * @filp: File pointer
+ * @buf: User space buffer
+ * @count: Number of bytes to read
+ * @f_pos: File position
+ *
+ * Returns number of bytes read or negative error code
+ */
+static int debugfs_b2r2_req_count_read(struct file *filp, char __user *buf,
+				   size_t count, loff_t *f_pos)
+{
+	/* 2 characters hex number + newline + string terminator; */
+	char tmpbuf[2+2];
+	size_t dev_size = 0;
+	int ret = 0;
+	struct b2r2_control *cont = filp->f_dentry->d_inode->i_private;
+
+	dev_size = snprintf(tmpbuf, sizeof(tmpbuf),
+		"%02X\n", cont->last_request_count);
+	/* No more to read if offset != 0 */
+	if (*f_pos > dev_size)
+		return ret;
+
+	if (*f_pos + count > dev_size)
+		count = dev_size - *f_pos;
+
+	if (copy_to_user(buf, &tmpbuf[*f_pos], count))
+		return -EINVAL;
+	*f_pos += count;
+	ret = count;
+
+	return ret;
+}
+
+/**
+ * debugfs_b2r2_last_count_write() - Implements debugfs write for
+ *                              previous request count
+ * @filp: File pointer
+ * @buf: User space buffer
+ * @count: Number of bytes to write
+ * @f_pos: File position
+ *
+ * Returns number of bytes written or negative error code
+ */
+static int debugfs_b2r2_req_count_write(struct file *filp,
+			const char __user *buf, size_t count, loff_t *f_pos)
+{
+	char tmpbuf[80];
+	unsigned int req_count = 0;
+	int ret = 0;
+	struct b2r2_control *cont = filp->f_dentry->d_inode->i_private;
+
+	if (count >= sizeof(tmpbuf))
+		count = sizeof(tmpbuf) - 1;
+	if (copy_from_user(tmpbuf, buf, count))
+		return -EINVAL;
+
+	tmpbuf[count] = 0;
+	if (sscanf(tmpbuf, "%02X", &req_count) != 1)
+		return -EINVAL;
+
+	mutex_lock(&cont->last_req_lock);
+	/* Reset buf_index and request array */
+	cont->buf_index = 0;
+	memset(cont->latest_request, 0,
+		sizeof(cont->latest_request));
+
+	/* Make req_count in [1-MAX_LAST_REQUEST] range */
+	if (req_count < 1) {
+		b2r2_log_warn(cont->dev,
+			"%s: last_request_count is less than MIN\n", __func__);
+		req_count = 1;
+	}
+	if (req_count > MAX_LAST_REQUEST) {
+		b2r2_log_warn(cont->dev,
+			"%s: last_request_count is more than MAX\n", __func__);
+		req_count = MAX_LAST_REQUEST;
+	}
+
+	cont->last_request_count = req_count;
+	mutex_unlock(&cont->last_req_lock);
+
+	*f_pos += count;
+	ret = count;
+
+	return ret;
+}
+
+/**
+ * debugfs_b2r2_req_count_fops() - File operations for previous request count in debugfs
+ */
+static const struct file_operations debugfs_b2r2_req_count_fops = {
+	.owner = THIS_MODULE,
+	.read  = debugfs_b2r2_req_count_read,
+	.write = debugfs_b2r2_req_count_write,
 };
 
 /**
@@ -2810,38 +2978,42 @@ static const struct file_operations debugfs_b2r2_bypass_fops = {
 };
 #endif
 
-static void init_tmp_bufs(struct b2r2_control *cont)
+static void init_tmp_bufs(struct b2r2_control *cont,
+					enum hwmem_mem_type mem_type)
 {
 	int i = 0;
+	struct hwmem_alloc *alloc;
+	struct hwmem_mem_chunk mem_chunk;
+	size_t num_mem_chunks = 1;
 
-	for (i = 0; i < (sizeof(cont->tmp_bufs) / sizeof(struct tmp_buf));
-			i++) {
-		cont->tmp_bufs[i].buf.virt_addr = dma_alloc_coherent(
-			cont->dev, MAX_TMP_BUF_SIZE,
-			&cont->tmp_bufs[i].buf.phys_addr, GFP_DMA);
-		if (cont->tmp_bufs[i].buf.virt_addr != NULL)
-			cont->tmp_bufs[i].buf.size = MAX_TMP_BUF_SIZE;
-		else {
-			b2r2_log_err(cont->dev, "%s: Failed to allocate temp "
-				"buffer %i\n", __func__, i);
-			cont->tmp_bufs[i].buf.size = 0;
+	kref_init(&cont->tmp_buf_ref);
+
+	for (i = 0; i < (sizeof(cont->tmp_bufs) / sizeof(struct tmp_buf)); i++) {
+		alloc = hwmem_alloc(MAX_TMP_BUF_SIZE,
+				HWMEM_ALLOC_HINT_WRITE_COMBINE |
+				HWMEM_ALLOC_HINT_UNCACHED,
+				(HWMEM_ACCESS_READ  | HWMEM_ACCESS_WRITE |
+				HWMEM_ACCESS_IMPORT),
+				mem_type);
+
+		if (IS_ERR_OR_NULL(alloc)) {
+			b2r2_log_warn(cont->dev, "%s alloc failed\n", __func__);
+			return;
 		}
-	}
-}
 
-static void destroy_tmp_bufs(struct b2r2_control *cont)
-{
-	int i = 0;
+		(void)hwmem_pin(alloc, &mem_chunk, &num_mem_chunks);
 
-	for (i = 0; i < MAX_TMP_BUFS_NEEDED; i++) {
-		if (cont->tmp_bufs[i].buf.size != 0) {
-			dma_free_coherent(cont->dev,
-					cont->tmp_bufs[i].buf.size,
-					cont->tmp_bufs[i].buf.virt_addr,
-					cont->tmp_bufs[i].buf.phys_addr);
-
-			cont->tmp_bufs[i].buf.size = 0;
+		cont->tmp_bufs[i].buf.virt_addr = hwmem_kmap(alloc);
+		if (cont->tmp_bufs[i].buf.virt_addr == NULL) {
+			hwmem_unpin(alloc);
+			hwmem_release(alloc);
+			b2r2_log_warn(cont->dev, "%s kmap failed\n", __func__);
+			return;
 		}
+
+		cont->tmp_bufs[i].buf.phys_addr = mem_chunk.paddr;
+		cont->tmp_bufs[i].buf.size = MAX_TMP_BUF_SIZE;
+		cont->tmp_bufs[i].buf.mem_handle = (u32)alloc;
 	}
 }
 
@@ -2870,7 +3042,6 @@ int b2r2_control_init(struct b2r2_control *cont)
 	b2r2_log_info(cont->dev, "%s: device registered\n", __func__);
 
 	cont->dev->coherent_dma_mask = 0xFFFFFFFF;
-	init_tmp_bufs(cont);
 	ret = b2r2_filters_init(cont);
 	if (ret) {
 		b2r2_log_warn(cont->dev, "%s: failed to init filters\n",
@@ -2888,11 +3059,18 @@ int b2r2_control_init(struct b2r2_control *cont)
 	}
 
 #ifdef CONFIG_DEBUG_FS
+	/* Initialize last_request_count and lock */
+	cont->last_request_count = 1;
+	mutex_init(&cont->last_req_lock);
+
 	/* Register debug fs */
 	if (!IS_ERR_OR_NULL(cont->debugfs_root_dir)) {
 		debugfs_create_file("last_request", 0666,
 			cont->debugfs_root_dir,
 			cont, &debugfs_b2r2_blt_request_fops);
+		debugfs_create_file("last_request_count", 0666,
+			cont->debugfs_root_dir,
+			cont, &debugfs_b2r2_req_count_fops);
 		debugfs_create_file("stats", 0666,
 			cont->debugfs_root_dir,
 			cont, &debugfs_b2r2_blt_stat_fops);
@@ -2931,7 +3109,6 @@ void b2r2_control_exit(struct b2r2_control *cont)
 		}
 #endif
 		b2r2_mem_exit(cont);
-		destroy_tmp_bufs(cont);
 		b2r2_node_split_exit(cont);
 #if defined(CONFIG_B2R2_GENERIC)
 		b2r2_generic_exit(cont);

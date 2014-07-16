@@ -39,7 +39,7 @@ struct sbus_priv {
 	void			*irq_priv;
 };
 
-static const struct sdio_device_id if_sdio_ids[] = {
+static const struct sdio_device_id cw1200_sdio_ids[] = {
 	{ SDIO_DEVICE(SDIO_ANY_ID, SDIO_ANY_ID) },
 	{ /* end: all zeroes */			},
 };
@@ -50,12 +50,7 @@ static int cw1200_sdio_memcpy_fromio(struct sbus_priv *self,
 				     unsigned int addr,
 				     void *dst, int count)
 {
-	int ret = sdio_memcpy_fromio(self->func, dst, addr, count);
-	if (ret) {
-		printk(KERN_ERR "!!! Can't read %d bytes from 0x%.8X. Err %d.\n",
-				count, addr, ret);
-	}
-	return ret;
+	return sdio_memcpy_fromio(self->func, dst, addr, count);
 }
 
 static int cw1200_sdio_memcpy_toio(struct sbus_priv *self,
@@ -111,10 +106,6 @@ static int cw1200_request_irq(struct sbus_priv *self,
 	if (WARN_ON(ret < 0))
 		goto exit;
 
-	ret = enable_irq_wake(irq->start);
-	if (WARN_ON(ret))
-		goto free_irq;
-
 	/* Hack to access Fuction-0 */
 	func_num = self->func->num;
 	self->func->num = 0;
@@ -124,10 +115,10 @@ static int cw1200_request_irq(struct sbus_priv *self,
 		goto set_func;
 
 	/* Master interrupt enable ... */
-	cccr |= 1;
+	cccr |= BIT(0);
 
 	/* ... for our function */
-	cccr |= 1 << func_num;
+	cccr |= BIT(func_num);
 
 	sdio_writeb(self->func, cccr, SDIO_CCCR_IENx, &ret);
 	if (WARN_ON(ret))
@@ -139,8 +130,6 @@ static int cw1200_request_irq(struct sbus_priv *self,
 
 set_func:
 	self->func->num = func_num;
-	disable_irq_wake(irq->start);
-free_irq:
 	free_irq(irq->start, self);
 exit:
 	return ret;
@@ -191,7 +180,6 @@ static int cw1200_sdio_irq_unsubscribe(struct sbus_priv *self)
 	ret = sdio_release_irq(self->func);
 	sdio_release_host(self->func);
 #else
-	disable_irq_wake(irq->start);
 	free_irq(irq->start, self);
 #endif
 
@@ -247,32 +235,35 @@ static int cw1200_detect_card(const struct cw1200_platform_data *pdata)
 
 static int cw1200_sdio_off(const struct cw1200_platform_data *pdata)
 {
+	int ret = 0;
 	const struct resource *reset = pdata->reset;
 	gpio_set_value(reset->start, 0);
-	cw1200_detect_card(pdata);
 	gpio_free(reset->start);
-	return 0;
+	cw1200_detect_card(pdata);
+	return ret;
 }
 
 static int cw1200_sdio_on(const struct cw1200_platform_data *pdata)
 {
+	int ret = 0;
+
 	const struct resource *reset = pdata->reset;
 	gpio_request(reset->start, reset->name);
 	gpio_direction_output(reset->start, 1);
 	/* It is not stated in the datasheet, but at least some of devices
 	 * have problems with reset if this stage is omited. */
 	msleep(50);
-	gpio_set_value(reset->start, 0);
+	gpio_direction_output(reset->start, 0);
 	/* A valid reset shall be obtained by maintaining WRESETN
 	 * active (low) for at least two cycles of LP_CLK after VDDIO
 	 * is stable within it operating range. */
-	msleep(1);
+	usleep_range(1000, 20000);
 	gpio_set_value(reset->start, 1);
-	/* The host should wait 30 ms after the WRESETN release
+	/* The host should wait 32 ms after the WRESETN release
 	 * for the on-chip LDO to stabilize */
-	msleep(30);
+	msleep(32);
 	cw1200_detect_card(pdata);
-	return 0;
+	return ret;
 }
 
 static int cw1200_sdio_reset(struct sbus_priv *self)
@@ -283,16 +274,26 @@ static int cw1200_sdio_reset(struct sbus_priv *self)
 	return 0;
 }
 
-static size_t cw1200_align_size(struct sbus_priv *self, size_t size)
+static size_t cw1200_sdio_align_size(struct sbus_priv *self, size_t size)
 {
 	size_t aligned = sdio_align_size(self->func, size);
-	/* HACK!!! Problems with DMA size on u8500 platform  */
-	if ((aligned & 0x1F) && (aligned & ~0x1F)) {
-		aligned &= ~0x1F;
-		aligned += 0x20;
-	}
-
 	return aligned;
+}
+
+int cw1200_sdio_set_block_size(struct sbus_priv *self, size_t size)
+{
+	return sdio_set_block_size(self->func, size);
+}
+
+static int cw1200_sdio_pm(struct sbus_priv *self, bool  suspend)
+{
+	int ret = 0;
+	const struct resource *irq = self->pdata->irq;
+
+	if (irq)
+		ret = irq_set_irq_wake(irq->start, suspend);
+
+	return ret;
 }
 
 static struct sbus_ops cw1200_sdio_sbus_ops = {
@@ -303,7 +304,9 @@ static struct sbus_ops cw1200_sdio_sbus_ops = {
 	.irq_subscribe		= cw1200_sdio_irq_subscribe,
 	.irq_unsubscribe	= cw1200_sdio_irq_unsubscribe,
 	.reset			= cw1200_sdio_reset,
-	.align_size		= cw1200_align_size,
+	.align_size		= cw1200_sdio_align_size,
+	.power_mgmt		= cw1200_sdio_pm,
+	.set_block_size		= cw1200_sdio_set_block_size,
 };
 
 /* Probe Function to be called by SDIO stack when device is discovered */
@@ -329,7 +332,7 @@ static int cw1200_sdio_probe(struct sdio_func *func,
 	sdio_enable_func(func);
 	sdio_release_host(func);
 
-	status = cw1200_probe(&cw1200_sdio_sbus_ops,
+	status = cw1200_core_probe(&cw1200_sdio_sbus_ops,
 			      self, &func->dev, &self->core);
 	if (status) {
 		sdio_claim_host(func);
@@ -342,14 +345,15 @@ static int cw1200_sdio_probe(struct sdio_func *func,
 	return status;
 }
 
-/* Disconnect Function to be called by SDIO stack when device is disconnected */
+/* Disconnect Function to be called by SDIO stack when
+ * device is disconnected */
 static void cw1200_sdio_disconnect(struct sdio_func *func)
 {
 	struct sbus_priv *self = sdio_get_drvdata(func);
 
 	if (self) {
 		if (self->core) {
-			cw1200_release(self->core);
+			cw1200_core_release(self->core);
 			self->core = NULL;
 		}
 		sdio_claim_host(func);
@@ -360,11 +364,38 @@ static void cw1200_sdio_disconnect(struct sdio_func *func)
 	}
 }
 
+static int cw1200_suspend(struct device *dev)
+{
+	int ret;
+	struct sdio_func *func = dev_to_sdio_func(dev);
+
+	/* Notify SDIO that CW1200 will remain powered during suspend */
+	ret = sdio_set_host_pm_flags(func, MMC_PM_KEEP_POWER);
+	if (ret)
+		cw1200_dbg(CW1200_DBG_ERROR,
+			   "Error setting SDIO pm flags: %i\n", ret);
+
+	return ret;
+}
+
+static int cw1200_resume(struct device *dev)
+{
+	return 0;
+}
+
+static const struct dev_pm_ops cw1200_pm_ops = {
+	.suspend = cw1200_suspend,
+	.resume = cw1200_resume,
+};
+
 static struct sdio_driver sdio_driver = {
 	.name		= "cw1200_wlan",
-	.id_table	= if_sdio_ids,
+	.id_table	= cw1200_sdio_ids,
 	.probe		= cw1200_sdio_probe,
 	.remove		= cw1200_sdio_disconnect,
+	.drv = {
+		.pm = &cw1200_pm_ops,
+	}
 };
 
 /* Init Module function -> Called by insmod */
@@ -378,6 +409,12 @@ static int __init cw1200_sdio_init(void)
 	ret = sdio_register_driver(&sdio_driver);
 	if (ret)
 		goto err_reg;
+
+	if (pdata->clk_ctrl) {
+		ret = pdata->clk_ctrl(pdata, true);
+		if (ret)
+			goto err_clk;
+	}
 
 	if (pdata->power_ctrl) {
 		ret = pdata->power_ctrl(pdata, true);
@@ -395,6 +432,9 @@ err_on:
 	if (pdata->power_ctrl)
 		pdata->power_ctrl(pdata, false);
 err_power:
+	if (pdata->clk_ctrl)
+		pdata->clk_ctrl(pdata, false);
+err_clk:
 	sdio_unregister_driver(&sdio_driver);
 err_reg:
 	return ret;
@@ -409,6 +449,8 @@ static void __exit cw1200_sdio_exit(void)
 	cw1200_sdio_off(pdata);
 	if (pdata->power_ctrl)
 		pdata->power_ctrl(pdata, false);
+	if (pdata->clk_ctrl)
+		pdata->clk_ctrl(pdata, false);
 }
 
 

@@ -9,7 +9,7 @@
 #define LINUX_MMC_CORE_H
 
 #include <linux/interrupt.h>
-#include <linux/device.h>
+#include <linux/completion.h>
 
 struct request;
 struct mmc_data;
@@ -166,6 +166,8 @@ extern int mmc_erase_group_aligned(struct mmc_card *card, unsigned int from,
 extern unsigned int mmc_calc_max_discard(struct mmc_card *card);
 
 extern int mmc_set_blocklen(struct mmc_card *card, unsigned int blocklen);
+extern int mmc_set_blockcount(struct mmc_card *card, unsigned int blockcount,
+			      bool is_rel_write);
 extern int mmc_hw_reset(struct mmc_host *host);
 extern int mmc_hw_reset_check(struct mmc_host *host);
 extern int mmc_can_reset(struct mmc_card *card);
@@ -194,4 +196,4 @@ static inline void mmc_claim_host(struct mmc_host *host)
 
 extern u32 mmc_vddrange_to_ocrmask(int vdd_min, int vdd_max);
 
-#endif
+#endif /* LINUX_MMC_CORE_H */

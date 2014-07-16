@@ -10,6 +10,8 @@
  *
  */
 
+#include <linux/module.h>
+#include <linux/device.h>
 #include <linux/cdev.h>
 #include <linux/io.h>
 #include <linux/mm.h>
@@ -52,10 +54,10 @@ static DEFINE_MUTEX(channel_lock); /* lock used to protect previous list */
 /* Debugfs support */
 bool cmld_user_has_debugfs = false;
 pid_t cmld_dump_ongoing = 0;
-module_param(cmld_dump_ongoing, uint, S_IWUSR|S_IRUGO);
+module_param(cmld_dump_ongoing, uint, S_IRUGO);
 static DECLARE_WAIT_QUEUE_HEAD(dump_waitq);
 #endif
-
+static unsigned char cmld_mmdsptraceIntr_sync[NB_MPC];
 static inline struct cm_process_priv *getProcessPriv(void)
 {
 	struct list_head* head;
@@ -363,7 +365,7 @@ static int cmld_channel_flush(struct file *file, fl_owner_t id)
 	 */
 	if (current->tgid == channelPriv->proc->pid) {
 		file->f_flags |= O_FLUSH;
-		wake_up(&channelPriv->waitq);
+		wake_up_all(&channelPriv->waitq);
 	}
 	return 0;
 }
@@ -389,6 +391,51 @@ static long cmld_channel_ioctl(struct file *file, unsigned int cmd, unsigned lon
 		return -EINVAL;
 	}
 	return 0;
+}
+
+
+/**
+ * struct dbx500_asic_id - fields of the ASIC ID
+ * @process: the manufacturing process, 0x40 is 40 nm 0x00 is "standard"
+ * @partnumber: hithereto 0x8500 for DB8500
+ * @revision: version code in the series
+ */
+struct dbx500_asic_id {
+	u16	partnumber;
+	u8	revision;
+	u8	process;
+};
+
+extern struct dbx500_asic_id dbx500_id;
+
+static inline unsigned int __attribute_const__ dbx500_partnumber(void)
+{
+	return dbx500_id.partnumber;
+}
+
+static inline unsigned int __attribute_const__ dbx500_revision(void)
+{
+	return dbx500_id.revision;
+}
+
+static inline bool __attribute_const__ cpu_is_u8500(void)
+{
+	return dbx500_partnumber() == 0x8500;
+}
+
+static inline bool __attribute_const__ cpu_is_u8520(void)
+{
+	return dbx500_partnumber() == 0x8520;
+}
+
+static inline bool cpu_is_u8500_family(void)
+{
+	return cpu_is_u8500() || cpu_is_u8520();
+}
+
+static inline bool __attribute_const__ cpu_is_u9540(void)
+{
+	return dbx500_partnumber() == 0x9540;
 }
 
 static long cmld_control_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -591,10 +638,15 @@ static long cmld_control_ioctl(struct file *file, unsigned int cmd, unsigned lon
 		t_uint32 nmfversion = NMF_VERSION;
 		return copy_to_user((void*)arg, &nmfversion, sizeof(nmfversion));
 	}
-	case CM_PRIV_GETBOARDVERSION: {
-		enum board_version v = U8500_V2;
-		return copy_to_user((void*)arg, &v, sizeof(v));
-	}
+	case CM_PRIV_GETBOARDVERSION:
+		if (cpu_is_u9540()) {
+			enum board_version v = U9540_V1;
+			return copy_to_user((void*)arg, &v, sizeof(v));
+		} else if (cpu_is_u8500_family()) {
+			enum board_version v = U8500_V2;
+			return copy_to_user((void*)arg, &v, sizeof(v));
+		} else
+			return -EINVAL;
 	case CM_PRIV_ISCOMPONENTCACHEEMPTY:
 		if (CM_ENGINE_IsComponentCacheEmpty())
 			return 0;
@@ -844,12 +896,29 @@ static int cmld_channel_open(struct file *file)
 	return 0;
 }
 
+static u64 computeDspTime(const s64 refTime, const s64 prcmuRefTime, const u64 prcmuDspTime)
+{
+	s64 dspTimens;
+
+	/*
+	 * To convert DSP time to local ARM time, we use a common PRCMU timer
+	 * on both side.
+	 * PRCMU time is based on PRCMU Timer 4, clocked at 32KHz
+	 */
+	dspTimens = div_s64( (((s64)prcmuDspTime - prcmuRefTime) * NSEC_PER_SEC),
+			     32*1024);
+
+	return (refTime + dspTimens);
+}
+
 static ssize_t cmld_sxa_trace_read(struct file *file, char *buf, size_t count, loff_t *ppos)
 {
-	struct mpcConfig *mpc = file->private_data;
+	struct cm_trace_priv *tracePriv = file->private_data;
+	struct mpcConfig *mpc = tracePriv->mpc;
 	size_t written = 0;
 	struct t_nmf_trace trace;
 	t_cm_trace_type traceType;
+	s64 refTime, prcmuRefTime;
 	struct mmdsp_trace mmdsp_tr = {
 		.media = TB_MEDIA_FILE,
 		.receiver_dev = TB_DEV_PC,
@@ -868,11 +937,34 @@ static ssize_t cmld_sxa_trace_read(struct file *file, char *buf, size_t count, l
 		.btrace_hdr_subcategory = 0,
 	};
 
+	/*
+	 * Use CLOCK_MONOTIC clock to synchronize with user logs
+	 * based on the same clock
+	 */
+	refTime = ktime_to_ns(ktime_get());
+	prcmuRefTime = OSAL_GetPrcmuTimer();
 	while ((count - written) >= sizeof(mmdsp_tr)) {
-		traceType = CM_ENGINE_GetNextTrace(mpc->coreId, &trace);
+		u16 param_nr, handle_valid;
+		u32 to_write;
+		u64 dspTime;
 
-		switch (traceType) {
-		case CM_MPC_TRACE_READ_OVERRUN:
+		if (wait_event_interruptible(mpc->trace_waitq,
+					     ((traceType =
+					       CM_ENGINE_GetNextTrace(mpc->coreId, &trace,
+								      &tracePriv->read_idx,
+								      &tracePriv->last_read_rev))
+					      != CM_MPC_TRACE_NONE)
+					     || (file->f_flags & O_NONBLOCK)
+					     || written))
+			return -ERESTARTSYS;
+
+		if (traceType == CM_MPC_TRACE_NONE)
+			return written;
+
+		dspTime = computeDspTime(refTime, prcmuRefTime, trace.timeStamp);
+
+		if (traceType == CM_MPC_TRACE_READ_OVERRUN) {
+			/* Add an overflow trace */
 			mmdsp_tr.size =
 				cpu_to_be16(offsetof(struct mmdsp_trace,
 						     ost_version)
@@ -880,71 +972,58 @@ static ssize_t cmld_sxa_trace_read(struct file *file, char *buf, size_t count, l
 						      receiver_obj));
 			mmdsp_tr.message_id = TB_TRACE_EXCEPTION_MSG;
 			mmdsp_tr.ost_master_id = TB_EXCEPTION_LONG_OVRF_PACKET;
+			mmdsp_tr.timestamp = cpu_to_be64(dspTime);
 			if (copy_to_user(&buf[written], &mmdsp_tr,
 					 offsetof(struct mmdsp_trace,
 						  ost_version)))
 				return -EFAULT;
 			written += offsetof(struct mmdsp_trace, ost_version);
-			if ((count - written) < sizeof(mmdsp_tr))
-				break;
-		case CM_MPC_TRACE_READ: {
-			u16 param_nr = (u16)trace.paramOpt;
-			u16 handle_valid = (u16)(trace.paramOpt >> 16);
-			u32 to_write = offsetof(struct mmdsp_trace,
-						parent_handle);
-			mmdsp_tr.transaction_id = trace.revision%256;
-			mmdsp_tr.message_id = TB_TRACE_MSG;
-			mmdsp_tr.ost_master_id = OST_MASTERID;
-			mmdsp_tr.timestamp = cpu_to_be64(trace.timeStamp);
-			mmdsp_tr.timestamp2 = cpu_to_be64(trace.timeStamp);
-			mmdsp_tr.component_id = cpu_to_be32(trace.componentId);
-			mmdsp_tr.trace_id = cpu_to_be32(trace.traceId);
-			mmdsp_tr.btrace_hdr_category = (trace.traceId>>16)&0xFF;
-			mmdsp_tr.btrace_hdr_size = BTRACE_HEADER_SIZE
-				+ sizeof(trace.params[0]) * param_nr;
-			if (handle_valid) {
-				mmdsp_tr.parent_handle = trace.parentHandle;
-				mmdsp_tr.component_handle =
-					trace.componentHandle;
-				to_write += sizeof(trace.parentHandle)
-					+ sizeof(trace.componentHandle);
-				mmdsp_tr.btrace_hdr_size +=
-					sizeof(trace.parentHandle)
-					+ sizeof(trace.componentHandle);
-			}
-			mmdsp_tr.size =
-				cpu_to_be16(to_write
-					    + (sizeof(trace.params[0])*param_nr)
-					    - offsetof(struct mmdsp_trace,
-						       receiver_obj));
-			mmdsp_tr.length = to_write
-				+ (sizeof(trace.params[0])*param_nr)
-				- offsetof(struct mmdsp_trace,
-					   timestamp2);
-			if (copy_to_user(&buf[written], &mmdsp_tr, to_write))
-				return -EFAULT;
-			written += to_write;
-			/* write param */
-			to_write = sizeof(trace.params[0]) * param_nr;
-			if (copy_to_user(&buf[written], trace.params, to_write))
-				return -EFAULT;
-			written += to_write;
-			break;
 		}
-		case CM_MPC_TRACE_NONE:
-		default:
-			if ((file->f_flags & O_NONBLOCK) || written)
-				return written;
-			spin_lock_bh(&mpc->trace_reader_lock);
-			mpc->trace_reader = current;
-			spin_unlock_bh(&mpc->trace_reader_lock);
-			schedule_timeout_killable(msecs_to_jiffies(200));
-			spin_lock_bh(&mpc->trace_reader_lock);
-			mpc->trace_reader = NULL;
-			spin_unlock_bh(&mpc->trace_reader_lock);
-			if (signal_pending(current))
-				return -ERESTARTSYS;
+
+		/* return if not enough remaining space to put the trace */
+		if ((count - written) < sizeof(mmdsp_tr))
+			return written;
+
+		param_nr = (u16)trace.paramOpt;
+		handle_valid = (u16)(trace.paramOpt >> 16);
+		to_write = offsetof(struct mmdsp_trace, parent_handle);
+
+		mmdsp_tr.transaction_id = trace.revision%256;
+		mmdsp_tr.message_id = TB_TRACE_MSG;
+		mmdsp_tr.ost_master_id = OST_MASTERID;
+		mmdsp_tr.timestamp2 = mmdsp_tr.timestamp
+			= cpu_to_be64(dspTime);
+		mmdsp_tr.component_id = cpu_to_be32(trace.componentId);
+		mmdsp_tr.trace_id = cpu_to_be32(trace.traceId);
+		mmdsp_tr.btrace_hdr_category = (trace.traceId>>16)&0xFF;
+		mmdsp_tr.btrace_hdr_size = BTRACE_HEADER_SIZE
+			+ sizeof(trace.params[0]) * param_nr;
+		if (handle_valid) {
+			mmdsp_tr.parent_handle = trace.parentHandle;
+			mmdsp_tr.component_handle = trace.componentHandle;
+			to_write += sizeof(trace.parentHandle)
+				+ sizeof(trace.componentHandle);
+			mmdsp_tr.btrace_hdr_size +=
+				sizeof(trace.parentHandle)
+				+ sizeof(trace.componentHandle);
 		}
+		mmdsp_tr.size =
+			cpu_to_be16(to_write
+				    + (sizeof(trace.params[0])*param_nr)
+				    - offsetof(struct mmdsp_trace,
+					       receiver_obj));
+		mmdsp_tr.length = to_write
+			+ (sizeof(trace.params[0])*param_nr)
+			- offsetof(struct mmdsp_trace,
+				   timestamp2);
+		if (copy_to_user(&buf[written], &mmdsp_tr, to_write))
+			return -EFAULT;
+		written += to_write;
+		/* write param */
+		to_write = sizeof(trace.params[0]) * param_nr;
+		if (copy_to_user(&buf[written], trace.params, to_write))
+			return -EFAULT;
+		written += to_write;
 	}
 	return written;
 }
@@ -952,8 +1031,15 @@ static ssize_t cmld_sxa_trace_read(struct file *file, char *buf, size_t count, l
 /* Driver's release method for /dev/cm_sxa_trace */
 static int cmld_sxa_trace_release(struct inode *inode, struct file *file)
 {
-	struct mpcConfig *mpc = file->private_data;
-	atomic_dec(&mpc->trace_read_count);
+    struct cm_trace_priv *tracePriv = file->private_data;
+    struct mpcConfig *mpc = tracePriv->mpc;
+    cmld_mmdsptraceIntr_sync[mpc->coreId-1]--;
+    if(cmld_mmdsptraceIntr_sync[mpc->coreId-1] == 0)
+    {
+        //disable ost trace interrupt when there is no reader
+        cm_DisableIntr_Osttrace(mpc->coreId);
+    }
+	OSAL_Free(file->private_data);
 	return 0;
 }
 
@@ -965,12 +1051,20 @@ static struct file_operations cmld_sxa_trace_fops = {
 
 static int cmld_sxa_trace_open(struct file *file, struct mpcConfig *mpc)
 {
-	if (atomic_add_unless(&mpc->trace_read_count, 1, 1) == 0)
-		return -EBUSY;
+    struct cm_trace_priv *tracePriv;
+    tracePriv = (struct cm_trace_priv*)OSAL_Alloc(sizeof(*tracePriv));
+    if (tracePriv == NULL)
+        return -ENOMEM;
 
-	file->private_data = mpc;
-	file->f_op = &cmld_sxa_trace_fops;
-	return 0;
+    tracePriv->read_idx = 0;
+    tracePriv->last_read_rev = 0;
+    tracePriv->mpc = mpc;
+
+    file->private_data = tracePriv;
+    file->f_op = &cmld_sxa_trace_fops;
+    cm_EnableIntr_Osttrace(mpc->coreId);
+    cmld_mmdsptraceIntr_sync[mpc->coreId-1]++;
+    return 0;
 }
 
 /* driver open() call: specific */
@@ -1197,7 +1291,6 @@ static int __init cmld_init_module(void)
 	unsigned i=0;
 	dev_t dev;
 	t_cfg_allocator_id dataAllocId = -1;
-	void *htim_base=NULL;
 
 	/* Component manager initialization descriptors */
 	t_nmf_hw_mapping_desc nmfHwMappingDesc;
@@ -1219,17 +1312,13 @@ static int __init cmld_init_module(void)
 
 	err = -EIO;
 	prcmu_base = __io_address(U8500_PRCMU_BASE);
-
-	/* power on a clock/timer 90KHz used on SVA */
-	htim_base = ioremap_nocache(U8500_CR_BASE /*0xA03C8000*/, SZ_4K);
-	prcmu_tcdm_base = __io_address(U8500_PRCMU_TCDM_BASE);
-
-	/* Activate SVA 90 KHz timer */
-	if (htim_base == NULL)
-		goto out;
-	iowrite32((1<<26) | ioread32(htim_base), htim_base);
-	iounmap(htim_base);
-
+	if (cpu_is_u9540()) {
+		prcmu_tcdm_base = __io_address(U8500_PRCMU_TCDM_BASE + SZ_8K);
+	} else if (cpu_is_u8500_family()) {
+		/* power on a clock/timer 90KHz used on SVA */
+		prcmu_tcdm_base = __io_address(U8500_PRCMU_TCDM_BASE);
+	} else
+			return -EINVAL;
 	err = init_config();
 	if (err)
 		goto out;

@@ -769,9 +769,18 @@ PUBLIC EXPORT_SHARED t_cm_error CM_ENGINE_BindComponentToCMCore(
                 (t_mpc2host_bf_info**)mpc2hostId);
 
         cm_EEM_AllowSleep(itfRequire.client->Template->dspId);
-    }
 
-    cm_registerSingletonBinding(client, &itfRequire, NULL, clientId);
+        if (error == CM_OK)
+		cm_registerSingletonBinding(client, &itfRequire, NULL, clientId);
+    }
+    else
+    {
+        /*
+	 * bindable = FALSE means client is SINGLETON
+	 * We don't allow multiple binding of singleton in this case.
+	 */
+        error = CM_INTERFACE_ALREADY_BINDED;
+    }
 
 out:
     cm_ELF_CloseFile(TRUE, elfhandleStub);
@@ -798,6 +807,12 @@ PUBLIC EXPORT_SHARED t_cm_error CM_ENGINE_UnbindComponentToCMCore(
 				       &itfRequire, &itfProvide)) != CM_OK)
         goto out;
 
+    if (itfRequire.client->interfaceReferences[itfRequire.requireIndex][itfRequire.collectionIndex].instance == NULL)
+    {
+        error = CM_INTERFACE_NOT_BINDED;
+        goto out;
+    }
+
     // Check if this is a DSP to Host binding
     if(itfRequire.client->interfaceReferences[itfRequire.requireIndex][itfRequire.collectionIndex].bfInfoID != BF_DSP2HOST)
     {
@@ -816,7 +831,6 @@ PUBLIC EXPORT_SHARED t_cm_error CM_ENGINE_UnbindComponentToCMCore(
         (void)cm_EEM_ForceWakeup(itfRequire.client->Template->dspId);
 
         cm_unbindComponentToCMCore(&itfRequire, bfInfo);
-
         cm_EEM_AllowSleep(itfRequire.client->Template->dspId);
 
         error = CM_OK;
@@ -979,7 +993,7 @@ PUBLIC EXPORT_SHARED t_cm_error CM_ENGINE_GetComponentListNext(
 
     // Sanity check
     if ((i >= ComponentTable.idxMax)
-	|| (((unsigned int)componentEntry(i) << INDEX_SHIFT) != (prevComponent & ~INDEX_MASK)))
+	|| (((unsigned int)componentEntry(i) << LSBADDR_SHIFT) != (prevComponent & ~(INDEX_MASK |STATUSBIT_MASK))))
         error =  CM_INVALID_COMPONENT_HANDLE;
     else {
 	*nextComponent = 0;

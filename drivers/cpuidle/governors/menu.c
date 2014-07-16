@@ -12,13 +12,14 @@
 
 #include <linux/kernel.h>
 #include <linux/cpuidle.h>
-#include <linux/pm_qos_params.h>
+#include <linux/pm_qos.h>
 #include <linux/time.h>
 #include <linux/ktime.h>
 #include <linux/hrtimer.h>
 #include <linux/tick.h>
 #include <linux/sched.h>
 #include <linux/math64.h>
+#include <linux/module.h>
 #include <linux/cpu.h>
 #include <linux/sysfs.h>
 
@@ -126,18 +127,8 @@ struct menu_device {
 static int tune_multiplier = 1024;
 static int forced_state;
 
-#if 0
 #define LOAD_INT(x) ((x) >> FSHIFT)
 #define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1-1)) * 100)
-
-static int get_loadavg(void)
-{
-	unsigned long this = this_cpu_load();
-
-
-	return LOAD_INT(this) * 10 + LOAD_FRAC(this) / 10;
-}
-#endif
 
 static inline int which_bucket(unsigned int duration)
 {
@@ -180,14 +171,14 @@ static inline int performance_multiplier(void)
 		return tune_multiplier;
 
 	/* for higher loadavg, we are more reluctant */
-#if 0
+
 	/*
 	 * this doesn't work as intended - it is almost always 0, but can
 	 * sometimes, depending on workload, spike very high into the hundreds
 	 * even when the average cpu load is under 10%.
 	 */
-	mult += 2 * get_loadavg();
-#endif
+	/* mult += 2 * get_loadavg(); */
+
 	/* for IO wait tasks (per cpu!) we add 5x each */
 	mult += 10 * nr_iowait_cpu(smp_processor_id());
 
@@ -199,7 +190,7 @@ static inline int performance_multiplier(void)
 
 static DEFINE_PER_CPU(struct menu_device, menu_devices);
 
-static void menu_update(struct cpuidle_device *dev);
+static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev);
 
 /* This implements DIV_ROUND_CLOSEST but avoids 64 bit division */
 static u64 div_round64(u64 dividend, u32 divisor)
@@ -245,19 +236,20 @@ static void detect_repeating_patterns(struct menu_device *data)
 
 /**
  * menu_select - selects the next idle state to enter
+ * @drv: cpuidle driver containing state data
  * @dev: the CPU
  */
-static int menu_select(struct cpuidle_device *dev)
+static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 {
 	struct menu_device *data = &__get_cpu_var(menu_devices);
 	int latency_req = pm_qos_request(PM_QOS_CPU_DMA_LATENCY);
-	unsigned int power_usage = -1;
+	int power_usage = -1;
 	int i;
 	int multiplier;
 	struct timespec t;
 
 	if (data->needs_update) {
-		menu_update(dev);
+		menu_update(drv, dev);
 		data->needs_update = 0;
 	}
 
@@ -295,24 +287,24 @@ static int menu_select(struct cpuidle_device *dev)
 	 * We want to default to C1 (hlt), not to busy polling
 	 * unless the timer is happening really really soon.
 	 */
-	if (data->expected_us > 5)
+	if (data->expected_us > 5 &&
+		drv->states[CPUIDLE_DRIVER_STATE_START].disable == 0)
 		data->last_state_idx = CPUIDLE_DRIVER_STATE_START;
 
-	WARN((forced_state >= dev->state_count), \
+	WARN((forced_state >= drv->state_count), \
 		"Forced state value out of range.\n");
-
-	if ((forced_state != 0) && (forced_state < dev->state_count)) {
-		data->exit_us = dev->states[forced_state].exit_latency;
+	if ((forced_state != 0) && (forced_state < drv->state_count)) {
+		data->exit_us = drv->states[forced_state].exit_latency;
 		data->last_state_idx = forced_state;
 	} else {
 		/*
 		 * Find the idle state with the lowest power while satisfying
 		 * our constraints.
 		 */
-		for (i = CPUIDLE_DRIVER_STATE_START; i < dev->state_count; i++) {
-			struct cpuidle_state *s = &dev->states[i];
+		for (i = CPUIDLE_DRIVER_STATE_START; i < drv->state_count; i++) {
+			struct cpuidle_state *s = &drv->states[i];
 
-			if (s->flags & CPUIDLE_FLAG_IGNORE)
+			if (s->disable)
 				continue;
 			if (s->target_residency > data->predicted_us)
 				continue;
@@ -332,29 +324,90 @@ static int menu_select(struct cpuidle_device *dev)
 	return data->last_state_idx;
 }
 
+int cpuidle_set_multiplier(unsigned int value)
+{
+
+	if (value > 1024)
+		tune_multiplier = 1024;
+	else
+		tune_multiplier = value;
+
+	return 0;
+}
+EXPORT_SYMBOL(cpuidle_set_multiplier);
+
+/* Writing 0 will remove the forced state. */
+int cpuidle_force_state(unsigned int state)
+{
+	forced_state = state;
+
+	return 0;
+}
+EXPORT_SYMBOL(cpuidle_force_state);
+
+static ssize_t show_multiplier(struct device *device,
+			       struct device_attribute *attr,
+			       char *buf)
+{
+	return sprintf(buf, "%d\n", tune_multiplier);
+}
+
+static ssize_t store_multiplier(struct device *device,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	unsigned long input;
+	int ret;
+
+	ret = kstrtoul_from_user(buf, count, 0, &input);
+
+	if (ret)
+		return ret;
+
+	cpuidle_set_multiplier(input);
+
+	return count;
+}
+
+static DEVICE_ATTR(multiplier, 0644, show_multiplier, store_multiplier);
+
+static struct attribute *dbs_attributes[] = {
+	&dev_attr_multiplier.attr,
+	NULL
+};
+
+static struct attribute_group dbs_attr_group = {
+	.attrs = dbs_attributes,
+	.name = "cpuidle",
+};
+
 /**
  * menu_reflect - records that data structures need update
  * @dev: the CPU
+ * @index: the index of actual entered state
  *
  * NOTE: it's important to be fast here because this operation will add to
  *       the overall exit latency.
  */
-static void menu_reflect(struct cpuidle_device *dev)
+static void menu_reflect(struct cpuidle_device *dev, int index)
 {
 	struct menu_device *data = &__get_cpu_var(menu_devices);
-	data->needs_update = 1;
+	data->last_state_idx = index;
+	if (index >= 0)
+		data->needs_update = 1;
 }
 
 /**
  * menu_update - attempts to guess what happened after entry
+ * @drv: cpuidle driver containing state data
  * @dev: the CPU
  */
-static void menu_update(struct cpuidle_device *dev)
+static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 {
 	struct menu_device *data = &__get_cpu_var(menu_devices);
 	int last_idx = data->last_state_idx;
 	unsigned int last_idle_us = cpuidle_get_last_residency(dev);
-	struct cpuidle_state *target = &dev->states[last_idx];
+	struct cpuidle_state *target = &drv->states[last_idx];
 	unsigned int measured_us;
 	u64 new_factor;
 
@@ -406,68 +459,13 @@ static void menu_update(struct cpuidle_device *dev)
 		data->interval_ptr = 0;
 }
 
-int cpuidle_set_multiplier(unsigned int value)
-{
-
-	if (value > 1024)
-		tune_multiplier = 1024;
-	else
-		tune_multiplier = value;
-
-	return 0;
-}
-EXPORT_SYMBOL(cpuidle_set_multiplier);
-
-/* Writing 0 will remove the forced state. */
-int cpuidle_force_state(unsigned int state)
-{
-	forced_state = state;
-
-	return 0;
-}
-EXPORT_SYMBOL(cpuidle_force_state);
-
-static ssize_t show_multiplier(struct sysdev_class *class,
-				      struct sysdev_class_attribute *attr,
-					  char *buf)
-{
-	return sprintf(buf, "%d\n", tune_multiplier);
-}
-
-static ssize_t store_multiplier(struct sysdev_class *class,
-					struct sysdev_class_attribute *attr,
-				    const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1)
-		return -EINVAL;
-
-	cpuidle_set_multiplier(input);
-
-	return count;
-}
-
-
-static SYSDEV_CLASS_ATTR(multiplier, 0644, show_multiplier, store_multiplier);
-
-static struct attribute *dbs_attributes[] = {
-	&attr_multiplier.attr,
-	NULL
-};
-
-static struct attribute_group dbs_attr_group = {
-	.attrs = dbs_attributes,
-	.name = "cpuidle",
-};
-
 /**
  * menu_enable_device - scans a CPU's states and does setup
+ * @drv: cpuidle driver
  * @dev: the CPU
  */
-static int menu_enable_device(struct cpuidle_device *dev)
+static int menu_enable_device(struct cpuidle_driver *drv,
+				struct cpuidle_device *dev)
 {
 	struct menu_device *data = &per_cpu(menu_devices, dev->cpu);
 
@@ -494,11 +492,9 @@ static int __init init_menu(void)
 
 	ret = cpuidle_register_governor(&menu_governor);
 
-	sysfs_merge_group(&(cpu_sysdev_class.kset.kobj),
-						&dbs_attr_group);
-
+	sysfs_merge_group(&cpu_subsys.dev_root->kobj,
+			  &dbs_attr_group);
 	return ret;
-
 }
 
 /**
@@ -506,9 +502,6 @@ static int __init init_menu(void)
  */
 static void __exit exit_menu(void)
 {
-	sysfs_unmerge_group(&(cpu_sysdev_class.kset.kobj),
-						&dbs_attr_group);
-
 	cpuidle_unregister_governor(&menu_governor);
 }
 

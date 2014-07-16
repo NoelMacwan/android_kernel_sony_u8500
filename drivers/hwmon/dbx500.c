@@ -1,13 +1,12 @@
 /*
- * Copyright (C) ST-Ericsson SA 2010. All rights reserved.
- * This code is ST-Ericsson proprietary and confidential.
- * Any use of the code for whatever purpose is subject to
- * specific written permission of ST-Ericsson SA.
+ * Copyright (C) ST-Ericsson SA 2010
  *
- * Author: WenHai Fang <wenhai.h.fang@stericsson.com> for
- * ST-Ericsson.
- * License terms: GNU Gereral Public License (GPL) version 2
+ * License Terms: GNU General Public License v2
  *
+ * Authors: WenHai Fang <wenhai.h.fang@stericsson.com>
+ *
+ *
+ * Description: DBX500 temperature driver
  */
 
 #include <linux/module.h>
@@ -34,7 +33,7 @@
 /*
  * Default critical sensor temperature
  */
-#define DEFAULT_CRITICAL_TEMP 85
+#define DEFAULT_CRITICAL_TEMP 100
 
 /* This driver monitors DB thermal*/
 #define NUM_SENSORS 1
@@ -274,6 +273,7 @@ static struct attribute *dbx500_temp_attributes[] = {
 static struct attribute *dbx500_temp_attributes_extended[] = {
 	&sensor_dev_attr_name.dev_attr.attr,
 	&sensor_dev_attr_temp1_input.dev_attr.attr,
+	&sensor_dev_attr_temp1_min.dev_attr.attr,
 	&sensor_dev_attr_temp1_max.dev_attr.attr,
 	&sensor_dev_attr_temp1_crit.dev_attr.attr,
 	&sensor_dev_attr_temp1_label.dev_attr.attr,

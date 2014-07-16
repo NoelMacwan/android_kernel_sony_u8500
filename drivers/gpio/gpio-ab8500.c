@@ -15,19 +15,19 @@
 #include <linux/module.h>
 #include <linux/err.h>
 #include <linux/platform_device.h>
-#include <linux/slab.h>
 #include <linux/gpio.h>
 #include <linux/irq.h>
 #include <linux/interrupt.h>
-#include <linux/mfd/ab8500.h>
 #include <linux/mfd/abx500.h>
 #include <linux/mfd/abx500/ab8500-gpio.h>
 
 /*
- * The AB9540 GPIO support is an extended version of the
- * AB8500 GPIO support. The AB9540 supports an additional
- * (7th) register so that more GPIO may be configured and
- * used.
+ * The AB9540 and AB8540 GPIO support are extended versions
+ * of the AB8500 GPIO support.
+ * The AB9540 supports an additional (7th) register so that
+ * more GPIO may be configured and used.
+ * The AB8540 supports 4 new gpios (GPIOx_VBAT) that have
+ * internal pull-up and pull-down capabilities.
  */
 
 /*
@@ -73,13 +73,20 @@
 #define AB8500_GPIO_IN5_REG	0x44
 #define AB8500_GPIO_IN6_REG	0x45
 #define AB9540_GPIO_IN7_REG	0x46
+#define AB8540_GPIO_VINSEL_REG	0x47
+#define AB8540_GPIO_PULL_UPDOWN_REG	0x48
 #define AB8500_GPIO_ALTFUN_REG	0x50
 #define AB8500_ALTFUN_REG_INDEX	6
 #define AB9540_ALTFUN_REG_INDEX	7
 #define AB8500_NUM_GPIO		42
 #define AB9540_NUM_GPIO		54
 #define AB8505_NUM_GPIO		53
+#define AB8540_NUM_GPIO		56
 #define AB8500_NUM_VIR_GPIO_IRQ	16
+#define AB8540_GPIO_PULL_UPDOWN_MASK	0x03
+#define AB8540_GPIO_VINSEL_MASK	0x03
+#define AB8540_GPIOX_VBAT_START	51
+#define AB8540_GPIOX_VBAT_END	54
 
 enum ab8500_gpio_action {
 	NONE,
@@ -92,6 +99,7 @@ enum ab8500_gpio_action {
 struct ab8500_gpio_irq_cluster {
 	int start;
 	int end;
+	int offset;
 };
 
 struct ab8500_gpio {
@@ -146,6 +154,17 @@ static struct ab8500_gpio_irq_cluster ab8505_irq_clusters[] = {
 	{.start = 49, .end = 49},
 	{.start = 51, .end = 52},
 };
+
+/*
+ * For AB8540 Only some GPIOs are interrupt capable:
+ *	GPIO43 to GPIO44
+ *	GPIO51 to GPIO54
+ */
+static struct ab8500_gpio_irq_cluster ab8540_irq_clusters[] = {
+	{.start = 42,  .end = 43,  .offset = 2}, /* GPIO numbers start from 1 */
+	{.start = 50,  .end = 53},
+};
+
 
 /**
  * to_ab8500_gpio() - get the pointer to ab8500_gpio
@@ -204,6 +223,7 @@ static void ab8500_gpio_set(struct gpio_chip *chip, unsigned offset, int val)
 static int ab8500_gpio_direction_output(struct gpio_chip *chip, unsigned offset,
 					int val)
 {
+	struct ab8500_gpio *ab8500_gpio = to_ab8500_gpio(chip);
 	int ret;
 	/* set direction as output */
 	ret = ab8500_gpio_set_bits(chip, AB8500_GPIO_DIR1_REG, offset, 1);
@@ -213,6 +233,18 @@ static int ab8500_gpio_direction_output(struct gpio_chip *chip, unsigned offset,
 	ret = ab8500_gpio_set_bits(chip, AB8500_GPIO_PUD1_REG, offset, 1);
 	if (ret < 0)
 		return ret;
+	/*
+	 * Disable both pull down and pull up for GPIO51 to GPIO54 (GPIO1_VBAT
+	 * to GPIO4_VBAT).
+	 */
+	if (is_ab8540(ab8500_gpio->parent)) {
+		if (offset >= (AB8540_GPIOX_VBAT_START - 1)
+			&& offset <= (AB8540_GPIOX_VBAT_END - 1))
+			ret = ab8540_config_pull_updown(ab8500_gpio->dev,
+				AB8500_PIN_GPIO(offset + 1), AB8540_GPIO_PULL_NONE);
+		if (ret < 0)
+			return ret;
+	}
 	/* set the output as 1 or 0 */
 	return ab8500_gpio_set_bits(chip, AB8500_GPIO_OUT1_REG, offset, val);
 
@@ -238,7 +270,7 @@ static int ab8500_gpio_to_irq(struct gpio_chip *chip, unsigned offset)
 			return base + offset - cluster->start;
 
 		/* Advance by the number of gpios in this cluster */
-		base += cluster->end - cluster->start + 1;
+		base += cluster->end + cluster->offset - cluster->start + 1;
 	}
 
 	return -EINVAL;
@@ -258,7 +290,12 @@ static unsigned int irq_to_rising(unsigned int irq)
 {
 	struct ab8500_gpio *ab8500_gpio = irq_get_chip_data(irq);
 	int offset = irq - ab8500_gpio->irq_base;
-	int new_irq = offset +  AB8500_INT_GPIO6R
+	int new_irq;
+	if (is_ab8540(ab8500_gpio->parent)) {
+		new_irq = offset * 2 + AB8540_INT_GPIO43R
+			+ ab8500_gpio->parent->irq_base;
+	} else
+		new_irq = offset + AB8500_INT_GPIO6R
 			+ ab8500_gpio->parent->irq_base;
 	return new_irq;
 }
@@ -267,8 +304,13 @@ static unsigned int irq_to_falling(unsigned int irq)
 {
 	struct ab8500_gpio *ab8500_gpio = irq_get_chip_data(irq);
 	int offset = irq - ab8500_gpio->irq_base;
-	int new_irq = offset +  AB8500_INT_GPIO6F
-			+  ab8500_gpio->parent->irq_base;
+	int new_irq;
+	if (is_ab8540(ab8500_gpio->parent)) {
+		new_irq = offset * 2 + AB8540_INT_GPIO43F
+			+ ab8500_gpio->parent->irq_base;
+	} else
+		new_irq = offset + AB8500_INT_GPIO6F
+			+ ab8500_gpio->parent->irq_base;
 	return new_irq;
 
 }
@@ -276,20 +318,33 @@ static unsigned int irq_to_falling(unsigned int irq)
 static unsigned int rising_to_irq(unsigned int irq, void *dev)
 {
 	struct ab8500_gpio *ab8500_gpio = dev;
-	int offset = irq - AB8500_INT_GPIO6R
-			- ab8500_gpio->parent->irq_base ;
-	int new_irq = offset + ab8500_gpio->irq_base;
+	int offset, new_irq;
+	if (is_ab8540(ab8500_gpio->parent)) {
+		offset = irq - AB8540_INT_GPIO43R
+			- ab8500_gpio->parent->irq_base;
+		new_irq = (offset >> 1) + ab8500_gpio->irq_base;
+	} else {
+		offset = irq - AB8500_INT_GPIO6R
+			- ab8500_gpio->parent->irq_base;
+		new_irq = offset + ab8500_gpio->irq_base;
+	}
 	return new_irq;
 }
 
 static unsigned int falling_to_irq(unsigned int irq, void *dev)
 {
 	struct ab8500_gpio *ab8500_gpio = dev;
-	int offset = irq - AB8500_INT_GPIO6F
-			- ab8500_gpio->parent->irq_base ;
-	int new_irq = offset + ab8500_gpio->irq_base;
+	int offset, new_irq;
+	if (is_ab8540(ab8500_gpio->parent)) {
+		offset = irq - AB8540_INT_GPIO43F
+			- ab8500_gpio->parent->irq_base;
+		new_irq = (offset >> 1) + ab8500_gpio->irq_base;
+	} else {
+		offset = irq - AB8500_INT_GPIO6F
+			- ab8500_gpio->parent->irq_base;
+		new_irq = offset + ab8500_gpio->irq_base;
+	}
 	return new_irq;
-
 }
 
 /*
@@ -484,7 +539,14 @@ static int __devinit ab8500_gpio_probe(struct platform_device *pdev)
 	ab8500_gpio->irq_base = pdata->irq_base;
 
 	/* Configure GPIO Settings for specific AB devices */
-	if (is_ab9540(parent)) {
+	if (is_ab8540(parent)) {
+		ab8500_gpio->chip.ngpio = AB8540_NUM_GPIO;
+		ab8500_gpio->irq_cluster = ab8540_irq_clusters;
+		ab8500_gpio->irq_cluster_size =
+			ARRAY_SIZE(ab8540_irq_clusters);
+		last_gpio_sel_reg = AB9540_GPIO_SEL7_REG;
+		altfun_reg_index = AB9540_ALTFUN_REG_INDEX;
+	} else if (is_ab9540(parent)) {
 		ab8500_gpio->chip.ngpio = AB9540_NUM_GPIO;
 		ab8500_gpio->irq_cluster = ab9540_irq_clusters;
 		ab8500_gpio->irq_cluster_size =
@@ -536,6 +598,20 @@ static int __devinit ab8500_gpio_probe(struct platform_device *pdev)
 		if (ret < 0)
 			goto out_free;
 	}
+
+	if (is_ab8540(parent)) {
+		ret = abx500_set_register_interruptible(ab8500_gpio->dev,
+				AB8500_MISC, AB8540_GPIO_VINSEL_REG,
+				pdata->config_vinsel);
+		if (ret < 0)
+			goto out_free;
+		ret = abx500_set_register_interruptible(ab8500_gpio->dev,
+				AB8500_MISC, AB8540_GPIO_PULL_UPDOWN_REG,
+				pdata->config_pullupdown);
+		if (ret < 0)
+			goto out_free;
+	}
+
 	ret = abx500_set_register_interruptible(ab8500_gpio->dev, AB8500_MISC,
 				AB8500_GPIO_ALTFUN_REG,
 				pdata->config_reg[altfun_reg_index]);
@@ -601,6 +677,56 @@ int ab8500_config_pulldown(struct device *dev,
 	return ret;
 }
 EXPORT_SYMBOL(ab8500_config_pulldown);
+
+int ab8540_config_pull_updown(struct device *dev,
+				int gpio, enum ab8540_gpio_pull_updown val)
+{
+	u8 pos;
+	int ret;
+
+	if ((gpio < AB8500_PIN_GPIO(AB8540_GPIOX_VBAT_START))
+		|| (gpio > AB8500_PIN_GPIO(AB8540_GPIOX_VBAT_END))) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	pos = (gpio - AB8500_PIN_GPIO(AB8540_GPIOX_VBAT_START)) << 1;
+
+	ret = abx500_mask_and_set_register_interruptible(dev,
+			AB8500_MISC, AB8540_GPIO_PULL_UPDOWN_REG,
+			AB8540_GPIO_PULL_UPDOWN_MASK << pos, val << pos);
+
+out:
+	if (ret < 0)
+		dev_err(dev, "%s failed (%d)\n", __func__, ret);
+	return ret;
+}
+EXPORT_SYMBOL(ab8540_config_pull_updown);
+
+int ab8540_gpio_config_vinsel(struct device *dev,
+				int gpio, enum ab8540_gpio_vinsel val)
+{
+	u8 pos;
+	int ret;
+
+	if ((gpio < AB8500_PIN_GPIO(AB8540_GPIOX_VBAT_START))
+		|| (gpio > AB8500_PIN_GPIO(AB8540_GPIOX_VBAT_END))) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	pos = (gpio - AB8500_PIN_GPIO(AB8540_GPIOX_VBAT_START)) << 1;
+
+	ret = abx500_mask_and_set_register_interruptible(dev,
+			AB8500_MISC, AB8540_GPIO_VINSEL_REG,
+			AB8540_GPIO_VINSEL_MASK << pos, val << pos);
+
+out:
+	if (ret < 0)
+		dev_err(dev, "%s failed (%d)\n", __func__, ret);
+	return ret;
+}
+EXPORT_SYMBOL(ab8540_gpio_config_vinsel);
 
 /*
  * ab8500_gpio_config_select()

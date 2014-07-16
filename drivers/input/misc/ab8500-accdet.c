@@ -13,15 +13,15 @@
 
 #include <linux/delay.h>
 #include <linux/interrupt.h>
-#include <linux/mfd/ab8500.h>
 #include <linux/mfd/abx500.h>
+#include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/mfd/abx500/ab8500-gpadc.h>
 #include <linux/mfd/abx500/ab8500-gpio.h>
 #include <linux/gpio.h>
 #include <linux/err.h>
 #include <linux/input/abx500-accdet.h>
-#ifdef CONFIG_SND_SOC_UX500_AB8500
+#ifdef CONFIG_SND_SOC_UX500_AB850X
 #include <sound/ux500_ab8500_ext.h>
 #endif
 
@@ -58,17 +58,6 @@
 
 /* After being loaded, how fast the first check is to be made */
 #define INIT_DELAY_MS			3000
-
-/* Voltage limits (mV) for various types of AV Accessories */
-#define ACCESSORY_DET_VOL_DONTCARE	-1
-#define ACCESSORY_HEADPHONE_DET_VOL_MIN	0
-#define ACCESSORY_HEADPHONE_DET_VOL_MAX	40
-#define ACCESSORY_CARKIT_DET_VOL_MIN	1100
-#define ACCESSORY_CARKIT_DET_VOL_MAX	1300
-#define ACCESSORY_HEADSET_DET_VOL_MIN	0
-#define ACCESSORY_HEADSET_DET_VOL_MAX	200
-#define ACCESSORY_OPENCABLE_DET_VOL_MIN	1730
-#define ACCESSORY_OPENCABLE_DET_VOL_MAX	2150
 
 /* Static data initialization */
 
@@ -229,7 +218,7 @@ static int ab8500_detect_plugged_in(struct abx500_ad *dd)
 		return value & BIT_ITSOURCE5_ACCDET1 ? 0 : 1;
 }
 
-#ifdef CONFIG_SND_SOC_UX500_AB8500
+#ifdef CONFIG_SND_SOC_UX500_AB850X
 
 /*
  * meas_voltage_stable - measures relative stable voltage from spec. input
@@ -238,7 +227,7 @@ static int ab8500_meas_voltage_stable(struct abx500_ad *dd)
 {
 	int ret, mv;
 
-	ret = ux500_ab8500_audio_gpadc_measure((struct ab8500_gpadc *)dd->gpadc,
+	ret = ux500_ab850x_audio_gpadc_measure((struct ab8500_gpadc *)dd->gpadc,
 			ACC_DETECT2, false, &mv);
 
 	return (ret < 0) ? ret : mv;
@@ -251,7 +240,7 @@ static int ab8500_meas_alt_voltage_stable(struct abx500_ad *dd)
 {
 	int ret, mv;
 
-	ret = ux500_ab8500_audio_gpadc_measure((struct ab8500_gpadc *)dd->gpadc,
+	ret = ux500_ab850x_audio_gpadc_measure((struct ab8500_gpadc *)dd->gpadc,
 			ACC_DETECT2, true, &mv);
 
 	return (ret < 0) ? ret : mv;
@@ -342,20 +331,24 @@ static void ab8500_config_hw_test_basic_carkit(struct abx500_ad *dd, int enable)
  * sets the av switch direction - audio-in vs video-out
  */
 static void ab8500_set_av_switch(struct abx500_ad *dd,
-		enum accessory_avcontrol_dir dir)
+		enum accessory_avcontrol_dir dir, bool nahj_headset)
 {
-	int ret;
+	int ret = 0;
 
 	dev_dbg(&dd->pdev->dev, "%s: Enter (%d)\n", __func__, dir);
 	if (dir == NOT_SET) {
-		ret = gpio_direction_input(dd->pdata->video_ctrl_gpio);
-		dd->gpio35_dir_set = 0;
-		ret = gpio_direction_output(dd->pdata->video_ctrl_gpio, 0);
+		if (dd->pdata->video_ctrl_gpio)
+			ret = gpio_direction_output(dd->pdata->video_ctrl_gpio,
+					0);
 		if (dd->pdata->mic_ctrl)
-			 gpio_direction_output(dd->pdata->mic_ctrl, 0);
-	} else if (!dd->gpio35_dir_set) {
+			ret = gpio_direction_output(dd->pdata->mic_ctrl, 0);
+		if (dd->pdata->nahj_ctrl)
+			ret = gpio_direction_output(dd->pdata->nahj_ctrl, 0);
+		if (ret < 0)
+			dev_err(&dd->pdev->dev, "Direction set failed\n");
+	} else if (dir == AUDIO_IN) {
 		ret = gpio_direction_output(dd->pdata->video_ctrl_gpio,
-						dir == AUDIO_IN ? 1 : 0);
+				dd->pdata->video_ctrl_gpio_inverted ? 0 : 1);
 		if (ret < 0) {
 			dev_err(&dd->pdev->dev,
 				"%s: video_ctrl pin output config failed (%d).\n",
@@ -364,8 +357,7 @@ static void ab8500_set_av_switch(struct abx500_ad *dd,
 		}
 
 		if (dd->pdata->mic_ctrl) {
-			ret = gpio_direction_output(dd->pdata->mic_ctrl,
-					dir == AUDIO_IN ? 1 : 0);
+			ret = gpio_direction_output(dd->pdata->mic_ctrl, 1);
 			if (ret < 0) {
 				dev_err(&dd->pdev->dev,
 						"%s: mic_ctrl pin output"
@@ -375,12 +367,22 @@ static void ab8500_set_av_switch(struct abx500_ad *dd,
 			}
 		}
 
-		dd->gpio35_dir_set = 1;
+		if (dd->pdata->nahj_ctrl) {
+			ret = gpio_direction_output(dd->pdata->nahj_ctrl,
+					nahj_headset ? 0 : 1);
+			if (ret < 0) {
+				dev_err(&dd->pdev->dev,
+						"%s: nahj_ctrl pin output"
+						"config failed (%d).\n",
+						__func__, ret);
+				return;
+			}
+		}
+
 		dev_dbg(&dd->pdev->dev, "AV-SWITCH: %s\n",
 			dir == AUDIO_IN ? "AUDIO_IN" : "VIDEO_OUT");
 	} else {
-		gpio_set_value(dd->pdata->video_ctrl_gpio,
-						dir == AUDIO_IN ? 1 : 0);
+		dev_err(&dd->pdev->dev, "Wrong option\n");
 	}
 }
 
@@ -437,6 +439,95 @@ struct abx500_accdet_platform_data *
 
 	return plat->accdet;
 }
+/* Static data initialization */
+/* Voltage limits (mV) for various types of AV Accessories */
+#define ACCESSORY_HEADPHONE_DET_VOL_MIN	0
+#define ACCESSORY_HEADPHONE_DET_VOL_MAX	40
+#define ACCESSORY_U_HEADSET_DET_VOL_MIN	47
+#define ACCESSORY_U_HEADSET_DET_VOL_MAX	732
+#define ACCESSORY_U_HEADSET_ALT_DET_VOL_MIN	25
+#define ACCESSORY_U_HEADSET_ALT_DET_VOL_MAX	50
+#define ACCESSORY_CARKIT_DET_VOL_MIN	1100
+#define ACCESSORY_CARKIT_DET_VOL_MAX	1300
+#define ACCESSORY_HEADSET_DET_VOL_MIN	1301
+#define ACCESSORY_HEADSET_DET_VOL_MAX	2000
+#define ACCESSORY_OPENCABLE_DET_VOL_MIN	2001
+#define ACCESSORY_OPENCABLE_DET_VOL_MAX	2150
+
+
+static struct accessory_detect_task ab8500_detect_ops[] = {
+	{
+		.type = JACK_TYPE_DISCONNECTED,
+		.typename = "DISCONNECTED",
+		.meas_mv = 1,
+		.req_det_count = 1,
+		.minvol = ACCESSORY_DET_VOL_DONTCARE,
+		.maxvol = ACCESSORY_DET_VOL_DONTCARE,
+		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
+		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
+	},
+	{
+		.type = JACK_TYPE_HEADPHONE,
+		.typename = "HEADPHONE",
+		.meas_mv = 1,
+		.req_det_count = 1,
+		.minvol = ACCESSORY_HEADPHONE_DET_VOL_MIN,
+		.maxvol = ACCESSORY_HEADPHONE_DET_VOL_MAX,
+		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
+		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
+	},
+	{
+		.type = JACK_TYPE_UNSUPPORTED_HEADSET,
+		.typename = "UNSUPPORTED HEADSET",
+		.meas_mv = 1,
+		.req_det_count = 2,
+		.minvol = ACCESSORY_U_HEADSET_DET_VOL_MIN,
+		.maxvol = ACCESSORY_U_HEADSET_DET_VOL_MAX,
+		.alt_minvol = ACCESSORY_U_HEADSET_ALT_DET_VOL_MIN,
+		.alt_maxvol = ACCESSORY_U_HEADSET_ALT_DET_VOL_MAX,
+	},
+	{
+		.type = JACK_TYPE_OPENCABLE,
+		.typename = "OPENCABLE",
+		.meas_mv = 0,
+		.req_det_count = 4,
+		.minvol = ACCESSORY_OPENCABLE_DET_VOL_MIN,
+		.maxvol = ACCESSORY_OPENCABLE_DET_VOL_MAX,
+		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
+		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
+	},
+	{
+		.type = JACK_TYPE_CARKIT,
+		.typename = "CARKIT",
+		.meas_mv = 1,
+		.req_det_count = 1,
+		.minvol = ACCESSORY_CARKIT_DET_VOL_MIN,
+		.maxvol = ACCESSORY_CARKIT_DET_VOL_MAX,
+		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
+		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
+	},
+	{
+		.type = JACK_TYPE_HEADSET,
+		.typename = "HEADSET",
+		.meas_mv = 0,
+		.req_det_count = 2,
+		.minvol = ACCESSORY_HEADSET_DET_VOL_MIN,
+		.maxvol = ACCESSORY_HEADSET_DET_VOL_MAX,
+		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
+		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
+	},
+	{
+		.type = JACK_TYPE_CONNECTED,
+		.typename = "CONNECTED",
+		.meas_mv = 0,
+		.req_det_count = 4,
+		.minvol = ACCESSORY_DET_VOL_DONTCARE,
+		.maxvol = ACCESSORY_DET_VOL_DONTCARE,
+		.alt_minvol = ACCESSORY_DET_VOL_DONTCARE,
+		.alt_maxvol = ACCESSORY_DET_VOL_DONTCARE
+	}
+};
+
 
 struct abx500_ad ab8500_accessory_det_callbacks = {
 	.irq_desc_norm			= ab8500_irq_desc_norm,
@@ -456,6 +547,8 @@ struct abx500_ad ab8500_accessory_det_callbacks = {
 	.config_hw_test_plug_connected	= ab8500_config_hw_test_plug_connected,
 	.set_av_switch			= ab8500_set_av_switch,
 	.get_platform_data		= ab8500_get_platform_data,
+	.detect_ops_array_size          = ARRAY_SIZE(ab8500_detect_ops),
+	.detect_ops                     = ab8500_detect_ops,
 };
 
 MODULE_DESCRIPTION("AB8500 AV Accessory detection driver");

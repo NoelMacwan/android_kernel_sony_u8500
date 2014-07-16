@@ -38,16 +38,16 @@
 #define CG2900_PG2_REV			0x0200
 #define CG2900_PG1_SPECIAL_REV	0x0700
 #define CG2905_PG1_05_REV		0x1805
-/*
- * There is an issue in OTP setting of a single bit for distinction
- * between CG2905 and CG2910. So Recommendation from the CG2900 Chip
- * Architects is that CG2910 PG1_05 HCI version has to be
- * considered as CG2905 PG1_05.
- */
-#define CG2910_PG1_05_REV		0x1005
 #define CG2905_PG2_REV			0x1806
 #define CG2910_PG1_REV			0x1004
 #define CG2910_PG2_REV			0x1008
+
+/*
+ * There is an issue in OTP setting of a single bit in CG2905
+ */
+#define CG2905_PG1_05_REV_OTP_NOT_SET	0x1005
+#define CG2905_PG2_REV_OTP_NOT_SET	0x1006
+#define CG2905_SET_OTP			0x1800
 
 /**
  * struct cg2900_rev_data - Contains revision data for the local controller.
@@ -172,7 +172,8 @@ struct cg2900_chip_dev {
  * @get_power_switch_off_cmd:	Callback called to retrieve
  *				HCI VS_Power_Switch_Off command (command
  *				HCI requires platform specific GPIO data).
- * @regulator_id:	Id of the regulator that powers on the chip
+ * @regulator_id:	Id of the regulator that powers on cg2900 chip
+ * @regulator_wlan_id:	Id of the regulator powers on cw1200 chip for snowball
  * @bus:		Transport used, see @include/net/bluetooth/hci.h.
  * @gpio_sleep:		Array of GPIO sleep settings.
  * @enable_uart:	Callback called when switching from UART GPIO to
@@ -185,6 +186,7 @@ struct cg2900_chip_dev {
  * @uart_disabled:	Array of size @n_uart_gpios with GPIO setting for
  *			disabling UART HW (switching to GPIO mode).
  * @uart:		Platform data structure for UART transport.
+ * @gpios:		GPIOs used in the platform. -1 indicates not used.
  *
  * Any callback may be NULL if not needed.
  */
@@ -197,6 +199,7 @@ struct cg2900_platform_data {
 						    u16 *op_code);
 
 	char *regulator_id;
+	char *regulator_wlan_id;
 	__u8 bus;
 	enum cg2900_gpio_pull_sleep *gpio_sleep;
 
@@ -207,6 +210,13 @@ struct cg2900_platform_data {
 		unsigned long *uart_enabled;
 		unsigned long *uart_disabled;
 	} uart;
+
+	struct {
+		int gbf_ena_reset;
+		int bt_enable;
+		int cts_gpio;
+		int pmu_en;
+	} gpios;
 };
 
 /**
@@ -218,6 +228,8 @@ struct cg2900_platform_data {
  * @h4_channel:		H4 channel. Set by CG2900 driver.
  * @is_audio:		True if this channel is an audio channel. Set by CG2900
  *			driver.
+ * @is_clk_user:	whether enabling CG29XX was started external entity
+ *			for eg. WLAN.
  * @chip_independent:	True if this channel does not require chip to be
  *			powered. Set by CG2900 driver.
  * @bt_bus:		Transport used, see @include/net/bluetooth/hci.h.
@@ -246,6 +258,7 @@ struct cg2900_user_data {
 
 	int	h4_channel;
 	bool	is_audio;
+	bool	is_clk_user;
 	bool	chip_independent;
 
 	union {
@@ -300,11 +313,21 @@ static inline bool check_chip_revision_support(u16 hci_revision)
 			hci_revision != CG2905_PG1_05_REV &&
 			hci_revision != CG2905_PG2_REV &&
 			hci_revision != CG2910_PG1_REV &&
-			hci_revision != CG2910_PG1_05_REV &&
 			hci_revision != CG2910_PG2_REV)
 		return false;
 
 	return true;
+}
+
+static inline bool use_device_channel_for_vs_cmd(u16 hci_revision)
+{
+	if (hci_revision == CG2905_PG1_05_REV ||
+			hci_revision == CG2905_PG2_REV ||
+			hci_revision == CG2910_PG1_REV ||
+			hci_revision == CG2910_PG2_REV)
+		return true;
+
+	return false;
 }
 
 extern int cg2900_register_chip_driver(struct cg2900_id_callbacks *cb);

@@ -19,14 +19,18 @@
 #include <linux/amba/bus.h>
 #include <linux/regulator/dbx500-prcmu.h>
 #include <linux/clk.h>
+#include <linux/gfp.h>
 #include <plat/pincfg.h>
 
+#include "../id.h"
 #include "../pins.h"
 
 #ifdef CONFIG_PM_RUNTIME
 #define BIT_ONCE		0
 #define BIT_ACTIVE		1
 #define BIT_ENABLED	2
+
+struct dev_pm_domain ux500_amba_dev_power_domain;
 
 struct pm_runtime_data {
 	unsigned long flags;
@@ -63,6 +67,9 @@ static struct pm_runtime_data *__to_prd(struct device *dev)
 static void platform_pm_runtime_init(struct device *dev,
 				     struct pm_runtime_data *prd)
 {
+	if (!dev->pm_domain)
+		dev->pm_domain = &ux500_amba_dev_power_domain;
+
 	prd->pins = ux500_pins_get(dev_name(dev));
 
 	prd->regulator = ux500_regulator_get(dev);
@@ -200,7 +207,7 @@ static int ux500_pd_resume_noirq(struct device *dev)
 	 */
 	return ux500_pd_runtime_resume(dev);
 }
-
+#ifdef CONFIG_UX500_SUSPEND
 static int ux500_pd_amba_suspend_noirq(struct device *dev)
 {
 	struct pm_runtime_data *prd = __to_prd(dev);
@@ -256,7 +263,16 @@ static int ux500_pd_amba_resume_noirq(struct device *dev)
 
 	return ret;
 }
-
+#else
+static int ux500_pd_amba_suspend_noirq(struct device *dev)
+{
+	return 0;
+}
+static int ux500_pd_amba_resume_noirq(struct device *dev)
+{
+	return 0;
+}
+#endif
 static int ux500_pd_amba_runtime_suspend(struct device *dev)
 {
 	struct pm_runtime_data *prd = __to_prd(dev);
@@ -371,27 +387,67 @@ static int ux500_pd_bus_notify(struct notifier_block *nb,
 	return 0;
 }
 
-static int ux500_pd_plat_bus_notify(struct notifier_block *nb,
-				    unsigned long action, void *data)
+static int ux500_pd_amba_pm_suspend(struct device *dev)
 {
-	return ux500_pd_bus_notify(nb, action, data, false);
+	if (dev->bus && dev->bus->pm && dev->bus->pm->suspend)
+		return dev->bus->pm->suspend(dev);
+	return 0;
 }
 
-static int ux500_pd_amba_bus_notify(struct notifier_block *nb,
-				    unsigned long action, void *data)
+static int ux500_pd_amba_pm_resume(struct device *dev)
 {
-	return ux500_pd_bus_notify(nb, action, data, true);
+	if (dev->bus && dev->bus->pm && dev->bus->pm->resume)
+		return dev->bus->pm->resume(dev);
+	return 0;
+}
+
+static int ux500_pd_amba_pm_freeze(struct device *dev)
+{
+	if (dev->bus && dev->bus->pm && dev->bus->pm->freeze)
+		return dev->bus->pm->freeze(dev);
+	return 0;
+}
+
+static int ux500_pd_amba_pm_thaw(struct device *dev)
+{
+	if (dev->bus && dev->bus->pm && dev->bus->pm->thaw)
+		return dev->bus->pm->thaw(dev);
+	return 0;
+}
+
+static int ux500_pd_amba_pm_poweroff(struct device *dev)
+{
+	if (dev->bus && dev->bus->pm && dev->bus->pm->poweroff)
+		return dev->bus->pm->poweroff(dev);
+	return 0;
+}
+
+static int ux500_pd_amba_pm_restore(struct device *dev)
+{
+	if (dev->bus && dev->bus->pm && dev->bus->pm->restore)
+		return dev->bus->pm->restore(dev);
+	return 0;
 }
 
 #else /* CONFIG_PM_RUNTIME */
 
 #define ux500_pd_suspend_noirq	NULL
 #define ux500_pd_resume_noirq	NULL
+#define ux500_pd_runtime_idle	NULL
 #define ux500_pd_runtime_suspend	NULL
 #define ux500_pd_runtime_resume	NULL
 
+#define ux500_pd_amba_pm_suspend	NULL
+#define ux500_pd_amba_pm_resume		NULL
+#define ux500_pd_amba_pm_freeze		NULL
+#define ux500_pd_amba_pm_thaw		NULL
+#define ux500_pd_amba_pm_poweroff	NULL
+#define ux500_pd_amba_pm_restore	NULL
+
 static int ux500_pd_bus_notify(struct notifier_block *nb,
-			       unsigned long action, void *data)
+			       unsigned long action,
+			       void *data,
+			       bool enable)
 {
 	struct ux500_regulator *regulator = NULL;
 	struct ux500_pins *pins = NULL;
@@ -449,52 +505,42 @@ static int ux500_pd_bus_notify(struct notifier_block *nb,
 
 #endif /* CONFIG_PM_RUNTIME */
 
-struct dev_power_domain ux500_amba_dev_power_domain = {
+static int ux500_pd_plat_bus_notify(struct notifier_block *nb,
+				    unsigned long action, void *data)
+{
+	return ux500_pd_bus_notify(nb, action, data, false);
+}
+
+static int ux500_pd_amba_bus_notify(struct notifier_block *nb,
+				    unsigned long action, void *data)
+{
+	return ux500_pd_bus_notify(nb, action, data, true);
+}
+
+struct dev_pm_domain ux500_amba_dev_power_domain = {
 	.ops = {
-		/* USE_AMBA_PM_SLEEP_OPS minus the two we replace */
-		.prepare = amba_pm_prepare,
-		.complete = amba_pm_complete,
-		.suspend = amba_pm_suspend,
-		.resume = amba_pm_resume,
-		.freeze = amba_pm_freeze,
-		.thaw = amba_pm_thaw,
-		.poweroff = amba_pm_poweroff,
-		.restore = amba_pm_restore,
-		.freeze_noirq = amba_pm_freeze_noirq,
-		.thaw_noirq = amba_pm_thaw_noirq,
-		.poweroff_noirq = amba_pm_poweroff_noirq,
-		.restore_noirq = amba_pm_restore_noirq,
-
-		.suspend_noirq = ux500_pd_amba_suspend_noirq,
-		.resume_noirq = ux500_pd_amba_resume_noirq,
-
 		SET_RUNTIME_PM_OPS(ux500_pd_amba_runtime_suspend,
 				   ux500_pd_amba_runtime_resume,
 				   ux500_pd_amba_runtime_idle)
+		.suspend	= ux500_pd_amba_pm_suspend,
+		.resume		= ux500_pd_amba_pm_resume,
+		.freeze		= ux500_pd_amba_pm_freeze,
+		.thaw		= ux500_pd_amba_pm_thaw,
+		.poweroff	= ux500_pd_amba_pm_poweroff,
+		.restore	= ux500_pd_amba_pm_restore,
+		.suspend_noirq = ux500_pd_amba_suspend_noirq,
+		.resume_noirq = ux500_pd_amba_resume_noirq,
 	},
 };
 
-struct dev_power_domain ux500_dev_power_domain = {
+struct dev_pm_domain ux500_dev_power_domain = {
 	.ops = {
-		/* USE_PLATFORM_PM_SLEEP_OPS minus the two we replace */
-		.prepare = platform_pm_prepare,
-		.complete = platform_pm_complete,
-		.suspend = platform_pm_suspend,
-		.resume = platform_pm_resume,
-		.freeze = platform_pm_freeze,
-		.thaw = platform_pm_thaw,
-		.poweroff = platform_pm_poweroff,
-		.restore = platform_pm_restore,
-		.freeze_noirq = platform_pm_freeze_noirq,
-		.thaw_noirq = platform_pm_thaw_noirq,
-		.poweroff_noirq = platform_pm_poweroff_noirq,
-		.restore_noirq = platform_pm_restore_noirq,
-
+		SET_RUNTIME_PM_OPS(ux500_pd_runtime_suspend,
+				   ux500_pd_runtime_resume,
+				   ux500_pd_runtime_idle)
+		USE_PLATFORM_PM_SLEEP_OPS
 		.suspend_noirq		= ux500_pd_suspend_noirq,
 		.resume_noirq		= ux500_pd_resume_noirq,
-		.runtime_idle		= ux500_pd_runtime_idle,
-		.runtime_suspend	= ux500_pd_runtime_suspend,
-		.runtime_resume		= ux500_pd_runtime_resume,
 	},
 };
 

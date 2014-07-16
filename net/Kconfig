@@ -81,13 +81,13 @@ endif # if INET
 
 config ANDROID_PARANOID_NETWORK
 	bool "Only allow certain groups to create sockets"
-	default y
+	default n
 	help
 		none
 
 config NET_ACTIVITY_STATS
 	bool "Network activity statistics tracking"
-	default y
+	default n
 	help
 	 Network activity statistics are useful for tracking wireless
 	 modem activity on 2G, 3G, 4G wireless networks. Counts number of
@@ -229,6 +229,7 @@ source "net/sched/Kconfig"
 source "net/dcb/Kconfig"
 source "net/dns_resolver/Kconfig"
 source "net/batman-adv/Kconfig"
+source "net/openvswitch/Kconfig"
 
 config RPS
 	boolean "RPS"
@@ -244,6 +245,19 @@ config RFS_ACCEL
 config XPS
 	boolean
 	depends on SMP && SYSFS && USE_GENERIC_SMP_HELPERS
+	default y
+
+config NETPRIO_CGROUP
+	tristate "Network priority cgroup"
+	depends on CGROUPS
+	---help---
+	  Cgroup subsystem for use in assigning processes to network priorities on
+	  a per-interface basis
+
+config BQL
+	boolean
+	depends on SYSFS
+	select DQL
 	default y
 
 config HAVE_BPF_JIT
@@ -378,7 +392,7 @@ config CFG80211_DEFAULT_PS
 config CFG80211_REG_DEBUG
        bool "CFG80211_REG_DEBUG"
        depends on COMPAT_WIRELESS
-       default n
+       default y
        ---help---
 
 config MAC80211_RC_PID
@@ -412,236 +426,99 @@ config MAC80211_MESH
        default y
        ---help---
 
-menuconfig MAC80211_DEBUG_MENU
-	bool "Select mac80211 debugging features"
-	depends on MAC80211
-	---help---
-	  This option collects various mac80211 debug settings.
-
-if MAC80211_DEBUG_MENU
-
-config MAC80211_NOINLINE
-	bool "Do not inline TX/RX handlers"
-	depends on MAC80211_DEBUG_MENU
-	---help---
-	  This option affects code generation in mac80211, when
-	  selected some functions are marked "noinline" to allow
-	  easier debugging of problems in the transmit and receive
-	  paths.
-
-	  This option increases code size a bit and inserts a lot
-	  of function calls in the code, but is otherwise safe to
-	  enable.
-
-	  If unsure, say N unless you expect to be finding problems
-	  in mac80211.
-
-config MAC80211_VERBOSE_DEBUG
-	bool "Verbose debugging output"
-	depends on MAC80211_DEBUG_MENU
-	---help---
-	  Selecting this option causes mac80211 to print out
-	  many debugging messages. It should not be selected
-	  on production systems as some of the messages are
-	  remotely triggerable.
-
-	  Do not select this option.
-
-config MAC80211_HT_DEBUG
-	bool "Verbose HT debugging"
-	depends on MAC80211_DEBUG_MENU
-	---help---
-	  This option enables 802.11n High Throughput features
-	  debug tracing output.
-
-	  It should not be selected on production systems as some
-	  of the messages are remotely triggerable.
-
-	  Do not select this option.
-
-config MAC80211_TKIP_DEBUG
-	bool "Verbose TKIP debugging"
-	depends on MAC80211_DEBUG_MENU
-	---help---
-	  Selecting this option causes mac80211 to print out
-	  very verbose TKIP debugging messages. It should not
-	  be selected on production systems as those messages
-	  are remotely triggerable.
-
-	  Do not select this option.
-
-config MAC80211_IBSS_DEBUG
-	bool "Verbose IBSS debugging"
-	depends on MAC80211_DEBUG_MENU
-	---help---
-	  Selecting this option causes mac80211 to print out
-	  very verbose IBSS debugging messages. It should not
-	  be selected on production systems as those messages
-	  are remotely triggerable.
-
-	  Do not select this option.
-
-config MAC80211_VERBOSE_PS_DEBUG
-	bool "Verbose powersave mode debugging"
-	depends on MAC80211_DEBUG_MENU
-	---help---
-	  Selecting this option causes mac80211 to print out very
-	  verbose power save mode debugging messages (when mac80211
-	  is an AP and has power saving stations.)
-	  It should not be selected on production systems as those
-	  messages are remotely triggerable.
-
-	  Do not select this option.
-
-config MAC80211_VERBOSE_MPL_DEBUG
-	bool "Verbose mesh peer link debugging"
-	depends on MAC80211_DEBUG_MENU
-	depends on MAC80211_MESH
-	---help---
-	  Selecting this option causes mac80211 to print out very
-	  verbose mesh peer link debugging messages (when mac80211
-	  is taking part in a mesh network).
-	  It should not be selected on production systems as those
-	  messages are remotely triggerable.
-
-	  Do not select this option.
-
-config MAC80211_VERBOSE_MHWMP_DEBUG
-	bool "Verbose mesh HWMP routing debugging"
-	depends on MAC80211_DEBUG_MENU
-	depends on MAC80211_MESH
-	---help---
-	  Selecting this option causes mac80211 to print out very
-	  verbose mesh routing (HWMP) debugging messages (when mac80211
-	  is taking part in a mesh network).
-	  It should not be selected on production systems as those
-	  messages are remotely triggerable.
-
-	  Do not select this option.
-
-config MAC80211_DEBUG_COUNTERS
-	bool "Extra statistics for TX/RX debugging"
-	depends on MAC80211_DEBUG_MENU
-	depends on MAC80211_DEBUGFS
-	---help---
-	  Selecting this option causes mac80211 to keep additional
-	  and very verbose statistics about TX and RX handler use
-	  and show them in debugfs.
-
-	  If unsure, say N.
-
-config MAC80211_DRIVER_API_TRACER
-	bool "Driver API tracer"
-	depends on MAC80211_DEBUG_MENU
-	depends on EVENT_TRACING
-	help
-	  Say Y here to make mac80211 register with the ftrace
-	  framework for the driver API -- you can then see which
-	  driver methods it is calling and which API functions
-	  drivers are calling by looking at the trace.
-
-	  If unsure, say Y.
-
-endif # MAC80211_DEBUG_MENU
-
 config CW1200
-       tristate "CW1200 WLAN support"
-       depends on MAC80211 && CFG80211
-       help
+	tristate "CW1200 WLAN support"
+	select MAC80211
+	select CFG80211
+	help
+		This is an experimental driver for the cw1200 chip-set.
+		Enabling this option enables the generic driver without
+		any platform support.
 
-         This is an experimental driver for the cw1200 chip-set.
-         Enabling this option enables the generic driver without
-         any platform support.
-
-         Please select the appropriate platform below.
+		Please select the appropriate platform below.
 
 if CW1200
 
 config CW1200_NON_POWER_OF_TWO_BLOCKSIZES
-      bool "Platform supports non-power-of-two SDIO transfer"
-      depends on CW1200
-      help
-        Say N here only if you are running the driver on a platform
-        which does not have support for non-power-of-two SDIO transfer.
-        If unsure, say Y.
+	bool "Platform supports non-power-of-two SDIO transfer"
+	depends on CW1200
+	help
+		Say N here only if you are running the driver on a platform
+		which does not have support for non-power-of-two SDIO transfer.
+		If unsure, say Y.
 
 config CW1200_USE_GPIO_IRQ
-      bool "Use GPIO interrupt"
-      depends on CW1200
-      help
-        Say Y here if you want to include GPIO IRQ support instead of SDIO IRQ.
-        If unsure, say N.
+	bool "Use GPIO interrupt"
+	depends on CW1200
+	help
+		Say Y here if you want to include GPIO IRQ support instead of SDIO IRQ.
+		If unsure, say N.
 
 config CW1200_5GHZ_SUPPORT
-      bool "5GHz band support"
-      depends on CW1200
-      help
-        Say Y if your device supports 5GHz band. Should be disabled for
-        CW1100 silicon.
-        If unsure, say N.
+	bool "5GHz band support"
+	depends on CW1200
+	help
+		Say Y if your device supports 5GHz band. Should be disabled for
+		CW1100 silicon.
+		If unsure, say N.
 
 config CW1200_WAPI_SUPPORT
-      bool "WAPI support"
-      depends on CW1200
-      help
-        Say Y if your compat-wireless support WAPI.
-        If unsure, say N.
+	bool "WAPI support"
+	depends on CW1200
+	help
+		Say Y if your compat-wireless support WAPI.
+		If unsure, say N.
 
 config CW1200_USE_STE_EXTENSIONS
-      bool "STE extensions"
-      depends on CW1200
-      help
-        Say Y if you want to include STE extensions
-        If unsure, say N.
+	bool "STE extensions"
+	depends on CW1200
+	help
+		Say Y if you want to include STE extensions
+		If unsure, say N.
 
-config CW1200_DISABLE_REGULATORY_HINT_11D
-      bool "Disables regulatory hint 11d"
-      depends on CW1200
-      help
-        Disables regulatory hint 11d
+config CW1200_U5500_SUPPORT
+	bool "Enable U5500 support"
+	depends on CW1200
+	help
+		Say Y if you want to enable wlan on u5500 platform support.
+		If unsure, say N.
 
 menu "Driver debug features"
-      depends on CW1200
+	depends on CW1200
 
 config CW1200_DEBUGFS
-      bool "Expose driver internals to DebugFS (DEVELOPMENT)"
-
-config CW1200_BINARY_LOGGING
-      bool "Store log in binary form to minimize performance impact (DEVELOPMENT)"
-      depends on CW1200_DEBUGFS
-      default y if CW1200_DEBUGFS=y
+	bool "Expose driver internals to DebugFS (DEVELOPMENT)"
 
 config CW1200_BH_DEBUG
-      bool "Enable low-level device communication logs (DEVELOPMENT)"
+	bool "Enable low-level device communication logs (DEVELOPMENT)"
 
 config CW1200_WSM_DEBUG
-      bool "Enable WSM API debug messages (DEVELOPMENT)"
-      default y if CW1200_BINARY_LOGGING=y
+	bool "Enable WSM API debug messages (DEVELOPMENT)"
 
 config CW1200_WSM_DUMPS
-      bool "Verbose WSM API logging (DEVELOPMENT)"
-      default y if CW1200_BINARY_LOGGING=y
+	bool "Verbose WSM API logging (DEVELOPMENT)"
 
 config CW1200_WSM_DUMPS_SHORT
-      bool "Dump only first x bytes (default 20) (DEVELOPMENT)"
-      default y if CW1200_BINARY_LOGGING=y
+	bool "Dump only first x bytes (default 20) (DEVELOPMENT)"
 
 config CW1200_TXRX_DEBUG
-      bool "Enable TX/RX debug messages (DEVELOPMENT)"
+	bool "Enable TX/RX debug messages (DEVELOPMENT)"
 
 config CW1200_TX_POLICY_DEBUG
-      bool "Enable TX policy debug (DEVELOPMENT)"
+	bool "Enable TX policy debug (DEVELOPMENT)"
 
 config CW1200_STA_DEBUG
-      bool "Enable STA/AP debug (DEVELOPMENT)"
+	bool "Enable STA/AP debug (DEVELOPMENT)"
 
 config CW1200_DUMP_ON_ERROR
-      bool "Dump kernel in case of critical error (DEVELOPMENT)"
+	bool "Dump kernel in case of critical error (DEVELOPMENT)"
+
+config CW1200_WLAN_BUILT_IN
+	bool "Enable CW1200 built-in support"
 
 endmenu
 
 endif
-
 endif
 
 #
@@ -663,6 +540,7 @@ source "net/rfkill/Kconfig"
 source "net/9p/Kconfig"
 source "net/caif/Kconfig"
 source "net/ceph/Kconfig"
+source "net/nfc/Kconfig"
 
 
 endif   # if NET

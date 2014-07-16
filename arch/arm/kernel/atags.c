@@ -27,7 +27,7 @@ read_buffer(char* page, char** start, off_t off, int count,
 	return count;
 }
 
-#define BOOT_PARAMS_SIZE 1536
+#define BOOT_PARAMS_SIZE 2225
 static char __initdata atags_copy[BOOT_PARAMS_SIZE];
 
 void __init save_atags(const struct tag *tags)

@@ -13,13 +13,21 @@
 #ifndef __BOARD_MOP500_BM_H
 #define __BOARD_MOP500_BM_H
 
+#include <linux/mfd/abx500.h>
 #include <linux/mfd/abx500/ab8500-bm.h>
 
-extern struct ab8500_charger_platform_data ab8500_charger_plat_data;
-extern struct ab8500_btemp_platform_data ab8500_btemp_plat_data;
-extern struct ab8500_fg_platform_data ab8500_fg_plat_data;
-extern struct ab8500_chargalg_platform_data ab8500_chargalg_plat_data;
-extern struct ab8500_bm_data ab8500_bm_data;
+extern struct abx500_charger_platform_data ab8500_charger_plat_data;
+extern struct abx500_charger_platform_data ab9540_charger_plat_data;
+extern struct abx500_charger_platform_data ab8540_charger_plat_data;
+extern struct abx500_btemp_platform_data ab8500_btemp_plat_data;
+extern struct abx500_fg_platform_data ab8500_fg_plat_data;
+extern struct abx500_chargalg_platform_data ab8500_chargalg_plat_data;
+extern struct abx500_bm_data ab8500_bm_data;
+extern struct abx500_bm_data ab9540_bm_data;
+extern struct abx500_bm_data ab8540_bm_data;
 extern struct ab8500_pwmled_platform_data ab8500_pwmled_plat_data;
+extern struct pm2xxx_charger_platform_data ccu9540_pm2xxx_charger_plat_data;
+extern struct pm2xxx_charger_platform_data ccu8540_pm2xxx_charger_plat_data;
+extern struct pm2xxx_bm_data pm2xxx_bm_data;
 
 #endif

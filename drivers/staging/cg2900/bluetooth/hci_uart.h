@@ -55,6 +55,7 @@ struct hci_uart_proto {
 	int (*close)(struct hci_uart *hu);
 	int (*flush)(struct hci_uart *hu);
 	int (*recv)(struct hci_uart *hu, void *data, int len);
+	int (*send_callback)(struct hci_uart *hu);
 	int (*enqueue)(struct hci_uart *hu, struct sk_buff *skb);
 	struct sk_buff *(*dequeue)(struct hci_uart *hu);
 	bool register_hci_dev;

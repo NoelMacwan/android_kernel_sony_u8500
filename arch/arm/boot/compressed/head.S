@@ -9,11 +9,8 @@
  * published by the Free Software Foundation.
  */
 #include <linux/linkage.h>
-#include <asm/memory.h>
-
-#ifdef CONFIG_KEXEC_HARDBOOT
-#include <asm/kexec.h>
-#endif
+#include <mach/hardware.h>
+#include <asm/hardware/cache-l2x0.h>
 
 /*
  * Debugging stuff
@@ -63,7 +60,7 @@
 		add	\rb, \rb, #0x00010000	@ Ser1
 #endif
 		.endm
-#elif defined(CONFIG_ARCH_S3C2410)
+#elif defined(CONFIG_ARCH_S3C24XX)
 		.macro loadsp, rb, tmp
 		mov	\rb, #0x50000000
 		add	\rb, \rb, #0x4000 * CONFIG_S3C_LOWLEVEL_UART_PORT
@@ -138,31 +135,7 @@ start:
 		.word	_edata			@ zImage end address
  THUMB(		.thumb			)
 1:		mov	r7, r1			@ save architecture ID
-		teq  r0, #0			@ Check for kexec_boot_atags.
-		movne  r8, r0		@ Save kexec_boot_tags.
-		moveq  r8, r2		@ save atags pointer
-
-#ifdef CONFIG_KEXEC_HARDBOOT
-		/* Check hardboot page for a kexec kernel. */
-		ldr	r3, =KEXEC_HB_PAGE_ADDR
-		ldr	r0, [r3]
-		ldr	r1, =KEXEC_HB_PAGE_MAGIC
-		teq	r0, r1
-		bne	not_booting_other
-
-		/* Clear hardboot page magic to avoid boot loop. */
-		mov	r0, #0
-		str	r0, [r3]
-
-		/* Load boot arguments and jump to kexec kernel. */
-		ldr	r0, [r3, #12]	@ kexec_boot_atags (r2: boot_atags)
-		ldr	r1, [r3, #8]	@ kexec_mach_type
-		ldr	pc, [r3, #4]	@ kexec_start_address
-
-		.ltorg
-
-not_booting_other:
-#endif
+		mov	r8, r2			@ save atags pointer
 
 #ifndef __ARM_ARCH_2__
 		/*
@@ -291,17 +264,18 @@ restart:	adr	r0, LC0
 		mov	r1, r6
 		sub	r2, sp, r6
 		bl	atags_to_fdt
-		
+
 		/*
 		 * If returned value is 1, there is no ATAG at the location
 		 * pointed by r8.  Try the typical 0x100 offset from start
 		 * of RAM and hope for the best.
 		 */
 		cmp	r0, #1
-		sub	r0, r4, #(TEXT_OFFSET - 0x100)
+		sub	r0, r4, #TEXT_OFFSET
+		add	r0, r0, #0x100
 		mov	r1, r6
 		sub	r2, sp, r6
-		blne	atags_to_fdt
+		bleq	atags_to_fdt
 
 		ldmfd	sp!, {r0-r3, ip, lr}
 		sub	sp, sp, #0x10000
@@ -484,55 +458,14 @@ not_relocated:	mov	r0, #0
 		add	r2, sp, #0x10000	@ 64k max
 		mov	r3, r7
 		bl	decompress_kernel
-
-/* Copy the kernel tagged list (atags):
- *
- * The kernel requires atags to be located in a direct-mapped region,
- * usually below the kernel in the first 16 kB of RAM.  If they're above
- * (the start of) the kernel, they need to be copied to a suitable
- * location, e.g., the machine-defined params_phys.
- *
- * The assumption is that the tags will only be "out of place" if the
- * decompressor code is also, so copying is implemented only in the "won't
- * overwrite" case (which should be fixed).  Still need to make sure that
- * the copied tags don't overwrite either the kernel or decompressor code
- * (or rather, the remainder of it since everything up to here has already
- * been executed).
- *
- * r4: zreladdr (kernel start)
- * r8: atags */
-
-		/* Don't need to copy atags if they're already below the kernel. */
-		cmp	r8, r4
-		blo	call_kernel
-
-		/* r1: min(zreladdr, pc) */
-		mov	r1, pc
-		cmp	r4, r1
-		movlo	r1, r4
-
-		/* Compute max space for atags, if max <= 0 don't copy. */
-		ldr	r0, =params_phys	@ dest
-		subs	r2, r1, r0		@ max = min(zreladdr, pc) - dest
-		bls	call_kernel
-
-		/* Copy atags to params_phys. */
-		mov	r1, r8			@ src
-		bl	copy_atags
-		mov	r8, r0
-
-call_kernel:
 		bl	cache_clean_flush
-#ifdef CONFIG_OUTER_CACHE
-		bl      inv_outercache_all_ways
-#endif
+		bl	inv_outercache_allways
 		bl	cache_off
 		mov	r0, #0			@ must be zero
 		mov	r1, r7			@ restore architecture number
 		mov	r2, r8			@ restore atags pointer
-		mov	pc, r4			@ call kernel
-
-		.ltorg
+ ARM(		mov	pc, r4	)		@ call kernel
+ THUMB(		bx	r4	)		@ entry point is always ARM
 
 		.align	2
 		.type	LC0, #object
@@ -554,25 +487,29 @@ params:		ldr	r0, =0x10000100		@ params_phys for RPC
 		.align
 #endif
 
-#ifdef CONFIG_OUTER_CACHE
-#ifdef CONFIG_ARCH_U8500
-#define PL310_INV_ALL_WAYS 0xA04127FC
-/* Invalidate all ways of L2 cache PL310 */
-		.align  5
-inv_outercache_all_ways:
-		mov r2, #0xFF                   @ clean & invalidate L2 cache
-		ldr r1, =PL310_INV_ALL_WAYS
-		str r2, [r1]
-outer_cache_loop:
-		ldr r2, [r1]
+#ifdef CONFIG_CACHE_L2X0
+
+/* Invalidate all Ways of L2 cache PL310 */
+		.align	5
+inv_outercache_allways:
+		ldr r3, =U8500_L2CC_BASE	@ Load L2CC base address
+		ldr r1, =L2X0_CTRL
+		ldr r2, [r3, r1]
+		teq r2, #1
+		bne outercache_exit		@ L2 cache disable continue
+		mov r2, #0xFF			@ clean & invalidate L2 cache
+		ldr r1, =L2X0_CLEAN_INV_WAY
+		str r2, [r3, r1]
+outercache_loop:
+		ldr r2, [r3, r1]
 		teq r2, #0
-		bne outer_cache_loop
+		bne outercache_loop
+outercache_exit:
 		mov pc, lr
 #else
-		.align  5
-inv_outercache_all_ways:
+		.align	5
+inv_outercache_allways:
 		mov pc, lr
-#endif
 #endif
 
 /*
@@ -666,14 +603,9 @@ __setup_mmu:	sub	r3, r4, #16384		@ Page directory size
  * bits for the RAM area only.
  */
 		mov	r0, r3
-#if defined(PLAT_PHYS_OFFSET) && defined(END_MEM)
-		mov  r9, #PLAT_PHYS_OFFSET  @ start of RAM
-		ldr  r10, =END_MEM    @ end of RAM
-#else
 		mov	r9, r0, lsr #18
 		mov	r9, r9, lsl #18		@ start of RAM
 		add	r10, r9, #0x10000000	@ a reasonable RAM size
-#endif
 		mov	r1, #0x12
 		orr	r1, r1, #3 << 10
 		add	r2, r3, #16384
@@ -744,7 +676,6 @@ __armv7_mmu_cache_on:
 		mcrne	p15, 0, r0, c8, c7, 0	@ flush I,D TLBs
 #endif
 		mrc	p15, 0, r0, c1, c0, 0	@ read control reg
-		bic	r0, r0, #1 << 28	@ clear SCTLR.TRE
 		orr	r0, r0, #0x5000		@ I-cache enable, RR cache replacement
 		orr	r0, r0, #0x003c		@ write buffer
 #ifdef CONFIG_MMU
@@ -756,6 +687,7 @@ __armv7_mmu_cache_on:
 		mcrne	p15, 0, r3, c2, c0, 0	@ load page table pointer
 		mcrne	p15, 0, r1, c3, c0, 0	@ load domain access control
 #endif
+		mcr	p15, 0, r0, c7, c5, 4	@ ISB
 		mcr	p15, 0, r0, c1, c0, 0	@ load control register
 		mrc	p15, 0, r0, c1, c0, 0	@ and read it back
 		mov	r0, #0

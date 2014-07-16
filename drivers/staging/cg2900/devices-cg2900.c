@@ -25,15 +25,15 @@
 #include <linux/ioport.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/sched.h>
 #include <linux/platform_device.h>
 #include <linux/skbuff.h>
 #include <linux/string.h>
 #include <linux/types.h>
-#include <linux/mfd/ab8500.h>
 #include <linux/regulator/consumer.h>
-#include <mach/id.h>
 #include <plat/pincfg.h>
 #include "cg2900.h"
+#include "id.h"
 #include "devices-cg2900.h"
 
 #define BT_VS_POWER_SWITCH_OFF		0xFD40
@@ -46,11 +46,81 @@ struct vs_power_sw_off_cmd {
 	u8	len;
 	u8	gpio_0_7_pull_up;
 	u8	gpio_8_15_pull_up;
-	u8	gpio_16_20_pull_up;
+	u8	gpio_16_22_pull_up;
 	u8	gpio_0_7_pull_down;
 	u8	gpio_8_15_pull_down;
-	u8	gpio_16_20_pull_down;
+	u8	gpio_16_22_pull_down;
 } __packed;
+
+void dcg2900_enable_chip(struct cg2900_chip_dev *dev)
+{
+	struct dcg2900_info *info = dev->b_data;
+
+#ifdef CONFIG_REGULATOR
+	int err;
+
+	/* Enable regulators */
+	if (info->regulator) {
+		err = regulator_enable(info->regulator);
+		if (err)
+			dev_err(dev->dev, "Not able to enable regulator\n");
+		else
+			info->regulator_enabled = true;
+	}
+	if (info->regulator_wlan) {
+		err = regulator_enable(info->regulator_wlan);
+		if (err)
+			dev_err(dev->dev,
+				"Not able to enable wlan regulator\n");
+		else
+			info->regulator_wlan_enabled = true;
+	}
+#endif
+
+	if (info->gbf_gpio == -1)
+		return;
+
+	/*
+	 * - SET PMU_EN to high
+	 * - Wait for 300usec
+	 * - Set PDB to high.
+	 */
+
+	if (info->pmuen_gpio != -1) {
+		/*
+		 * We must first set PMU_EN pin high and then wait 300 us before
+		 * setting the GBF_EN high.
+		 */
+		gpio_set_value(info->pmuen_gpio, 1);
+		udelay(CHIP_ENABLE_PMU_EN_TIMEOUT);
+	}
+
+	gpio_set_value(info->gbf_gpio, 1);
+}
+
+void dcg2900_disable_chip(struct cg2900_chip_dev *dev)
+{
+	struct dcg2900_info *info = dev->b_data;
+
+	if (info->gbf_gpio != -1)
+		gpio_set_value(info->gbf_gpio, 0);
+	if (info->pmuen_gpio != -1)
+		gpio_set_value(info->pmuen_gpio, 0);
+
+	schedule_timeout_killable(
+			msecs_to_jiffies(CHIP_ENABLE_PDB_LOW_TIMEOUT));
+#ifdef CONFIG_REGULATOR
+	/* Disable regulators */
+	if (info->regulator && info->regulator_enabled) {
+		regulator_disable(info->regulator);
+		info->regulator_enabled = false;
+	}
+	if (info->regulator_wlan && info->regulator_wlan_enabled) {
+		regulator_disable(info->regulator_wlan);
+		info->regulator_wlan_enabled = false;
+	}
+#endif
+}
 
 static struct sk_buff *dcg2900_get_power_switch_off_cmd
 				(struct cg2900_chip_dev *dev, u16 *op_code)
@@ -59,6 +129,7 @@ static struct sk_buff *dcg2900_get_power_switch_off_cmd
 	struct vs_power_sw_off_cmd *cmd;
 	struct dcg2900_info *info;
 	int i;
+	int max_gpio = 23;
 
 	/* If connected chip does not support the command return NULL */
 	if (!check_chip_revision_support(dev->chip.hci_revision))
@@ -86,12 +157,17 @@ static struct sk_buff *dcg2900_get_power_switch_off_cmd
 	 * - byte 0 bit 0 is GPIO 0
 	 * - byte 0 bit 1 is GPIO 1
 	 * - up to
-	 * - byte 2 bit 4 which is GPIO 20
+	 * - byte 2 bit 6 which is GPIO 22
 	 * where each bit means:
 	 * - 0: No pull-up / no pull-down
 	 * - 1: Pull-up / pull-down
 	 * All GPIOs are set as input.
 	 */
+	if(dev->chip.hci_revision == CG2900_PG1_SPECIAL_REV ||
+		dev->chip.hci_revision == CG2900_PG1_REV ||
+		dev->chip.hci_revision == CG2900_PG2_REV)
+		max_gpio = 21;
+
 	if (!info->sleep_gpio_set) {
 		struct cg2900_platform_data *pf_data;
 
@@ -108,26 +184,128 @@ static struct sk_buff *dcg2900_get_power_switch_off_cmd
 			else if (pf_data->gpio_sleep[i] == CG2900_PULL_DN)
 				info->gpio_8_15_pull_down |= (1 << (i - 8));
 		}
-		for (i = 16; i < 21; i++) {
+		for (i = 16; i < max_gpio; i++) {
 			if (pf_data->gpio_sleep[i] == CG2900_PULL_UP)
-				info->gpio_16_20_pull_up |= (1 << (i - 16));
+				info->gpio_16_22_pull_up |= (1 << (i - 16));
 			else if (pf_data->gpio_sleep[i] == CG2900_PULL_DN)
-				info->gpio_16_20_pull_down |= (1 << (i - 16));
+				info->gpio_16_22_pull_down |= (1 << (i - 16));
 		}
 		info->sleep_gpio_set = true;
 	}
 	cmd->gpio_0_7_pull_up = info->gpio_0_7_pull_up;
 	cmd->gpio_8_15_pull_up = info->gpio_8_15_pull_up;
-	cmd->gpio_16_20_pull_up = info->gpio_16_20_pull_up;
+	cmd->gpio_16_22_pull_up = info->gpio_16_22_pull_up;
 	cmd->gpio_0_7_pull_down = info->gpio_0_7_pull_down;
 	cmd->gpio_8_15_pull_down = info->gpio_8_15_pull_down;
-	cmd->gpio_16_20_pull_down = info->gpio_16_20_pull_down;
+	cmd->gpio_16_22_pull_down = info->gpio_16_22_pull_down;
 
 
 	if (op_code)
 		*op_code = BT_VS_POWER_SWITCH_OFF;
 
 	return skb;
+}
+
+int dcg2900_resource_setup(struct cg2900_chip_dev *dev,
+					struct dcg2900_info *info)
+{
+	int err = 0;
+	const char *gbf_name;
+	const char *bt_name = NULL;
+	const char *pmuen_name = NULL;
+	struct cg2900_platform_data *pf_data = dev_get_platdata(dev->dev);
+
+	if (pf_data->gpios.gbf_ena_reset == -1) {
+		dev_err(dev->dev, "GBF GPIO does not exist\n");
+		err = -EINVAL;
+		goto err_handling;
+	}
+	info->gbf_gpio = pf_data->gpios.gbf_ena_reset;
+	gbf_name = "gbf_ena_reset";
+
+	/* BT Enable GPIO may not exist */
+	if (pf_data->gpios.bt_enable != -1) {
+		info->bt_gpio = pf_data->gpios.bt_enable;
+		bt_name = "bt_enable";
+	}
+
+	/* PMU_EN GPIO may not exist */
+	if (pf_data->gpios.pmu_en != -1) {
+		info->pmuen_gpio = pf_data->gpios.pmu_en;
+		pmuen_name = "pmu_en";
+	}
+
+	/* Now setup the GPIOs */
+	err = gpio_request(info->gbf_gpio, gbf_name);
+	if (err < 0) {
+		dev_err(dev->dev, "gpio_request %s failed with err: %d\n",
+			gbf_name, err);
+		goto err_handling;
+	}
+
+	err = gpio_direction_output(info->gbf_gpio, 0);
+	if (err < 0) {
+		dev_err(dev->dev,
+			"gpio_direction_output %s failed with err: %d\n",
+			gbf_name, err);
+		goto err_handling_free_gpio_gbf;
+	}
+
+	if (!pmuen_name)
+		goto set_bt_gpio;
+
+	err = gpio_request(info->pmuen_gpio, pmuen_name);
+	if (err < 0) {
+		dev_err(dev->dev, "gpio_request %s failed with err: %d\n",
+			pmuen_name, err);
+		goto err_handling_free_gpio_gbf;
+	}
+
+	err = gpio_direction_output(info->pmuen_gpio, 0);
+	if (err < 0) {
+		dev_err(dev->dev,
+			"gpio_direction_output %s failed with err: %d\n",
+			pmuen_name, err);
+		goto err_handling_free_gpio_pmuen;
+	}
+
+set_bt_gpio:
+	if (!bt_name)
+		goto finished;
+
+	err = gpio_request(info->bt_gpio, bt_name);
+	if (err < 0) {
+		dev_err(dev->dev, "gpio_request %s failed with err: %d\n",
+			bt_name, err);
+		goto err_handling_free_gpio_pmuen;
+	}
+
+	err = gpio_direction_output(info->bt_gpio, 1);
+	if (err < 0) {
+		dev_err(dev->dev,
+			"gpio_direction_output %s failed with err: %d\n",
+			bt_name, err);
+		goto err_handling_free_gpio_bt;
+	}
+
+finished:
+
+	return 0;
+
+err_handling_free_gpio_bt:
+	gpio_free(info->bt_gpio);
+	info->bt_gpio = -1;
+err_handling_free_gpio_pmuen:
+	if (info->pmuen_gpio != -1) {
+		gpio_free(info->pmuen_gpio);
+		info->pmuen_gpio = -1;
+	}
+err_handling_free_gpio_gbf:
+	gpio_free(info->gbf_gpio);
+	info->gbf_gpio = -1;
+err_handling:
+
+	return err;
 }
 
 static int dcg2900_init(struct cg2900_chip_dev *dev)
@@ -152,55 +330,38 @@ static int dcg2900_init(struct cg2900_chip_dev *dev)
 		goto finished;
 	}
 
-	if (cpu_is_u5500())
-		err = dcg2900_u5500_setup(dev, info);
-	else
-		err = dcg2900_u8500_setup(dev, info);
-
+	err = dcg2900_resource_setup(dev, info);
 	if (err)
 		goto err_handling;
 
-	/*
-	 * Enable the power on snowball
-	 */
-	if (machine_is_snowball()) {
-		/* Take the regulator */
-		if (pdata->regulator_id) {
-			info->regulator_wlan = regulator_get(dev->dev,
+	info->regulator_enabled = false;
+	info->regulator_wlan_enabled = false;
+	info->regulator = NULL;
+	info->regulator_wlan = NULL;
+
+#ifdef CONFIG_REGULATOR
+	/* Get Regulators */
+	if (pdata->regulator_id) {
+		info->regulator = regulator_get(dev->dev,
 					pdata->regulator_id);
-			if (IS_ERR(info->regulator_wlan)) {
-				err = PTR_ERR(info->regulator_wlan);
-				dev_warn(dev->dev,
-					"%s: Failed to get regulator '%s'\n",
-					__func__, pdata->regulator_id);
-				info->regulator_wlan = NULL;
-				goto err_handling_free_gpios;
-			}
-			/* Enable it also */
-			err = regulator_enable(info->regulator_wlan);
-			if (err < 0) {
-				dev_warn(dev->dev, "%s: regulator_enable failed\n",
-						__func__);
-				goto err_handling_put_reg;
-			}
-		} else {
-			dev_warn(dev->dev, "%s: no regulator defined for snowball.\n",
-					__func__);
+		if (IS_ERR(info->regulator)) {
+			dev_warn(dev->dev, "Not able to find regulator\n");
+			info->regulator = NULL;
 		}
 	}
+	if (pdata->regulator_wlan_id) {
+		info->regulator_wlan = regulator_get(dev->dev,
+					pdata->regulator_wlan_id);
+		if (IS_ERR(info->regulator_wlan)) {
+			dev_warn(dev->dev, "Not able to find wlan regulator\n");
+			info->regulator_wlan = NULL;
+		}
+	}
+#endif
 
 finished:
 	dev->b_data = info;
 	return 0;
-err_handling_put_reg:
-	regulator_put(info->regulator_wlan);
-err_handling_free_gpios:
-	if (info->bt_gpio != -1)
-		gpio_free(info->bt_gpio);
-	if (info->pmuen_gpio != -1)
-		gpio_free(info->pmuen_gpio);
-	if (info->gbf_gpio != -1)
-		gpio_free(info->gbf_gpio);
 err_handling:
 	kfree(info);
 	return err;
@@ -210,18 +371,18 @@ static void dcg2900_exit(struct cg2900_chip_dev *dev)
 {
 	struct dcg2900_info *info = dev->b_data;
 
-	if (machine_is_snowball()) {
-		/* Turn off power if we have any */
-		if (info->regulator_wlan) {
-			regulator_disable(info->regulator_wlan);
-			regulator_put(info->regulator_wlan);
-		}
+#ifdef CONFIG_REGULATOR
+	/* Release the regulators */
+	if (info->regulator_wlan) {
+		regulator_put(info->regulator_wlan);
+		info->regulator_wlan = NULL;
 	}
 
-	if (cpu_is_u5500())
-		dcg2900_u5500_disable_chip(dev);
-	else
-		dcg2900_u8500_disable_chip(dev);
+	if (info->regulator) {
+		regulator_put(info->regulator);
+		info->regulator = NULL;
+	}
+#endif
 
 	if (info->bt_gpio != -1)
 		gpio_free(info->bt_gpio);
@@ -246,7 +407,7 @@ static int dcg2900_disable_uart(struct cg2900_chip_dev *dev)
 
 	/* Disable UART functions. */
 	err = nmk_config_pins(pdata->uart.uart_disabled,
-			      pdata->uart.n_uart_gpios);
+			pdata->uart.n_uart_gpios);
 	if (err)
 		goto error;
 
@@ -254,7 +415,7 @@ static int dcg2900_disable_uart(struct cg2900_chip_dev *dev)
 
 error:
 	(void)nmk_config_pins(pdata->uart.uart_enabled,
-			      pdata->uart.n_uart_gpios);
+			pdata->uart.n_uart_gpios);
 	dev_err(dev->dev, "Cannot set interrupt (%d)\n", err);
 	return err;
 }
@@ -266,7 +427,7 @@ static int dcg2900_enable_uart(struct cg2900_chip_dev *dev)
 
 	/* Restore UART settings. */
 	err = nmk_config_pins(pdata->uart.uart_enabled,
-			      pdata->uart.n_uart_gpios);
+			pdata->uart.n_uart_gpios);
 	if (err)
 		dev_err(dev->dev, "Unable to enable UART (%d)\n", err);
 
@@ -277,15 +438,13 @@ void dcg2900_init_platdata(struct cg2900_platform_data *data)
 {
 	data->init = dcg2900_init;
 	data->exit = dcg2900_exit;
-	if (cpu_is_u5500()) {
-		data->enable_chip = dcg2900_u5500_enable_chip;
-		data->disable_chip = dcg2900_u5500_disable_chip;
-	} else {
-		data->enable_chip = dcg2900_u8500_enable_chip;
-		data->disable_chip = dcg2900_u8500_disable_chip;
-	}
+
+	data->enable_chip = dcg2900_enable_chip;
+	data->disable_chip = dcg2900_disable_chip;
+
 	data->get_power_switch_off_cmd = dcg2900_get_power_switch_off_cmd;
 
 	data->uart.enable_uart = dcg2900_enable_uart;
 	data->uart.disable_uart = dcg2900_disable_uart;
 }
+

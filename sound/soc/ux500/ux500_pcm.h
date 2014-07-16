@@ -16,7 +16,6 @@
 
 #include <asm/page.h>
 #include <linux/workqueue.h>
-#include <linux/mutex.h>
 
 #define UX500_PLATFORM_MIN_RATE_PLAYBACK 8000
 #define UX500_PLATFORM_MAX_RATE_PLAYBACK 48000
@@ -33,6 +32,7 @@
 #define UX500_PLATFORM_BUFFER_BYTES_MAX		(2048 * PAGE_SIZE)
 
 extern struct snd_soc_platform ux500_soc_platform;
+extern void ux500_pcm_wakeup(struct snd_pcm_substream *substream);
 
 struct ux500_pcm_private {
 	struct dma_chan *pipeid;
@@ -41,12 +41,14 @@ struct ux500_pcm_private {
 	int msp_id;
 	int stream_id;
 	unsigned int offset;
-	struct mutex pipeLock;
+	bool cyclic;
+	int state;
 };
 
 struct ux500_pcm_dma_params {
 	unsigned int data_size;
 	struct stedma40_chan_cfg *dma_cfg;
+	bool cyclic;
 };
 
 #endif

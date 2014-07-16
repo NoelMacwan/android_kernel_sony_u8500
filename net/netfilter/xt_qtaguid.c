@@ -2,7 +2,6 @@
  * Kernel iptables module to track stats for packets based on user tags.
  *
  * (C) 2011 Google, Inc
- * Copyright (C) 2012 Sony Mobile Communications AB.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -26,6 +25,10 @@
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <net/udp.h>
+
+#if defined(CONFIG_IP6_NF_IPTABLES) || defined(CONFIG_IP6_NF_IPTABLES_MODULE)
+#include <linux/netfilter_ipv6/ip6_tables.h>
+#endif
 
 #include <linux/netfilter/xt_socket.h>
 #include "xt_qtaguid_internal.h"
@@ -1266,7 +1269,7 @@ static void if_tag_stat_update(const char *ifname, uid_t uid,
 	struct data_counters *uid_tag_counters;
 	struct sock_tag *sock_tag_entry;
 	struct iface_stat *iface_entry;
-	struct tag_stat *new_tag_stat;
+	struct tag_stat *new_tag_stat = NULL;
 	MT_DEBUG("qtaguid: if_tag_stat_update(ifname=%s "
 		"uid=%u sk=%p dir=%d proto=%d bytes=%d)\n",
 		 ifname, uid, sk, direction, proto, bytes);
@@ -1331,8 +1334,19 @@ static void if_tag_stat_update(const char *ifname, uid_t uid,
 	}
 
 	if (acct_tag) {
+		/* Create the child {acct_tag, uid_tag} and hook up parent. */
 		new_tag_stat = create_if_tag_stat(iface_entry, tag);
 		new_tag_stat->parent_counters = uid_tag_counters;
+	} else {
+		/*
+		 * For new_tag_stat to be still NULL here would require:
+		 *  {0, uid_tag} exists
+		 *  and {acct_tag, uid_tag} doesn't exist
+		 *  AND acct_tag == 0.
+		 * Impossible. This reassures us that new_tag_stat
+		 * below will always be assigned.
+		 */
+		BUG_ON(!new_tag_stat);
 	}
 	tag_stat_update(new_tag_stat, direction, proto, bytes);
 	spin_unlock_bh(&iface_entry->tag_stat_list_lock);
@@ -1473,20 +1487,16 @@ static int __init iface_stat_init(struct proc_dir_entry *parent_procdir)
 		goto err_unreg_nd;
 	}
 
-#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
 	err = register_inet6addr_notifier(&iface_inet6addr_notifier_blk);
 	if (err) {
 		pr_err("qtaguid: iface_stat: init "
 		       "failed to register ipv6 dev event handler\n");
 		goto err_unreg_ip4_addr;
 	}
-#endif
 	return 0;
 
-#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
 err_unreg_ip4_addr:
 	unregister_inetaddr_notifier(&iface_inetaddr_notifier_blk);
-#endif
 err_unreg_nd:
 	unregister_netdevice_notifier(&iface_netdev_notifier_blk);
 err_zap_all_stats_entry:
@@ -1514,11 +1524,9 @@ static struct sock *qtaguid_find_sk(const struct sk_buff *skb,
 		return NULL;
 
 	switch (par->family) {
-#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
 	case NFPROTO_IPV6:
 		sk = xt_socket_get6_sk(skb, par);
 		break;
-#endif
 	case NFPROTO_IPV4:
 		sk = xt_socket_get4_sk(skb, par);
 		break;
@@ -1540,6 +1548,27 @@ static struct sock *qtaguid_find_sk(const struct sk_buff *skb,
 		}
 	}
 	return sk;
+}
+
+static int ipx_proto(const struct sk_buff *skb,
+		     struct xt_action_param *par)
+{
+	int thoff, tproto;
+
+	switch (par->family) {
+	case NFPROTO_IPV6:
+		tproto = ipv6_find_hdr(skb, &thoff, -1, NULL);
+		if (tproto < 0)
+			MT_DEBUG("%s(): transport header not found in ipv6"
+				 " skb=%p\n", __func__, skb);
+		break;
+	case NFPROTO_IPV4:
+		tproto = ip_hdr(skb)->protocol;
+		break;
+	default:
+		tproto = IPPROTO_RAW;
+	}
+	return tproto;
 }
 
 static void account_for_uid(const struct sk_buff *skb,
@@ -1568,15 +1597,15 @@ static void account_for_uid(const struct sk_buff *skb,
 	} else if (unlikely(!el_dev->name)) {
 		pr_info("qtaguid[%d]: no dev->name?!!\n", par->hooknum);
 	} else {
-		MT_DEBUG("qtaguid[%d]: dev name=%s type=%d\n",
-			 par->hooknum,
-			 el_dev->name,
-			 el_dev->type);
+		int proto = ipx_proto(skb, par);
+		MT_DEBUG("qtaguid[%d]: dev name=%s type=%d fam=%d proto=%d\n",
+			 par->hooknum, el_dev->name, el_dev->type,
+			 par->family, proto);
 
 		if_tag_stat_update(el_dev->name, uid,
 				skb->sk ? skb->sk : alternate_sk,
 				par->in ? IFS_RX : IFS_TX,
-				ip_hdr(skb)->protocol, skb->len);
+				proto, skb->len);
 	}
 }
 
@@ -1621,8 +1650,8 @@ static bool qtaguid_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	} else {
 		atomic64_inc(&qtu_events.match_found_sk);
 	}
-	MT_DEBUG("qtaguid[%d]: sk=%p got_sock=%d proto=%d\n",
-		par->hooknum, sk, got_sock, ip_hdr(skb)->protocol);
+	MT_DEBUG("qtaguid[%d]: sk=%p got_sock=%d fam=%d proto=%d\n",
+		 par->hooknum, sk, got_sock, par->family, ipx_proto(skb, par));
 	if (sk != NULL) {
 		MT_DEBUG("qtaguid[%d]: sk=%p->sk_socket=%p->file=%p\n",
 			par->hooknum, sk, sk->sk_socket,

@@ -6,6 +6,7 @@
  * License Terms: GNU General Public License v2
  */
 
+#include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
@@ -14,7 +15,7 @@
 #include <linux/kobject.h>
 #include <linux/slab.h>
 #include <linux/mfd/abx500.h>
-#include <linux/mfd/ab8500.h>
+#include <linux/mfd/abx500/ab8500.h>
 #include <linux/regulator/ab8500-debug.h>
 #include <linux/io.h>
 
@@ -78,7 +79,7 @@ enum ab8500_register_id {
 	AB8500_REGU_SW_HP_REQ_VALID2,
 	AB8500_REGU_SYSCLK_REQ1_VALID,
 	AB8500_REGU_SYSCLK_REQ2_VALID,
-	AB9540_REGU_VAUX4_REQ_VALID,
+	AB8500_REGU_VAUX4_REQ_VALID,
 	AB8500_REGU_MISC1,
 	AB8500_REGU_OTG_SUPPLY_CTRL,
 	AB8500_REGU_VUSB_CTRL,
@@ -101,9 +102,11 @@ enum ab8500_register_id {
 	AB8500_REGU_VAPE_SEL1,
 	AB8500_REGU_VAPE_SEL2,
 	AB8500_REGU_VAPE_SEL3,
-	AB9540_REGU_VAUX4_REQ_CTRL,
-	AB9540_REGU_VAUX4_REGU,
-	AB9540_REGU_VAUX4_SEL,
+	AB8500_REGU_VAUX4_REQ_CTRL,
+	AB8500_REGU_VAUX4_REGU,
+	AB8500_REGU_VAUX4_SEL,
+	AB8500_REGU_VAUX5_SEL,
+	AB8500_REGU_VAUX6_SEL,
 	AB8500_REGU_VBB_SEL1,
 	AB8500_REGU_VBB_SEL2,
 	AB8500_REGU_VSMPS1_SEL1,
@@ -124,7 +127,7 @@ enum ab8500_register_id {
 	AB8500_REGU_VMOD_SEL2,
 	AB8500_REGU_CTRL_DISCH,
 	AB8500_REGU_CTRL_DISCH2,
-	AB9540_REGU_CTRL_DISCH3,
+	AB8500_REGU_CTRL_DISCH3,
 	AB8500_OTHER_SYSCLK_CTRL, /* Other */
 	AB8500_OTHER_VSIM_SYSCLK_CTRL, /* Other */
 	AB8500_OTHER_SYSULPCLK_CTRL1, /* Other */
@@ -210,7 +213,7 @@ static struct ab8500_register
 		.bank = 0x03,
 		.addr = 0x10,
 	},
-	[AB9540_REGU_VAUX4_REQ_VALID] = {
+	[AB8500_REGU_VAUX4_REQ_VALID] = {
 		.name = "ReguVaux4ReqValid",
 		.bank = 0x03,
 		.addr = 0x11,
@@ -326,23 +329,35 @@ static struct ab8500_register
 		.bank = 0x04,
 		.addr = 0x10,
 	},
-	[AB9540_REGU_VAUX4_REQ_CTRL] = {
+	[AB8500_REGU_VAUX4_REQ_CTRL] = {
 		.name = "Vaux4ReqCtrl",
 		.bank = 0x04,
 		.addr = 0x2d,
-		.unavailable = true, /* ab9540 register */
+		.unavailable = true, /* ab8505/ab9540 register */
 	},
-	[AB9540_REGU_VAUX4_REGU] = {
+	[AB8500_REGU_VAUX4_REGU] = {
 		.name = "Vaux4Regu",
 		.bank = 0x04,
 		.addr = 0x2e,
-		.unavailable = true, /* ab9540 register */
+		.unavailable = true, /* ab8505/ab9540 register */
 	},
-	[AB9540_REGU_VAUX4_SEL] = {
+	[AB8500_REGU_VAUX4_SEL] = {
 		.name = "Vaux4Sel",
 		.bank = 0x04,
 		.addr = 0x2f,
-		.unavailable = true, /* ab9540 register */
+		.unavailable = true, /* ab8505/ab9540 register */
+	},
+	[AB8500_REGU_VAUX5_SEL] = {
+		.name = "Vaux5Sel",
+		.bank = 0x01,
+		.addr = 0x55,
+		.unavailable = true, /* ab8505 register */
+	},
+	[AB8500_REGU_VAUX6_SEL] = {
+		.name = "Vaux6Sel",
+		.bank = 0x01,
+		.addr = 0x56,
+		.unavailable = true, /* ab8505 register */
 	},
 	[AB8500_REGU_VBB_SEL1] = {
 		.name = "VBBSel1",
@@ -444,7 +459,7 @@ static struct ab8500_register
 		.bank = 0x04,
 		.addr = 0x44,
 	},
-	[AB9540_REGU_CTRL_DISCH3] = {
+	[AB8500_REGU_CTRL_DISCH3] = {
 		.name = "ReguCtrlDisch3",
 		.bank = 0x04,
 		.addr = 0x48,
@@ -468,7 +483,7 @@ static struct ab8500_register
 	},
 };
 
-struct ab9540_register_update {
+struct ab8500_register_update {
 	/* Identity of register to be updated */
 	u8 bank;
 	u8 addr;
@@ -476,7 +491,56 @@ struct ab9540_register_update {
 	u8 unavailable;
 };
 
-static const struct ab9540_register_update ab9540_update[] = {
+static const struct ab8500_register_update ab8505_update[] = {
+	/* AB8500 register which is unavailable to AB8505 */
+	/* AB8500_REGU_VREF_DDR */
+	{
+		.bank = 0x04,
+		.addr = 0x07,
+		.unavailable = true,
+	},
+	/*
+	 * Registers which were not available to AB8500 but are on the
+	 * AB8505.
+	 */
+	/* AB8500_REGU_VAUX4_REQ_VALID */
+	{
+		.bank = 0x03,
+		.addr = 0x11,
+	},
+	/* AB8500_REGU_VAUX4_REQ_CTRL */
+	{
+		.bank = 0x04,
+		.addr = 0x2d,
+	},
+	/* AB8500_REGU_VAUX4_REGU */
+	{
+		.bank = 0x04,
+		.addr = 0x2e,
+	},
+	/* AB8500_REGU_VAUX4_SEL */
+	{
+		.bank = 0x04,
+		.addr = 0x2f,
+	},
+	/* AB8500_REGU_VAUX5_SEL */
+	{
+		.bank = 0x01,
+		.addr = 0x55,
+	},
+	/* AB8500_REGU_VAUX6_SEL */
+	{
+		.bank = 0x01,
+		.addr = 0x56,
+	},
+	/* AB8500_REGU_CTRL_DISCH3 */
+	{
+		.bank = 0x04,
+		.addr = 0x48,
+	},
+};
+
+static const struct ab8500_register_update ab9540_update[] = {
 	/* AB8500 register which is unavailable to AB9540 */
 	/* AB8500_REGU_VREF_DDR */
 	{
@@ -484,36 +548,57 @@ static const struct ab9540_register_update ab9540_update[] = {
 		.addr = 0x07,
 		.unavailable = true,
 	},
-
-	/* Registers which were not available to AB8500 but are on the
-	 * AB9540. */
-	/* AB9540_REGU_VAUX4_REQ_VALID */
+	/*
+	 * Registers which were not available to AB8500 but are on the
+	 * AB9540.
+	 */
+	/* AB8500_REGU_VAUX4_REQ_VALID */
 	{
 		.bank = 0x03,
 		.addr = 0x11,
 	},
-	/* AB9540_REGU_VAUX4_REQ_CTRL */
+	/* AB8500_REGU_VAUX4_REQ_CTRL */
 	{
 		.bank = 0x04,
 		.addr = 0x2d,
 	},
-	/* AB9540_REGU_VAUX4_REGU */
+	/* AB8500_REGU_VAUX4_REGU */
 	{
 		.bank = 0x04,
 		.addr = 0x2e,
 	},
-	/* AB9540_REGU_VAUX4_SEL */
+	/* AB8500_REGU_VAUX4_SEL */
 	{
 		.bank = 0x04,
 		.addr = 0x2f,
 	},
-	/* AB9540_REGU_CTRL_DISCH3 */
+	/* AB8500_REGU_CTRL_DISCH3 */
 	{
 		.bank = 0x04,
 		.addr = 0x48,
 	},
+	/* AB8500_OTHER_TVOUT_CTRL */
+	{
+		.bank = 0x06,
+		.addr = 0x80,
+		.unavailable = true,
+	},
 };
 
+static void ab8505_registers_update(void)
+{
+	int i;
+	int j;
+
+	for (i = 0; i < NUM_AB8500_REGISTER; i++)
+		for (j = 0; j < ARRAY_SIZE(ab8505_update); j++)
+			if (ab8500_register[i].bank == ab8505_update[j].bank &&
+			    ab8500_register[i].addr == ab8505_update[j].addr) {
+				ab8500_register[i].unavailable =
+					ab8505_update[j].unavailable;
+				break;
+			}
+}
 static void ab9540_registers_update(void)
 {
 	int i;
@@ -578,73 +663,52 @@ static int ab8500_regulator_dump_print(struct seq_file *s, void *p)
 {
 	struct device *dev = s->private;
 	int state, reg_id, i;
-	int err;
 
 	/* record current state */
 	ab8500_regulator_record_state(AB8500_REGULATOR_STATE_CURRENT);
 
 	/* print dump header */
-	err = seq_printf(s, "ab8500-regulator dump:\n");
-	if (err < 0)
-		dev_err(dev, "seq_printf overflow\n");
+	seq_printf(s, "ab8500-regulator dump:\n");
 
 	/* print states */
 	for (state = NUM_REGULATOR_STATE - 1; state >= 0; state--) {
 		if (ab8500_register_state_saved[state])
-			err = seq_printf(s, "%16s saved -------",
-				regulator_state_name[state]);
+			seq_printf(s, "%16s saved -------",
+				   regulator_state_name[state]);
 		else
-			err = seq_printf(s, "%12s not saved -------",
-				regulator_state_name[state]);
-		if (err < 0)
-			dev_err(dev, "seq_printf overflow: %i\n", __LINE__);
+			seq_printf(s, "%12s not saved -------",
+				   regulator_state_name[state]);
 
 		for (i = 0; i < NUM_REGULATOR_STATE; i++) {
 			if (i < state)
-				err = seq_printf(s, "-----");
+				seq_printf(s, "-----");
 			else if (i == state)
-				err = seq_printf(s, "----+");
+				seq_printf(s, "----+");
 			else
-				err = seq_printf(s, "    |");
-			if (err < 0)
-				dev_err(dev, "seq_printf overflow: %i\n",
-					__LINE__);
+				seq_printf(s, "    |");
 		}
-		err = seq_printf(s, "\n");
-		if (err < 0)
-			dev_err(dev, "seq_printf overflow: %i\n", __LINE__);
+		seq_printf(s, "\n");
 	}
 
 	/* print labels */
-	err = seq_printf(s, "\n                       addr\n");
-	if (err < 0)
-		dev_err(dev, "seq_printf overflow: %i\n", __LINE__);
+	seq_printf(s, "\n                       addr\n");
 
 	/* dump registers */
 	for (reg_id = 1; reg_id < NUM_AB8500_REGISTER; reg_id++) {
 		if (ab8500_register[reg_id].unavailable)
 			continue;
 
-		err = seq_printf(s, "%22s 0x%02x%02x:",
+		seq_printf(s, "%22s 0x%02x%02x:",
 			ab8500_register[reg_id].name,
 			ab8500_register[reg_id].bank,
 			ab8500_register[reg_id].addr);
-		if (err < 0)
-			dev_err(dev, "seq_printf overflow: %i, %i\n",
-				reg_id, __LINE__);
 
 		for (state = 0; state < NUM_REGULATOR_STATE; state++) {
-			err = seq_printf(s, " 0x%02x",
-				ab8500_register_state[state][reg_id]);
-			if (err < 0)
-				dev_err(dev, "seq_printf overflow: %i, %i\n",
-					reg_id, __LINE__);
+			seq_printf(s, " 0x%02x",
+				   ab8500_register_state[state][reg_id]);
 		}
 
-		err = seq_printf(s, "\n");
-		if (err < 0)
-			dev_err(dev, "seq_printf overflow: %i, %i\n",
-				reg_id, __LINE__);
+		seq_printf(s, "\n");
 	}
 
 	return 0;
@@ -741,9 +805,9 @@ static const struct regulator_volt_range ab8500_varm_vsel[] = {
 	{ {0x36, 1362500}, {0x01,       0}, {0x3f, 1362500} },
 };
 
-/* AB9540 device - Varm_vsel in 6.25mV steps */
-#define AB9540_VARM_VSEL_MASK 0x7f
-static const struct regulator_volt_range ab9540_varm_vsel[] = {
+/* AB9540/AB8505 device - Varm_vsel in 6.25mV steps */
+#define AB9540_AB8505_VARM_VSEL_MASK 0x7f
+static const struct regulator_volt_range ab9540_ab8505_varm_vsel[] = {
 	{ {0x00,  600000}, {0x01,    6250}, {0x7f, 1393750} },
 };
 
@@ -767,13 +831,13 @@ static const struct regulator_volt_range ab8500_vbbn_vsel[] = {
 	{ {0x0d,  400000}, {0x01,       0}, {0x0f,  400000} },
 };
 
-/* AB9540 device - Vbbp_vsel and Vbbn_sel in 50mV steps */
-static const struct regulator_volt_range ab9540_vbbp_vsel[] = {
+/* AB9540/AB8505 device - Vbbp_vsel and Vbbn_sel in 50mV steps */
+static const struct regulator_volt_range ab9540_ab8505_vbbp_vsel[] = {
 	{ {0x00,       0}, {0x10,  -50000}, {0x70, -350000} },
 	{ {0x80,   50000}, {0x10,   50000}, {0xf0,  400000} },
 };
 
-static const struct regulator_volt_range ab9540_vbbn_vsel[] = {
+static const struct regulator_volt_range ab9540_ab8505_vbbn_vsel[] = {
 	{ {0x00,       0}, {0x01,  -50000}, {0x07, -350000} },
 	{ {0x08,   50000}, {0x01,   50000}, {0x0f,  400000} },
 };
@@ -809,6 +873,15 @@ static const struct regulator_volt_range vaux3_vsel[] = {
 	{ {0x04, 2500000}, {0x01,  250000}, {0x05, 2750000} },
 	{ {0x06, 2790000}, {0x01,       0}, {0x06, 2790000} },
 	{ {0x07, 2910000}, {0x01,       0}, {0x07, 2910000} },
+};
+
+static const struct regulator_volt_range vaux5_6_vsel[] = {
+	{ {0x00, 1800000}, {0x01,       0}, {0x00, 1800000} },
+	{ {0x01, 1050000}, {0x01,   50000}, {0x03, 1200000} },
+	{ {0x04, 1500000}, {0x01,       0}, {0x04, 1500000} },
+	{ {0x05, 2200000}, {0x01,       0}, {0x05, 2200000} },
+	{ {0x06, 2500000}, {0x01,       0}, {0x06, 2500000} },
+	{ {0x07, 2790000}, {0x01,       0}, {0x07, 2790000} },
 };
 
 static const struct regulator_volt_range vrf1_vsel[] = {
@@ -1206,27 +1279,62 @@ static struct ab8500_regulator ab8500_regulator[AB8500_NUM_REGULATORS] = {
 		.vsel_range[0]     = vaux3_vsel,
 		.vsel_range_len[0] = ARRAY_SIZE(vaux3_vsel),
 	},
-	[AB9540_VAUX4] = {
+	[AB8500_VAUX4] = {
 		.name              = "Vaux4",
-		.update_regid      = AB9540_REGU_VAUX4_REGU,
+		.update_regid      = AB8500_REGU_VAUX4_REGU,
 		.update_mask       = 0x03,
 		.update_val        = {0x00, 0x01, 0x02, 0x03},
-		.hw_mode_regid     = AB9540_REGU_VAUX4_REQ_CTRL,
+		.hw_mode_regid     = AB8500_REGU_VAUX4_REQ_CTRL,
 		.hw_mode_mask      = 0x03,
 		.hw_mode_val       = {0x00, 0x01, 0x02, 0x03},
-		.hw_valid_regid[0] = AB9540_REGU_VAUX4_REQ_VALID,
+		.hw_valid_regid[0] = AB8500_REGU_VAUX4_REQ_VALID,
 		.hw_valid_mask[0]  = 0x08,
-		.hw_valid_regid[1] = AB9540_REGU_VAUX4_REQ_VALID,
+		.hw_valid_regid[1] = AB8500_REGU_VAUX4_REQ_VALID,
 		.hw_valid_mask[1]  = 0x04,
-		.hw_valid_regid[2] = AB9540_REGU_VAUX4_REQ_VALID,
+		.hw_valid_regid[2] = AB8500_REGU_VAUX4_REQ_VALID,
 		.hw_valid_mask[2]  = 0x02,
-		.hw_valid_regid[3] = AB9540_REGU_VAUX4_REQ_VALID,
+		.hw_valid_regid[3] = AB8500_REGU_VAUX4_REQ_VALID,
 		.hw_valid_mask[3]  = 0x01,
-		.vsel_regid[0]     = AB9540_REGU_VAUX4_SEL,
+		.vsel_regid[0]     = AB8500_REGU_VAUX4_SEL,
 		.vsel_mask[0]      = 0x0f,
 		.vsel_range[0]     = vauxn_vsel,
 		.vsel_range_len[0] = ARRAY_SIZE(vauxn_vsel),
-		.unavailable       = true, /* AB9540 regulator */
+		.unavailable       = true, /* AB8505/AB9540 regulator */
+	},
+	[AB8500_VAUX5] = {
+		.name              = "Vaux5",
+		.update_regid      = AB8500_REGU_VAUX5_SEL,
+		.update_mask       = 0x18,
+		.update_val        = {0x00, 0x10, 0x00, 0x18},
+		.hw_mode_regid     = AB8500_REGU_VAUX5_SEL,
+		.hw_mode_mask      = 0x08,
+		.hw_mode_val       = {0x00, 0x00, 0x00, 0x08},
+		.vsel_regid[0]     = AB8500_REGU_VAUX5_SEL,
+		.vsel_mask[0]      = 0x07,
+		.vsel_range[0]     = vaux5_6_vsel,
+		.vsel_range_len[0] = ARRAY_SIZE(vaux5_6_vsel),
+		.unavailable       = true, /* AB8505 regulator */
+	},
+	[AB8500_VAUX6] = {
+		.name              = "Vaux6",
+		.update_regid      = AB8500_REGU_VAUX6_SEL,
+		.update_mask       = 0x10,
+		.update_val        = {0x00, 0x10, 0x00, 0x00},
+		.hw_mode_regid     = AB8500_REGU_VAUX6_SEL,
+		.hw_mode_mask      = 0x08,
+		.hw_mode_val       = {0x00, 0x00, 0x00, 0x08},
+		.vsel_regid[0]     = AB8500_REGU_VAUX6_SEL,
+		.vsel_mask[0]      = 0x07,
+		.vsel_range[0]     = vaux5_6_vsel,
+		.vsel_range_len[0] = ARRAY_SIZE(vaux5_6_vsel),
+		.unavailable       = true, /* AB8505 regulator */
+	},
+	[AB8500_VAUX8] = {
+		.name              = "Vaux8",
+		.update_regid      = AB8500_REGU_VAUDIO_SUPPLY,
+		.update_mask       = 0x04,
+		.update_val        = {0x00, 0x04, 0x00, 0x00},
+		.unavailable       = true, /* AB8505 regulator */
 	},
 	[AB8500_VINTCORE] = {
 		.name		   = "VintCore12",
@@ -1288,39 +1396,67 @@ static struct ab8500_regulator ab8500_regulator[AB8500_NUM_REGULATORS] = {
 	},
 };
 
+static void ab9540_ab8505_regulator_characteristics_update(void)
+{
+	ab8500_regulator[AB8500_VARM].vsel_mask[0] =
+		AB9540_AB8505_VARM_VSEL_MASK;
+	ab8500_regulator[AB8500_VARM].vsel_range[0] = ab9540_ab8505_varm_vsel;
+	ab8500_regulator[AB8500_VARM].vsel_range_len[0] =
+		ARRAY_SIZE(ab9540_ab8505_varm_vsel);
+	ab8500_regulator[AB8500_VARM].vsel_mask[1] =
+		AB9540_AB8505_VARM_VSEL_MASK;
+	ab8500_regulator[AB8500_VARM].vsel_range[1] = ab9540_ab8505_varm_vsel;
+	ab8500_regulator[AB8500_VARM].vsel_range_len[1] =
+		ARRAY_SIZE(ab9540_ab8505_varm_vsel);
+	ab8500_regulator[AB8500_VARM].vsel_mask[2] =
+		AB9540_AB8505_VARM_VSEL_MASK;
+	ab8500_regulator[AB8500_VARM].vsel_range[2] =
+		ab9540_ab8505_varm_vsel;
+	ab8500_regulator[AB8500_VARM].vsel_range_len[2] =
+		ARRAY_SIZE(ab9540_ab8505_varm_vsel);
+
+	ab8500_regulator[AB8500_VBBP].vsel_range[0] = ab9540_ab8505_vbbp_vsel;
+	ab8500_regulator[AB8500_VBBP].vsel_range_len[0] =
+		ARRAY_SIZE(ab9540_ab8505_vbbp_vsel);
+	ab8500_regulator[AB8500_VBBP].vsel_range[1] = ab9540_ab8505_vbbp_vsel;
+	ab8500_regulator[AB8500_VBBP].vsel_range_len[1] =
+		ARRAY_SIZE(ab9540_ab8505_vbbp_vsel);
+
+	ab8500_regulator[AB8500_VBBN].vsel_range[0] = ab9540_ab8505_vbbn_vsel;
+	ab8500_regulator[AB8500_VBBN].vsel_range_len[0] =
+		ARRAY_SIZE(ab9540_ab8505_vbbn_vsel);
+	ab8500_regulator[AB8500_VBBN].vsel_range[1] = ab9540_ab8505_vbbn_vsel;
+	ab8500_regulator[AB8500_VBBN].vsel_range_len[1] =
+		ARRAY_SIZE(ab9540_ab8505_vbbn_vsel);
+}
+
 static void ab9540_regulators_update(void)
 {
 	/* Update unavailable regulators */
 	ab8500_regulator[AB8500_VREFDDR].unavailable = true;
-	ab8500_regulator[AB9540_VAUX4].unavailable = false;
+	ab8500_regulator[AB8500_VAUX4].unavailable = false;
+	ab8500_regulator[AB8500_VTVOUT].unavailable = true;
 
 	/* Update regulator characteristics for AB9540 */
-	ab8500_regulator[AB8500_VARM].vsel_mask[0] = AB9540_VARM_VSEL_MASK;
-	ab8500_regulator[AB8500_VARM].vsel_range[0] = ab9540_varm_vsel;
-	ab8500_regulator[AB8500_VARM].vsel_range_len[0] =
-		ARRAY_SIZE(ab9540_varm_vsel);
-	ab8500_regulator[AB8500_VARM].vsel_mask[1] = AB9540_VARM_VSEL_MASK;
-	ab8500_regulator[AB8500_VARM].vsel_range[1] = ab9540_varm_vsel;
-	ab8500_regulator[AB8500_VARM].vsel_range_len[1] =
-		ARRAY_SIZE(ab9540_varm_vsel);
-	ab8500_regulator[AB8500_VARM].vsel_mask[2] = AB9540_VARM_VSEL_MASK;
-	ab8500_regulator[AB8500_VARM].vsel_range[2] = ab9540_varm_vsel;
-	ab8500_regulator[AB8500_VARM].vsel_range_len[2] =
-		ARRAY_SIZE(ab9540_varm_vsel);
+	ab9540_ab8505_regulator_characteristics_update();
+}
 
-	ab8500_regulator[AB8500_VBBP].vsel_range[0] = ab9540_vbbp_vsel;
-	ab8500_regulator[AB8500_VBBP].vsel_range_len[0] =
-		ARRAY_SIZE(ab9540_vbbp_vsel);
-	ab8500_regulator[AB8500_VBBP].vsel_range[1] = ab9540_vbbp_vsel;
-	ab8500_regulator[AB8500_VBBP].vsel_range_len[1] =
-		ARRAY_SIZE(ab9540_vbbp_vsel);
+static void ab8505_regulators_update(void)
+{
+	/* Update unavailable regulators */
+	ab8500_regulator[AB8500_VREFDDR].unavailable = true;
+	ab8500_regulator[AB8500_VAUX4].unavailable = false;
+	ab8500_regulator[AB8500_VAUX5].unavailable = false;
+	ab8500_regulator[AB8500_VAUX6].unavailable = false;
+	ab8500_regulator[AB8500_VAUX8].unavailable = false;
+	ab8500_regulator[AB8500_VEXTSUPPLY1].unavailable = true;
+	ab8500_regulator[AB8500_VEXTSUPPLY2].unavailable = true;
+	ab8500_regulator[AB8500_VEXTSUPPLY3].unavailable = true;
+	ab8500_regulator[AB8500_VDMIC].unavailable = true;
+	ab8500_regulator[AB8500_VTVOUT].unavailable = true;
 
-	ab8500_regulator[AB8500_VBBN].vsel_range[0] = ab9540_vbbn_vsel;
-	ab8500_regulator[AB8500_VBBN].vsel_range_len[0] =
-		ARRAY_SIZE(ab9540_vbbn_vsel);
-	ab8500_regulator[AB8500_VBBN].vsel_range[1] = ab9540_vbbn_vsel;
-	ab8500_regulator[AB8500_VBBN].vsel_range_len[1] =
-		ARRAY_SIZE(ab9540_vbbn_vsel);
+	/* Update regulator characteristics for AB8505 */
+	ab9540_ab8505_regulator_characteristics_update();
 }
 
 static int status_state = AB8500_REGULATOR_STATE_CURRENT;
@@ -1482,7 +1618,6 @@ int ab8500_regulator_debug_read(enum ab8500_regulator_id id,
 	}
 	return 0;
 }
-EXPORT_SYMBOL(ab8500_regulator_debug_read);
 
 static int ab8500_regulator_status_print(struct seq_file *s, void *p)
 {
@@ -1490,7 +1625,6 @@ static int ab8500_regulator_status_print(struct seq_file *s, void *p)
 	int id, regid;
 	int i;
 	u8 val;
-	int err;
 
 	/* record current state */
 	ab8500_regulator_record_state(AB8500_REGULATOR_STATE_CURRENT);
@@ -1502,43 +1636,24 @@ static int ab8500_regulator_status_print(struct seq_file *s, void *p)
 	}
 
 	/* print dump header */
-	err = seq_printf(s, "ab8500-regulator status:\n");
-	if (err < 0)
-		dev_err(dev, "seq_printf overflow\n");
+	seq_printf(s, "ab8500-regulator status:\n");
 
 	/* print state */
 	for (i = 0; i < NUM_REGULATOR_STATE; i++) {
 		if (i == status_state)
-			err = seq_printf(s, "-> %i. %12s\n",
-				i, regulator_state_name[i]);
+			seq_printf(s, "-> %i. %12s\n", i,
+				   regulator_state_name[i]);
 		else
-			err = seq_printf(s, "   %i. %12s\n",
-				i, regulator_state_name[i]);
-		if (err < 0)
-			dev_err(dev, "seq_printf overflow\n");
+			seq_printf(s, "   %i. %12s\n",
+				   i, regulator_state_name[i]);
 	}
 
 	/* print labels */
-	err = seq_printf(s,
-	      "+-----------+----+--------------+-------------------------+\n");
-	if (err < 0)
-		dev_err(dev, "seq_printf overflow: %i\n", __LINE__);
-	err = seq_printf(s,
-	      "|       name|man |auto          |voltage                  |\n");
-	if (err < 0)
-		dev_err(dev, "seq_printf overflow: %i\n", __LINE__);
-	err = seq_printf(s,
-	      "+-----------+----+--------------+ +-----------------------+\n");
-	if (err < 0)
-		dev_err(dev, "seq_printf overflow: %i\n", __LINE__);
-	err = seq_printf(s,
-	      "|           |mode|mode  |0|1|2|3| |    1  |    2  |    3  |\n");
-	if (err < 0)
-		dev_err(dev, "seq_printf overflow: %i\n", __LINE__);
-	err = seq_printf(s,
-	      "+-----------+----+------+-+-+-+-+-+-------+-------+-------+\n");
-	if (err < 0)
-		dev_err(dev, "seq_printf overflow: %i\n", __LINE__);
+	seq_printf(s, "+-----------+----+--------------+-------------------------+\n");
+	seq_printf(s, "|       name|man |auto          |voltage                  |\n");
+	seq_printf(s, "+-----------+----+--------------+ +-----------------------+\n");
+	seq_printf(s, "|           |mode|mode  |0|1|2|3| |    1  |    2  |    3  |\n");
+	seq_printf(s, "+-----------+----+------+-+-+-+-+-+-------+-------+-------+\n");
 
 	/* dump registers */
 	for (id = 0; id < AB8500_NUM_REGULATORS; id++) {
@@ -1547,11 +1662,7 @@ static int ab8500_regulator_status_print(struct seq_file *s, void *p)
 			continue;
 
 		/* print name */
-		err = seq_printf(s, "|%11s|",
-			ab8500_regulator[id].name);
-		if (err < 0)
-			dev_err(dev, "seq_printf overflow: %i, %i\n",
-				id, __LINE__);
+		seq_printf(s, "|%11s|", ab8500_regulator[id].name);
 
 		/* print manual mode */
 		regid = ab8500_regulator[id].update_regid;
@@ -1561,11 +1672,7 @@ static int ab8500_regulator_status_print(struct seq_file *s, void *p)
 			if (val == ab8500_regulator[id].update_val[i])
 				break;
 		}
-		err = seq_printf(s, "%4s|",
-			update_val_name[i]);
-		if (err < 0)
-			dev_err(dev, "seq_printf overflow: %i, %i\n",
-				id, __LINE__);
+		seq_printf(s, "%4s|", update_val_name[i]);
 
 		/* print auto mode */
 		regid = ab8500_regulator[id].hw_mode_regid;
@@ -1576,14 +1683,10 @@ static int ab8500_regulator_status_print(struct seq_file *s, void *p)
 				if (val == ab8500_regulator[id].hw_mode_val[i])
 					break;
 			}
-			err = seq_printf(s, "%6s|",
-				hw_mode_val_name[i]);
+			seq_printf(s, "%6s|", hw_mode_val_name[i]);
 		} else {
-			err = seq_printf(s, "      |");
+			seq_printf(s, "      |");
 		}
-		if (err < 0)
-			dev_err(dev, "seq_printf overflow: %i, %i\n",
-				id, __LINE__);
 
 		/* print valid bits */
 		for (i = 0; i < 4; i++) {
@@ -1592,15 +1695,12 @@ static int ab8500_regulator_status_print(struct seq_file *s, void *p)
 				val = ab8500_register_state[status_state][regid]
 				    & ab8500_regulator[id].hw_valid_mask[i];
 				if (val)
-					err = seq_printf(s, "1|");
+					seq_printf(s, "1|");
 				else
-					err = seq_printf(s, "0|");
+					seq_printf(s, "0|");
 			} else {
-				err = seq_printf(s, " |");
+				seq_printf(s, " |");
 			}
-			if (err < 0)
-				dev_err(dev, "seq_printf overflow: %i, %i\n",
-					regid, __LINE__);
 		}
 
 		/* print voltage selection */
@@ -1619,9 +1719,6 @@ static int ab8500_regulator_status_print(struct seq_file *s, void *p)
 		} else {
 			seq_printf(s, " |");
 		}
-		if (err < 0)
-			dev_err(dev, "seq_printf overflow: %i, %i\n",
-				regid, __LINE__);
 
 		for (i = 0; i < 3; i++) {
 			int volt;
@@ -1638,26 +1735,12 @@ static int ab8500_regulator_status_print(struct seq_file *s, void *p)
 			} else {
 				seq_printf(s, "       |");
 			}
-			if (err < 0)
-				dev_err(dev, "seq_printf overflow: %i, %i\n",
-					regid, __LINE__);
 		}
 
-		err = seq_printf(s, "\n");
-		if (err < 0)
-			dev_err(dev, "seq_printf overflow: %i, %i\n",
-				regid, __LINE__);
-
+		seq_printf(s, "\n");
 	}
-	err = seq_printf(s,
-	      "+-----------+----+------+-+-+-+-+-+-------+-------+-------+\n");
-	if (err < 0)
-		dev_err(dev, "seq_printf overflow: %i\n", __LINE__);
-	err = seq_printf(s,
-	      "Note! In HW mode, voltage selection is controlled by HW.\n");
-	if (err < 0)
-		dev_err(dev, "seq_printf overflow: %i\n", __LINE__);
-
+	seq_printf(s, "+-----------+----+------+-+-+-+-+-+-------+-------+-------+\n");
+	seq_printf(s, "Note! In HW mode, voltage selection is controlled by HW.\n");
 
 exit:
 	return 0;
@@ -1788,7 +1871,7 @@ static struct ab8500_force_reg ab8500_force_reg[] = {
 	},
 };
 
-static void ab9540_force_reg_update(void)
+static void ab8500_force_reg_update(void)
 {
 	int i;
 
@@ -1804,7 +1887,7 @@ static void ab9540_force_reg_update(void)
 			ab8500_force_reg[i].val  = 0x00;
 		} else if (ab8500_force_reg[i].bank == 0x06 &&
 			   ab8500_force_reg[i].addr == 0x80) {
-			/* TVoutCtrl not supported by AB9540 */
+			/* TVoutCtrl not supported by AB9540/AB8505 */
 			ab8500_force_reg[i].unavailable = true;
 		}
 	}
@@ -1817,7 +1900,7 @@ void ab8500_regulator_debug_force(void)
 	/* save state of registers */
 	ret = ab8500_regulator_record_state(AB8500_REGULATOR_STATE_SUSPEND);
 	if (ret < 0)
-		dev_err(&pdev->dev, "Failed to record suspend state.\n");
+		dev_err(&pdev->dev, "Failed to record suspend state\n");
 
 	/* check if registers should be forced */
 	if (!setting_suspend_force)
@@ -1995,18 +2078,25 @@ int __devinit ab8500_regulator_debug_init(struct platform_device *plf)
 	dev = &plf->dev;
 	pdev = plf;
 
-	/* save state of registers */
-	ret = ab8500_regulator_record_state(AB8500_REGULATOR_STATE_INIT);
-	if (ret < 0)
-		dev_err(&plf->dev, "Failed to record init state.\n");
 
         ab8500 = dev_get_drvdata(plf->dev.parent);
 	/* Update data structures for AB9540 */
-	if (is_ab9540(ab8500) || is_ab8505(ab8500)) {
+	if (is_ab9540(ab8500)) {
 		ab9540_registers_update();
 		ab9540_regulators_update();
-		ab9540_force_reg_update();
+		ab8500_force_reg_update();
+	} else if (is_ab8505(ab8500)) {
+		/* Update data structures for AB8505 */
+		ab8505_registers_update();
+		ab8505_regulators_update();
+		ab8500_force_reg_update();
 	}
+
+	/* save state of registers */
+	ret = ab8500_regulator_record_state(AB8500_REGULATOR_STATE_INIT);
+	if (ret < 0)
+		dev_err(&plf->dev, "Failed to record init state\n");
+
 	/* make suspend-force default if board profile is v5x-power */
 	boot_info_backupram = ioremap(BOOT_INFO_BACKUPRAM1, 0x4);
 

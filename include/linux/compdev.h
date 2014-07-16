@@ -124,7 +124,7 @@ struct compdev_img {
 };
 
 struct compdev_scene_info {
-	enum   compdev_transform  ovly_transform;
+	enum   compdev_transform  app_transform;
 	enum   compdev_transform  fb_transform;
 	__u8                      img_count;
 	__u8                      reuse_fb_img;

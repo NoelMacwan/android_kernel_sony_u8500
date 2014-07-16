@@ -16,6 +16,7 @@
 #define UX500_MSP_I2S_H
 
 #include <linux/platform_device.h>
+#include <linux/types.h>
 #include <mach/msp.h>
 #include "ux500_pcm.h"
 
@@ -25,6 +26,8 @@ struct ux500_msp_i2s_drvdata {
 	struct regulator *reg_vape;
 	struct ux500_pcm_dma_params playback_dma_data;
 	struct ux500_pcm_dma_params capture_dma_data;
+	struct dentry *dbg_dir;
+	u32 loopback;
 };
 
 struct ux500_msp_i2s_drvdata *ux500_msp_i2s_init(struct platform_device *pdev,

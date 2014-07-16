@@ -13,14 +13,13 @@
 #include <linux/mfd/abx500/ux500_sysctrl.h>
 #include <linux/mfd/dbx500-prcmu.h>
 
+#include "id.h"
 #include "clock.h"
 #include "prcc.h"
 
 DEFINE_MUTEX(clk_opp100_mutex);
 static DEFINE_SPINLOCK(clk_spin_lock);
 #define NO_LOCK &clk_spin_lock
-
-static void __iomem *prcmu_base;
 
 static void __clk_lock(struct clk *clk, void *last_lock, unsigned long *flags)
 {
@@ -480,48 +479,14 @@ struct clkops prcc_kclk_rec_ops = {
 	.set_rate = clk_set_rate_rec,
 };
 
-#ifdef CONFIG_CPU_FREQ
-extern unsigned long dbx500_cpufreq_getfreq(void);
-
-unsigned long clk_smp_twd_get_rate(struct clk *clk)
-{
-	return dbx500_cpufreq_getfreq() / 2;
-}
-
-static struct clkops clk_smp_twd_ops = {
-	.get_rate = clk_smp_twd_get_rate,
-};
-
-static struct clk clk_smp_twd = {
-	.name	= "smp_twd",
-	.ops	= &clk_smp_twd_ops,
-};
-
-static struct clk_lookup clk_smp_twd_lookup = {
-	.clk	= &clk_smp_twd,
-	.dev_id	= "smp_twd",
-};
-#endif
-
 int __init clk_init(void)
 {
-	if (cpu_is_u8500()) {
-		prcmu_base = __io_address(U8500_PRCMU_BASE);
-	} else if (cpu_is_u5500()) {
-		prcmu_base = __io_address(U5500_PRCMU_BASE);
-	} else {
+	if (cpu_is_u8500_family() || cpu_is_ux540_family())
+		db8500_clk_init();
+	else {
 		pr_err("clock: Unknown DB Asic.\n");
 		return -EIO;
 	}
-
-	if (cpu_is_u8500())
-		db8500_clk_init();
-	else if (cpu_is_u5500())
-		db5500_clk_init();
-
-#ifdef CONFIG_CPU_FREQ
-	clkdev_add(&clk_smp_twd_lookup);
-#endif
 
 	return 0;
 }

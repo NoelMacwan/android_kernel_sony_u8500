@@ -17,6 +17,8 @@
  */
 #define U8500_IO_VIRTUAL	0xf0000000
 #define U8500_IO_PHYSICAL	0xa0000000
+/* This is where we map in the ROM to check ASIC IDs */
+#define UX500_VIRT_ROM		0xf0000000
 
 /* This macro is used in assembly, so no cast */
 #define IO_ADDRESS(x)           \
@@ -31,14 +33,12 @@
 	(((x) & 0x0001ffff) + U8500_IO_VIRTUAL + 0x0B000000)
 
 /* typesafe io address */
-#define __io_address(n)		__io(IO_ADDRESS(n))
+#define __io_address(n)		IOMEM(IO_ADDRESS(n))
 
-#define __io_address_db9540_rom(n)	__io(IO_ADDRESS_DB9540_ROM(n))
 /* Used by some plat-nomadik code */
 #define io_p2v(n)		__io_address(n)
 
 #include <mach/db8500-regs.h>
-#include <mach/db5500-regs.h>
 
 /*
  * DDR Dies base addresses for PASR
@@ -72,33 +72,9 @@
 
 #ifndef __ASSEMBLY__
 
-#include <mach/id.h>
 extern void __iomem *_PRCMU_BASE;
-extern void __iomem *tcdm_base_bkp;
 
 #define ARRAY_AND_SIZE(x)	(x), ARRAY_SIZE(x)
-
-#ifdef CONFIG_UX500_SOC_DB5500
-bool cpu_is_u5500v1(void);
-bool cpu_is_u5500v2(void);
-bool cpu_is_u5500v20(void);
-bool cpu_is_u5500v21(void);
-#else
-static inline bool cpu_is_u5500v1(void) { return false; }
-static inline bool cpu_is_u5500v2(void) { return false; }
-static inline bool cpu_is_u5500v20(void) { return false; }
-static inline bool cpu_is_u5500v21(void) { return false; }
-#endif
-
-#ifdef CONFIG_UX500_SOC_DB8500
-bool cpu_is_u8500v20(void);
-bool cpu_is_u8500v21(void);
-bool cpu_is_u8500v22(void);
-#else
-static inline bool cpu_is_u8500v20(void) { return false; }
-static inline bool cpu_is_u8500v21(void) { return false; }
-static inline bool cpu_is_u8500v22(void) { return false; }
-#endif
 
 #endif				/* __ASSEMBLY__ */
 #endif				/* __MACH_HARDWARE_H */

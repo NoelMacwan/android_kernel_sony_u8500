@@ -717,7 +717,7 @@ static int isa_open(struct inode *inode, struct file *filp)
 	}
 	if (!atomic_dec_and_test(&isa_context->is_open[idx])) {
 		atomic_inc(&isa_context->is_open[idx]);
-		dev_err(shrm->dev, "Device already opened\n");
+		dev_err(shrm->dev, "Device: %d already opened\n", idx);
 		mutex_unlock(&isa_lock);
 		return -EBUSY;
 	}

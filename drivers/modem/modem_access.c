@@ -10,6 +10,7 @@
  * Also, exposes APIs for gettng/releasing the access and even
  * query the access status, and the modem usage status.
  */
+#include <linux/module.h>
 #include <linux/modem/modem.h>
 #include <linux/modem/modem_client.h>
 #include <linux/slab.h>
@@ -66,15 +67,15 @@ EXPORT_SYMBOL(modem_is_requested);
 
 static int _modem_request(struct modem_dev *mdev)
 {
-	int ret;
+	int ret = 0;
 
 	if (++mdev->use_count == 1) {
 		ret = _modem_is_requested(mdev);
 		if (ret == 0)
-			mdev->desc->ops->request(mdev);
+			ret = mdev->desc->ops->request(mdev);
 	}
 
-	return 0;
+	return ret;
 }
 
 /**
@@ -85,7 +86,7 @@ static int _modem_request(struct modem_dev *mdev)
  * specific check on whether the particular modem
  * requested is accessed or not.
  */
-void modem_request(struct modem *modem)
+int modem_request(struct modem *modem)
 {
 	struct modem_dev *mdev = modem->mdev;
 	int ret = 0;
@@ -94,12 +95,13 @@ void modem_request(struct modem *modem)
 	mutex_lock(&mdev->mutex);
 	if (atomic_read(&modem->use) == 1) {
 		mutex_unlock(&mdev->mutex);
-		return;
+		return ret;
 	}
 	ret = _modem_request(mdev);
 	if (ret == 0)
 		atomic_set(&modem->use, 1);
 	mutex_unlock(&mdev->mutex);
+	return ret;
 }
 EXPORT_SYMBOL(modem_request);
 

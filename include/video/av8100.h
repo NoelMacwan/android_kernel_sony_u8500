@@ -19,8 +19,6 @@
 #define AV8100_CHIPVER_2		2
 
 struct av8100_platform_data {
-	int		(*init)(void);
-	int		(*exit)(void);
 	unsigned	gpio_base;
 	int		irq;
 	int		reset;
@@ -46,6 +44,7 @@ enum av8100_command_type {
 	AV8100_COMMAND_EDID_SECTION_READBACK,
 	AV8100_COMMAND_PATTERNGENERATOR,
 	AV8100_COMMAND_FUSE_AES_KEY,
+	AV8100_COMMAND_AUDIO_INFOFRAME,
 };
 
 enum interface_type {
@@ -564,6 +563,6 @@ enum av8100_output_CEA_VESA av8100_video_output_format_get(int xres,
 void av8100_hdmi_event_cb_set(void (*event_callback)(enum av8100_hdmi_event));
 u8 av8100_ver_get(void);
 bool av8100_encryption_ongoing(void);
+void av8100_video_mode_changed(void);
 
 #endif /* __AV8100__H__ */
-

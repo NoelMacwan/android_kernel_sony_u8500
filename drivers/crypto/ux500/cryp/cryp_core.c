@@ -31,7 +31,7 @@
 
 #include <plat/ste_dma40.h>
 
-#include <mach/crypto-ux500.h>
+#include <linux/platform_data/crypto-ux500.h>
 #include <mach/hardware.h>
 
 #include "cryp_p.h"
@@ -1986,6 +1986,12 @@ static int ux500_cryp_probe(struct platform_device *pdev)
 		goto out_regulator;
 	}
 
+	ret = clk_prepare(device_data->clk);
+	if (ret) {
+		dev_err(&pdev->dev, "can't prepare clock\n");
+		goto out_clk_get;
+	}
+
 	/* Enable device power (and clock) */
 	ret = cryp_enable_power(device_data->dev, device_data, false);
 	if (ret) {
@@ -2054,6 +2060,9 @@ out_power:
 	cryp_disable_power(&pdev->dev, device_data, false);
 
 out_clk:
+	clk_unprepare(device_data->clk);
+
+out_clk_get:
 	clk_put(device_data->clk);
 
 out_regulator:
@@ -2123,6 +2132,7 @@ static int ux500_cryp_remove(struct platform_device *pdev)
 		dev_err(&pdev->dev, "[%s]: cryp_disable_power() failed",
 			__func__);
 
+	clk_unprepare(device_data->clk);
 	clk_put(device_data->clk);
 	ux500_regulator_put(device_data->pwr_regulator);
 

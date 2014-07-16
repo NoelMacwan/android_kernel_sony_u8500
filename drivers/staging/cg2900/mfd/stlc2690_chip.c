@@ -285,7 +285,8 @@ static void send_bd_address(struct stlc2690_chip_info *info)
 	dev_dbg(BOOT_DEV, "New boot_state: BOOT_SEND_BD_ADDRESS\n");
 	info->boot_state = BOOT_SEND_BD_ADDRESS;
 
-	cg2900_send_bt_cmd(info->user_in_charge, info->logger, cmd, plen);
+	cg2900_send_bt_cmd(info->user_in_charge, info->logger, cmd, plen,
+			CHANNEL_BT_CMD);
 
 	kfree(cmd);
 }
@@ -304,7 +305,8 @@ static void send_settings_file(struct stlc2690_chip_info *info)
 	bytes_sent = cg2900_read_and_send_file_part(info->user_in_charge,
 						    info->logger,
 						    &info->file_info,
-						    info->file_info.fw_file_ssf);
+						    info->file_info.fw_file_ssf,
+						    CHANNEL_BT_CMD);
 	if (bytes_sent > 0) {
 		/* Data sent. Wait for CmdComplete */
 		return;
@@ -347,7 +349,8 @@ static void send_patch_file(struct cg2900_chip_dev *dev)
 	bytes_sent = cg2900_read_and_send_file_part(info->user_in_charge,
 						    info->logger,
 						    &info->file_info,
-						    info->file_info.fw_file_ptc);
+						    info->file_info.fw_file_ptc,
+						    CHANNEL_BT_CMD);
 	if (bytes_sent > 0) {
 		/* Data sent. Wait for CmdComplete */
 		return;
@@ -556,7 +559,7 @@ static bool handle_vs_store_in_fs_cmd_complete(struct cg2900_chip_dev *dev,
 		cmd.opcode = cpu_to_le16(HCI_OP_RESET);
 		cmd.plen = 0; /* No parameters for Reset */
 		cg2900_send_bt_cmd(info->user_in_charge, info->logger, &cmd,
-				   sizeof(cmd));
+				   sizeof(cmd), CHANNEL_BT_CMD);
 	} else {
 		dev_err(BOOT_DEV,
 			"Command complete for StoreInFS received with error "
@@ -926,7 +929,8 @@ static int stlc2690_open(struct cg2900_user_data *user)
 		info->main_state = STLC2690_BOOTING;
 		cmd.opcode = cpu_to_le16(HCI_OP_RESET);
 		cmd.plen = 0; /* No parameters for HCI reset */
-		cg2900_send_bt_cmd(user, info->logger, &cmd, sizeof(cmd));
+		cg2900_send_bt_cmd(user, info->logger, &cmd, sizeof(cmd),
+				CHANNEL_BT_CMD);
 
 		dev_dbg(user->dev, "Wait up to 15 seconds for chip to start\n");
 		wait_event_timeout(main_wait_queue,

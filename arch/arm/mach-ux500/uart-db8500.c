@@ -16,6 +16,8 @@
 #include <mach/hardware.h>
 #include <mach/context.h>
 
+#include "id.h"
+
 #ifdef CONFIG_DBX500_CONTEXT
 
 static struct {
@@ -203,10 +205,8 @@ static int __init uart_context_notifier_init(void)
 	static const char clkname[] __initconst
 		= "uart" __stringify(CONFIG_UX500_DEBUG_UART);
 
-	if (cpu_is_u8500() || cpu_is_u9540())
+	if (cpu_is_u8500_family() || cpu_is_ux540_family())
 		base = UART_BASE(U8500, CONFIG_UX500_DEBUG_UART);
-	else if (cpu_is_u5500())
-		base = UART_BASE(U5500, CONFIG_UX500_DEBUG_UART);
 	else
 		ux500_unknown_soc();
 

@@ -120,7 +120,10 @@ PUBLIC t_cm_error cm_CFG_CheckMpcStatus(t_nmf_core_id coreId)
             cm_COM_FreeMpc(coreId);
             return error;
         }
-
+        if((error = OSAL_EnableSxA_HTIMEN()) != CM_OK)
+        {
+            return error;
+        }
         /* Initialize coms fifo for a given MPC */
         cm_COM_InitMpc(coreId);
 

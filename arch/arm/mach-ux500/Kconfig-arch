@@ -41,10 +41,6 @@ config MCDE_DISPLAY_PRIMARY_32BPP
 
 endchoice
 
-config MCDE_DISPLAY_PRIMARY_TRIPPLE_BUFFERED
-	bool "Enable tripple buffering for primary display"
-	default n
-
 config DISPLAY_AV8100_TRIPPLE_BUFFER
 	bool "Enable tripple buffer for HDMI display"
 	depends on MCDE_DISPLAY_AV8100

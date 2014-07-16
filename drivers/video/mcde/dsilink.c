@@ -26,6 +26,7 @@
 
 #include "dsilink_regs.h"
 #include "dsilink.h"
+#include "dsilink_debugfs.h"
 
 #define CLK_DSI_SYS	"dsisys"
 #define CLK_DSI_LP	"dsilp"
@@ -40,6 +41,12 @@
 /* TODO Check how long these timeouts should be */
 #define DSI_TE_NO_ANSWER_TIMEOUT_INIT_MS 2500
 #define DSI_TE_NO_ANSWER_TIMEOUT_MS 250
+
+/*
+ * Default init period according to spec if not
+ * specified in the port struct
+ */
+#define DSI_DPHY_DEFAULT_TINIT 100
 
 static struct dsilink_device *dsilinks[MAX_NBR_OF_DSILINKS];
 
@@ -110,8 +117,6 @@ static void te_timer_function(unsigned long arg)
 
 static void disable_clocks_and_power(struct dsilink_device *dsilink)
 {
-
-	set_link_reset(dsilink->port.link);
 	clk_disable(dsilink->clk_dsi_hs);
 	clk_disable(dsilink->clk_dsi_lp);
 	clk_disable(dsilink->clk_dsi_sys);
@@ -127,6 +132,8 @@ int nova_dsilink_setup(struct dsilink_device *dsilink,
 		return -EINVAL;
 
 	DSILINK_TRACE(dsilink->dev);
+
+	dsilink_debugfs_create();
 
 	dsilink->port = *port;
 
@@ -177,14 +184,36 @@ error:
  */
 int nova_dsilink_send_max_read_len(struct dsilink_device *dsilink)
 {
+	u8 data[2] = { DSILINK_MAX_DCS_READ & 0xFF, DSILINK_MAX_DCS_READ >> 8 };
 	if (!dsilink->enabled || !dsilink->reserved)
 		return -EINVAL;
 
 	DSILINK_TRACE(dsilink->dev);
 
 	return dsilink->ops.write(dsilink->io, dsilink->dev,
-					DSILINK_CMD_SET_MAX_PKT_SIZE,
-						DSILINK_MAX_DCS_READ, NULL, 1);
+				DSILINK_CMD_SET_MAX_PKT_SIZE, -1, data, 2);
+}
+
+int nova_dsilink_turn_on_peripheral(struct dsilink_device *dsilink)
+{
+	if (!dsilink->enabled || !dsilink->reserved)
+		return -EINVAL;
+
+	DSILINK_TRACE(dsilink->dev);
+
+	return dsilink->ops.write(dsilink->io, dsilink->dev,
+				DSILINK_CMD_TURN_ON_PERIPHERAL, -1, NULL, 0);
+}
+
+int nova_dsilink_shut_down_peripheral(struct dsilink_device *dsilink)
+{
+	if (!dsilink->enabled || !dsilink->reserved)
+		return -EINVAL;
+
+	DSILINK_TRACE(dsilink->dev);
+
+	return dsilink->ops.write(dsilink->io, dsilink->dev,
+				DSILINK_CMD_SHUT_DOWN_PERIPHERAL, -1, NULL, 0);
 }
 
 /*
@@ -209,6 +238,13 @@ u8 nova_dsilink_handle_irq(struct dsilink_device *dsilink)
 
 	ret = dsilink->ops.handle_irq(dsilink->io);
 
+	/*
+	 * In some cases BTA_TA and NO_TE is signaled at the same time.
+	 * Remove DSILINK_IRQ_NO_TE in these cases.
+	 */
+	if (ret & (DSILINK_IRQ_BTA_TE | DSILINK_IRQ_NO_TE))
+		ret = DSILINK_IRQ_BTA_TE;
+
 	if (ret & DSILINK_IRQ_BTA_TE) {
 		dev_vdbg(dsilink->dev, "BTA TE DSI\n");
 	} else if (ret & DSILINK_IRQ_NO_TE) {
@@ -218,6 +254,11 @@ u8 nova_dsilink_handle_irq(struct dsilink_device *dsilink)
 		if (dsilink->port.sync_src == DSILINK_SYNCSRC_TE_POLLING)
 			te_poll_set_timer(dsilink,
 						DSI_TE_NO_ANSWER_TIMEOUT_MS);
+	}
+	else if (ret & DSILINK_IRQ_ACK_WITH_ERR) {
+		dev_dbg(dsilink->dev, "ACK WITH ERR\n");
+	} else if (ret & DSILINK_IRQ_TE_MISS) {
+		dev_dbg(dsilink->dev, "TE MISS\n");
 	}
 
 	return ret;
@@ -231,13 +272,14 @@ int nova_dsilink_dcs_write(struct dsilink_device *dsilink, u8 cmd,
 
 	DSILINK_TRACE(dsilink->dev);
 
+	dsilink_debugfs_print_cmd(cmd, data, len, "WRITE");
+
 	return dsilink->ops.write(dsilink->io, dsilink->dev,
 							DSILINK_CMD_DCS_WRITE,
 								cmd, data, len);
 }
 
-int nova_dsilink_dsi_write(struct dsilink_device *dsilink, u8 cmd,
-							u8 *data, int len)
+int nova_dsilink_dsi_write(struct dsilink_device *dsilink, u8 *data, int len)
 {
 	if (!dsilink->enabled || !dsilink->reserved)
 		return -EINVAL;
@@ -246,18 +288,25 @@ int nova_dsilink_dsi_write(struct dsilink_device *dsilink, u8 cmd,
 
 	return dsilink->ops.write(dsilink->io, dsilink->dev,
 						DSILINK_CMD_GENERIC_WRITE,
-								cmd, data, len);
+								-1, data, len);
 }
 
 int nova_dsilink_dsi_read(struct dsilink_device *dsilink,
 						u8 cmd, u32 *data, int *len)
 {
+	int ret;
 	if (WARN_ON_ONCE(!dsilink->reserved))
 		return -EINVAL;
 
 	DSILINK_TRACE(dsilink->dev);
 
-	return dsilink->ops.read(dsilink->io, dsilink->dev, cmd, data, len);
+	ret = dsilink->ops.read(dsilink->io, dsilink->dev, cmd, data, len);
+	if (ret == -EAGAIN)
+		dsilink->ops.force_stop(dsilink->io);
+
+	dsilink_debugfs_print_cmd(cmd, (u8 *)data, *len, "READ");
+
+	return ret;
 }
 
 void nova_dsilink_te_request(struct dsilink_device *dsilink)
@@ -272,6 +321,7 @@ void nova_dsilink_te_request(struct dsilink_device *dsilink)
 
 int nova_dsilink_enable(struct dsilink_device *dsilink)
 {
+	u32 t_init;
 	if (dsilink->enabled || !dsilink->reserved)
 		return -EBUSY;
 
@@ -283,21 +333,54 @@ int nova_dsilink_enable(struct dsilink_device *dsilink)
 	regulator_enable(dsilink->reg_epod_dss);
 
 	if (dsilink->update_dsi_freq) {
-		if (dsilink->port.phy.lp_freq != clk_round_rate(
-				dsilink->clk_dsi_lp, dsilink->port.phy.lp_freq))
+		long dsi_lp_freq;
+		long dsi_hs_freq;
+		int ret;
+		u32 ui_value;
+
+		dsi_lp_freq = clk_round_rate(
+				dsilink->clk_dsi_lp, dsilink->port.phy.lp_freq);
+
+		if (dsilink->port.phy.lp_freq != dsi_lp_freq)
+			/*
+			 * The actual lp freq should be inside
+			 * 2/3 * tx_esc_clock < dsi_lp_freq < 3/2 * tx_esc_clock
+			 * where tx_esc_clock = dsilink->port.phy.lp_freq
+			 */
 			dev_dbg(dsilink->dev, "Could not set dsi lp freq"
-					" to %d\n", dsilink->port.phy.lp_freq);
+				" to %d got %ld\n",
+					dsilink->port.phy.lp_freq, dsi_lp_freq);
 
 		WARN_ON_ONCE(clk_set_rate(
 			dsilink->clk_dsi_lp, dsilink->port.phy.lp_freq));
 
-		if (dsilink->port.phy.hs_freq != clk_round_rate(
-				dsilink->clk_dsi_hs, dsilink->port.phy.hs_freq))
-			dev_dbg(dsilink->dev, "Could not set dsi hs freq"
-					" to %d\n", dsilink->port.phy.hs_freq);
+		dsi_hs_freq = clk_round_rate(
+				dsilink->clk_dsi_hs, dsilink->port.phy.hs_freq);
 
-		WARN_ON_ONCE(clk_set_rate(dsilink->clk_dsi_hs,
-						dsilink->port.phy.hs_freq));
+		if (dsilink->port.phy.hs_freq != dsi_hs_freq)
+			dev_dbg(dsilink->dev, "Could not set dsi hs freq"
+				" to %d got %ld\n",
+					dsilink->port.phy.hs_freq, dsi_hs_freq);
+
+		/*
+		 * If clk_set_rate fails it is likely
+		 * that the clock is already enabled
+		 */
+		ret = clk_set_rate(dsilink->clk_dsi_hs,
+						dsilink->port.phy.hs_freq);
+		if (ret)
+			dev_dbg(dsilink->dev,
+					"clk_set_rate failed with ret %x", ret);
+
+		/* if a display driver has set a value this should be used */
+		if (dsilink->port.phy.ui == 0) {
+			/* Calulate in MHz instead */
+			dsi_hs_freq = dsi_hs_freq / 1000000;
+			ui_value = 4000 / dsi_hs_freq;
+			dsilink->port.phy.ui = (u8) ui_value;
+		}
+		dev_dbg(dsilink->dev, "ui value %d dsi_hs_freq %ld in Mhz\n",
+					dsilink->port.phy.ui, dsi_hs_freq);
 	}
 
 	clk_enable(dsilink->clk_dsi_sys);
@@ -309,6 +392,20 @@ int nova_dsilink_enable(struct dsilink_device *dsilink)
 	if (dsilink->ops.enable(dsilink->io, dsilink->dev, &dsilink->port,
 							&dsilink->vid_regs))
 		goto error;
+
+	/*
+	* DPHY spec:
+	* After power-up, the Slave side PHY shall be initialized when
+	* the Master PHY drives a Stop State (LP-11) for a period
+	* longer then TINIT. The first Stop state longer than the
+	* specified TINIT is called the Initialization period.
+	*/
+	if (dsilink->port.phy.t_init == 0)
+		t_init = DSI_DPHY_DEFAULT_TINIT;
+	else
+		t_init = dsilink->port.phy.t_init;
+	usleep_range(t_init, t_init);
+	dev_dbg(dsilink->dev, "t_init %d\n", t_init);
 
 	if (dsilink->port.sync_src == DSILINK_SYNCSRC_TE_POLLING) {
 		init_timer(&dsilink->te_timer);
@@ -358,8 +455,7 @@ int nova_dsilink_update_frame_parameters(struct dsilink_device *dsilink,
 				struct dsilink_video_mode *vmode, u8 bpp,
 						u8 pixel_mode, u8 rgb_header)
 {
-	u32 hs_byte_clk = 0;
-	u32 pck_len = 0;
+	u64 bpl;
 	u32 blkline_pck, line_duration;
 	u32 blkeol_pck, blkeol_duration;
 	int hfp = 0, hbp = 0, hsa = 0;
@@ -421,26 +517,25 @@ int nova_dsilink_update_frame_parameters(struct dsilink_device *dsilink,
 
 	/*
 	 * vmode->pixclock is the time between two pixels (in picoseconds)
-	 *
-	 * hs_byte_clk is the amount of transferred bytes per lane and
-	 * second (in MHz)
 	 */
-	hs_byte_clk = 1000000 / vmode->pixclock / 8;
-	pck_len = 1000000 * hs_byte_clk / dsilink->port.refresh_rate /
-			(vmode->vsw + vmode->vbp + vmode->yres + vmode->vfp) *
-					dsilink->port.phy.num_data_lanes;
+	bpl = vmode->pixclock *
+			(vmode->hsw + vmode->hbp + vmode->xres + vmode->hfp);
+	bpl *= dsilink->port.phy.hs_freq / 8;
+	do_div(bpl, 1000000);
+	do_div(bpl, 1000000);
+	bpl *= dsilink->port.phy.num_data_lanes;
 
 	/*
 	 * 6 is header + checksum, header = 4 bytes, checksum = 2 bytes
 	 * 4 is short packet for vsync/hsync
 	 */
 	if (dsilink->vid_regs.sync_is_pulse)
-		blkline_pck = pck_len - vmode->hsw - 6;
+		blkline_pck = bpl - vmode->hsw - 6;
 	else
-		blkline_pck = pck_len - 4 - 6;
+		blkline_pck = bpl - 4 - 6;
 
 	line_duration = (blkline_pck + 6) / dsilink->port.phy.num_data_lanes;
-	blkeol_pck = pck_len -
+	blkeol_pck = bpl -
 		(vmode->hsw + vmode->hbp + vmode->xres + vmode->hfp) * bpp - 6;
 	blkeol_duration = (blkeol_pck + 6) / dsilink->port.phy.num_data_lanes;
 
@@ -458,15 +553,27 @@ int nova_dsilink_update_frame_parameters(struct dsilink_device *dsilink,
 
 void nova_dsilink_set_clk_continous(struct dsilink_device *dsilink, bool on)
 {
-	bool value;
+	bool value = false;
 
 	if (!dsilink->reserved)
 		return;
 
 	DSILINK_TRACE(dsilink->dev);
 
-	value = on ? false : dsilink->port.phy.clk_cont;
-	dsilink->ops.set_clk_continous(dsilink->io, on);
+	if (on)
+		value = dsilink->port.phy.clk_cont;
+
+	dsilink->ops.set_clk_continous(dsilink->io, value);
+}
+
+void nova_dsilink_enable_video_mode(struct dsilink_device *dsilink, bool enable)
+{
+	if (!dsilink->reserved)
+		return;
+
+	DSILINK_TRACE(dsilink->dev);
+
+	dsilink->ops.enable_video_mode(dsilink->io, enable);
 }
 
 int nova_dsilink_enter_ulpm(struct dsilink_device *dsilink)
@@ -476,7 +583,8 @@ int nova_dsilink_enter_ulpm(struct dsilink_device *dsilink)
 
 	DSILINK_TRACE(dsilink->dev);
 
-	return 0;
+	return dsilink->ops.handle_ulpm(dsilink->io, dsilink->dev,
+				&dsilink->port, true);
 }
 
 int nova_dsilink_exit_ulpm(struct dsilink_device *dsilink)
@@ -485,6 +593,19 @@ int nova_dsilink_exit_ulpm(struct dsilink_device *dsilink)
 		return -EINVAL;
 
 	DSILINK_TRACE(dsilink->dev);
+
+	return dsilink->ops.handle_ulpm(dsilink->io, dsilink->dev,
+				&dsilink->port, false);
+}
+
+int nova_dsilink_force_stop(struct dsilink_device *dsilink)
+{
+	if (!dsilink->enabled || !dsilink->reserved)
+		return -EINVAL;
+
+	DSILINK_TRACE(dsilink->dev);
+
+	dsilink->ops.force_stop(dsilink->io);
 
 	return 0;
 }

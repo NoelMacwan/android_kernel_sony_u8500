@@ -83,6 +83,8 @@ typedef struct cm_allocator_desc {
     t_cm_chunk     *lastChunk;              /* Null terminated last chunk of previous array declaration */
     t_cm_chunk     *free_mem_chunks[BINS];  /* List of free memory */
     struct cm_allocator_desc* next;         /* List of allocator */
+    t_uint32        currentUsedMemory;		/* current used memory */
+    t_uint32        maxUsedMemory;		/* max used memory */
 } t_cm_allocator_desc;
 
 int bin_index(unsigned int sz);

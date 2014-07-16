@@ -5,13 +5,12 @@
 #ifndef _LINUX_WORKQUEUE_H
 #define _LINUX_WORKQUEUE_H
 
-#include <linux/version.h>
 #include <linux/timer.h>
 #include <linux/linkage.h>
 #include <linux/bitops.h>
 #include <linux/lockdep.h>
 #include <linux/threads.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 
 struct workqueue_struct;
 
@@ -256,7 +255,7 @@ enum {
 	WQ_HIGHPRI		= 1 << 4, /* high priority */
 	WQ_CPU_INTENSIVE	= 1 << 5, /* cpu instensive workqueue */
 
-	WQ_DYING		= 1 << 6, /* internal: workqueue is dying */
+	WQ_DRAINING		= 1 << 6, /* internal: workqueue is draining */
 	WQ_RESCUER		= 1 << 7, /* internal: workqueue has rescuer */
 
 	WQ_MAX_ACTIVE		= 512,	  /* I like 512, better ideas? */
@@ -267,10 +266,6 @@ enum {
 /* unbound wq's aren't per-cpu, scale max_active according to #cpus */
 #define WQ_UNBOUND_MAX_ACTIVE	\
 	max_t(int, WQ_MAX_ACTIVE, num_possible_cpus() * WQ_MAX_UNBOUND_PER_CPU)
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,3,0)
-#define __WQ_ORDERED	0
-#endif
 
 /*
  * System-wide workqueues which are always present.
@@ -306,36 +301,60 @@ extern struct workqueue_struct *system_freezable_wq;
 extern struct workqueue_struct *system_nrt_freezable_wq;
 
 extern struct workqueue_struct *
-__alloc_workqueue_key(const char *name, unsigned int flags, int max_active,
-		      struct lock_class_key *key, const char *lock_name);
+__alloc_workqueue_key(const char *fmt, unsigned int flags, int max_active,
+	struct lock_class_key *key, const char *lock_name, ...) __printf(1, 6);
 
-struct workqueue_struct *
-backport_alloc_workqueue(const char *fmt, unsigned int flags,
-			 int max_active, struct lock_class_key *key,
-			 const char *lock_name, ...);
-
+/**
+ * alloc_workqueue - allocate a workqueue
+ * @fmt: printf format for the name of the workqueue
+ * @flags: WQ_* flags
+ * @max_active: max in-flight work items, 0 for default
+ * @args: args for @fmt
+ *
+ * Allocate a workqueue with the specified parameters.  For detailed
+ * information on WQ_* flags, please refer to Documentation/workqueue.txt.
+ *
+ * The __lock_name macro dance is to guarantee that single lock_class_key
+ * doesn't end up with different namesm, which isn't allowed by lockdep.
+ *
+ * RETURNS:
+ * Pointer to the allocated workqueue on success, %NULL on failure.
+ */
 #ifdef CONFIG_LOCKDEP
-#define alloc_workqueue(fmt, flags, max_active, args...)		\
-({									\
-	static struct lock_class_key __key;				\
-	const char *__lock_name;					\
-									\
-	if (__builtin_constant_p(fmt))					\
-		__lock_name = (fmt);					\
-	else								\
-		__lock_name = #fmt;					\
-									\
-	backport_alloc_workqueue((fmt), (flags), (max_active),		\
-				 &__key, __lock_name, ##args);		\
+#define alloc_workqueue(fmt, flags, max_active, args...)	\
+({								\
+	static struct lock_class_key __key;			\
+	const char *__lock_name;				\
+								\
+	if (__builtin_constant_p(fmt))				\
+		__lock_name = (fmt);				\
+	else							\
+		__lock_name = #fmt;				\
+								\
+	__alloc_workqueue_key((fmt), (flags), (max_active),	\
+			      &__key, __lock_name, ##args);	\
 })
 #else
-#define alloc_workqueue(fmt, flags, max_active, args...)		\
-	backport_alloc_workqueue((fmt), (flags), (max_active),		\
-				 NULL, NULL, ##args)
+#define alloc_workqueue(fmt, flags, max_active, args...)	\
+	__alloc_workqueue_key((fmt), (flags), (max_active),	\
+			      NULL, NULL, ##args)
 #endif
 
-#define alloc_ordered_workqueue(fmt, flags, args...) \
-	alloc_workqueue(fmt, WQ_UNBOUND | __WQ_ORDERED | (flags), 1, ##args)
+/**
+ * alloc_ordered_workqueue - allocate an ordered workqueue
+ * @fmt: printf format for the name of the workqueue
+ * @flags: WQ_* flags (only WQ_FREEZABLE and WQ_MEM_RECLAIM are meaningful)
+ * @args: args for @fmt
+ *
+ * Allocate an ordered workqueue.  An ordered workqueue executes at
+ * most one work item at any given time in the queued order.  They are
+ * implemented as unbound workqueues with @max_active of one.
+ *
+ * RETURNS:
+ * Pointer to the allocated workqueue on success, %NULL on failure.
+ */
+#define alloc_ordered_workqueue(fmt, flags, args...)		\
+	alloc_workqueue(fmt, WQ_UNBOUND | (flags), 1, ##args)
 
 #define create_workqueue(name)					\
 	alloc_workqueue((name), WQ_MEM_RECLAIM, 1)
@@ -355,6 +374,7 @@ extern int queue_delayed_work_on(int cpu, struct workqueue_struct *wq,
 			struct delayed_work *work, unsigned long delay);
 
 extern void flush_workqueue(struct workqueue_struct *wq);
+extern void drain_workqueue(struct workqueue_struct *wq);
 extern void flush_scheduled_work(void);
 
 extern int schedule_work(struct work_struct *work);
@@ -410,21 +430,6 @@ static inline bool __cancel_delayed_work(struct delayed_work *work)
 	if (ret)
 		work_clear_pending(&work->work);
 	return ret;
-}
-
-/* Obsolete. use cancel_delayed_work_sync() */
-static inline __deprecated
-void cancel_rearming_delayed_workqueue(struct workqueue_struct *wq,
-					struct delayed_work *work)
-{
-	cancel_delayed_work_sync(work);
-}
-
-/* Obsolete. use cancel_delayed_work_sync() */
-static inline __deprecated
-void cancel_rearming_delayed_work(struct delayed_work *work)
-{
-	cancel_delayed_work_sync(work);
 }
 
 #ifndef CONFIG_SMP

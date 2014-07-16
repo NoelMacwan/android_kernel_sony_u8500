@@ -1,7 +1,5 @@
 /*
  * Copyright (C) ST-Ericsson SA 2010
- * Copyright (C) 2012 Sony Mobile Communications AB
- *
  * Author: Pankaj Chauhan <pankaj.chauhan@stericsson.com> for ST-Ericsson.
  * License terms: GNU General Public License (GPL), version 2.
  */
@@ -18,11 +16,9 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
-#include <linux/mutex.h>
-#include <linux/workqueue.h>
 #include <linux/mfd/dbx500-prcmu.h>
 #include <linux/mmio.h>
-#include <linux/ratelimit.h>
+
 
 #define ISP_REGION_IO				(0xE0000000)
 #define SIA_ISP_REG_ADDR			(0x521E4)
@@ -51,6 +47,8 @@
 
 #define CLOCK_ENABLE_DELAY		(0x2)
 
+#define MAX_PRCMU_QOS_APP		(0x64)
+
 #define ISP_WRITE_DATA_SIZE		(0x4)
 
 #define clrbits32(_addr, _clear) \
@@ -58,37 +56,9 @@
 #define setbits32(_addr, _set) \
 	writel(readl(_addr) | (u32)(_set), _addr)
 
-#define XP70_BLOCK_SIZE		124
-#define XP70_NB_BLOCK		50
-/*
- * For 30 fps video, there is 33 msec delay between every two frames
- * MMIO driver reads traces from trace buffer every XP70_TIMEOUT_MSEC.
- * If traces are not read in time from trace buffer, camera firmware
- * will start overwiting the traces as size of trace buffer is limited.
- */
-#define XP70_TIMEOUT_MSEC	30
-#define XP70_DEFAULT_MSG_ID	(0xCDCDCDCD)
-#define XP70_MAX_BLOCK_ID	(0xFFFFFFFF)
 
 #define upper_16_bits(n) ((u16)((u32)(n) >> 16))
 
-struct trace_block {
-	u32 msg_id;
-	char data[XP70_BLOCK_SIZE];
-};
-
-struct mmio_trace {
-	u32 nb_block;
-	u32 block_size;
-	u32 block_id;
-	u32 overwrite_count;
-	struct trace_block block[XP70_NB_BLOCK];
-};
-
-struct trace_buffer_status {
-	u32 prev_overwrite_count;
-	u32 prev_block_id;
-};
 
 struct mmio_info {
 	struct mmio_platform_data *pdata; /* Config from board */
@@ -100,12 +70,6 @@ struct mmio_info {
 	/* States */
 	int xshutdown_enabled;
 	int xshutdown_is_active_high;
-	/* tracing */
-	struct trace_buffer_status trace_status;
-	struct mmio_trace *trace_buffer;
-	struct delayed_work trace_work;
-	int trace_allowed;
-	struct mutex lock;
 };
 
 /*
@@ -154,7 +118,7 @@ static int get_mcu_sys_size(u32 size, u32 *val)
 static int mmio_cam_pwr_sensor(struct mmio_info *info, int on)
 {
 	int err = 0;
-
+	
 	if (on) {
 		err = info->pdata->power_enable(info->pdata);
 
@@ -189,7 +153,43 @@ static int mmio_cam_control_clocks(struct mmio_info *info,
 			dev_err(info->dev,
 				"clock_enable failed, err = %d\n",
 				err);
+
+                printk("YJYING debug\n");
+		udelay(100);
+		gpio_set_value(142,1);
+		udelay(100);
+		gpio_set_value(142,0);
+		udelay(100);
+		gpio_set_value(142,1);
+		udelay(100);
+		if(info->pdata->camera_slot ==0)
+		{
+			printk("YJYING debug master poweron\n");
+			gpio_set_value(141,0);
+			gpio_set_value(140,1);
+		}
+		else
+		{
+			printk("YJYING debug slave power on\n");
+			gpio_set_value(141,1);
+			gpio_set_value(140,0);
+		}
+
 	} else {
+              if(info->pdata->camera_slot ==0)
+		{
+			printk("YJYING all powerdown\n");
+			gpio_set_value(141,1);
+			gpio_set_value(140,1);
+		}
+		else
+		{
+			printk("YJYING all powerdown\n");
+			gpio_set_value(141,1);
+			gpio_set_value(140,1);
+		}
+
+		udelay(500);
 		info->pdata->clock_disable(info->pdata);
 	}
 
@@ -442,39 +442,79 @@ static int mmio_enable_xshutdown_from_host(struct mmio_info *info,
 static int mmio_cam_initboard(struct mmio_info *info)
 {
 	int err = 0;
+
 	err = prcmu_qos_add_requirement(PRCMU_QOS_APE_OPP, MMIO_NAME,
-					PRCMU_QOS_APE_OPP_MAX);
+					MAX_PRCMU_QOS_APP);
 
 	if (err) {
-		dev_err(info->dev, "Error adding PRCMU QoS APE OPP requirement %d\n",
+		dev_err(info->dev, "Error adding PRCMU QoS requirement %d\n",
 			err);
-		goto out;
+		goto out_ape;
 	}
 
 	err = prcmu_qos_add_requirement(PRCMU_QOS_DDR_OPP, MMIO_NAME,
 					PRCMU_QOS_DDR_OPP_MAX);
 
 	if (err) {
-		dev_err(info->dev, "Error adding PRCMU QoS DDR OPP requirement %d\n",
+		dev_err(info->dev, "Error adding PRCMU QoS requirement %d\n",
 			err);
-		goto out;
+		goto out_ddr;
 	}
+
+	/* Initialize platform specific data */
+	err = info->pdata->platform_init(info->pdata);
+
+	if (err) {
+		dev_err(info->dev,
+			"Failed to execute platform init: %d\n",
+			err);
+		goto out_plat_init;
+	}
+
 
 	/* Configure xshutdown to be disabled by default */
 	err = mmio_enable_xshutdown_from_host(info, 0);
-	dev_dbg(info->dev, "%s: Main cam XRST controlled by ISP!\n", __func__);
 
-	if (err)
-		goto out;
+	if (err) {
+		dev_err(info->dev,
+			"Failed to disable xshutdown: %d\n",
+			err);
+		goto out_xshutdown;
+	}
 
 	/* Enable IPI2C */
 	err = mmio_activate_i2c2(info, MMIO_ACTIVATE_IPI2C2);
-out:
+
+	if (err) {
+		dev_err(info->dev,
+			"Failed to enable IPI2C: %d\n",
+			err);
+		goto out_i2c;
+	}
+
+	return 0;
+out_i2c:
+	info->pdata->config_xshutdown_pins(info->pdata, MMIO_DISABLE_XSHUTDOWN,
+		-1);
+out_xshutdown:
+	info->pdata->platform_exit(info->pdata);
+out_plat_init:
+	prcmu_qos_remove_requirement(PRCMU_QOS_DDR_OPP, MMIO_NAME);
+out_ddr:
+	prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP, MMIO_NAME);
+out_ape:
 	return err;
 }
 
 static int mmio_cam_desinitboard(struct mmio_info *info)
 {
+	mmio_activate_i2c2(info, MMIO_DEACTIVATE_I2C);
+
+	info->pdata->config_xshutdown_pins(info->pdata, MMIO_DISABLE_XSHUTDOWN,
+			-1);
+
+	info->pdata->platform_exit(info->pdata);
+
 	prcmu_qos_remove_requirement(PRCMU_QOS_APE_OPP, MMIO_NAME);
 	prcmu_qos_remove_requirement(PRCMU_QOS_DDR_OPP, MMIO_NAME);
 	return 0;
@@ -533,68 +573,61 @@ out:
 	return err;
 }
 
-static int mmio_set_trace_buffer(struct mmio_info *info,
-				 struct trace_buf_t *buf)
+
+static int enable_flash_from_host(unsigned long enable)
 {
-	u32 i;
-	int ret = 0;
+	printk("  mmio_enable_flash_from_host: %ld\n",	  enable);
 
-	if (info->trace_allowed != 1) {
-		dev_warn(info->dev, "trace disabled in kernel\n");
-		ret = -EPERM;
-		goto out;
+	switch(enable)
+	{
+	case 0://shutdown
+		gpio_set_value(152,0);
+		gpio_set_value(151,0);
+		udelay(100);
+		break;
+	case 1://torch
+		gpio_set_value(152,0);
+		gpio_set_value(151,1);
+		udelay(100);
+		break;
+	case 2://indicator
+		gpio_set_value(152,1);
+		gpio_set_value(151,0);
+		udelay(100);
+		break;
+	case 3://flash
+		/* flash light need continuse be on several frames to 
+		   get camera sensor AE convenience before take picture,
+		   since flash control chip timed out and auto off in 800ms,
+		   so have to turn off flash and turn on again. */
+		gpio_set_value(152,0);
+		gpio_set_value(151,0);
+		udelay(100);
+		gpio_set_value(152,1);
+		gpio_set_value(151,1);
+		msleep(400);
+		printk(KERN_INFO "	mmio_enable_flash_from_host: re-enable\n");
+		gpio_set_value(152,0);
+		gpio_set_value(151,0);
+		udelay(100);
+		gpio_set_value(152,1);
+		gpio_set_value(151,1);
+		msleep(400);
+		printk(KERN_INFO "	mmio_enable_flash_from_host: re-enable\n");
+		gpio_set_value(152,0);
+		gpio_set_value(151,0);
+		udelay(100);
+		gpio_set_value(152,1);
+		gpio_set_value(151,1);
+		udelay(100);
+		break;
+	default:
+		break;
 	}
 
-	if (!buf->size || !buf->address
-			|| buf->size < sizeof(struct mmio_trace)) {
-		dev_err(info->dev, "invalid xp70 trace buffer\n");
-		ret = -EINVAL;
-		goto out;
-	}
-
-	mutex_lock(&info->lock);
-	if (info->trace_buffer) {
-		dev_info(info->dev, "unmap old buffer");
-		iounmap(info->trace_buffer);
-		info->trace_buffer = NULL;
-	}
-
-	info->trace_buffer = ioremap((u32)buf->address, buf->size);
-
-	if (!info->trace_buffer) {
-		dev_err(info->dev, "failed to map trace buffer\n");
-		ret = -ENOMEM;
-		goto out_unlock;
-	}
-
-	dev_info(info->dev, "xp70 overwrite_cnt=%d (0x%x) blk_id=%d (0x%x)",
-		 info->trace_buffer->overwrite_count,
-		 info->trace_buffer->overwrite_count,
-		 info->trace_buffer->block_id, info->trace_buffer->block_id);
-#ifndef CAM_SHARED_MEM_DEBUG
-
-	/* Reset the allocated buffer contents */
-	for (i = 0; i < XP70_NB_BLOCK; i++)
-		info->trace_buffer->block[i].msg_id = XP70_DEFAULT_MSG_ID;
-
-#endif /* CAM_SHARED_MEMORY_DEBUG */
-	dev_info(info->dev, "xp70 overwrite_cnt=%d (0x%x) blk_id=%d (0x%x)\n",
-		 info->trace_buffer->overwrite_count,
-		 info->trace_buffer->overwrite_count,
-		 info->trace_buffer->block_id, info->trace_buffer->block_id);
-	info->trace_status.prev_overwrite_count = 0;
-	info->trace_status.prev_block_id = 0;
-
-	/* schedule work */
-	if (!schedule_delayed_work(&info->trace_work,
-				   msecs_to_jiffies(XP70_TIMEOUT_MSEC)))
-		dev_err(info->dev, "failed to schedule work\n");
-
-out_unlock:
-	mutex_unlock(&info->lock);
-out:
-	return ret;
+	return 0;
 }
+
 
 static long mmio_ioctl(struct file *filp, u32 cmd,
 		      unsigned long arg)
@@ -622,8 +655,18 @@ static long mmio_ioctl(struct file *filp, u32 cmd,
 		info->pdata->camera_slot = data.mmio_arg.camera_slot;
 		ret = mmio_cam_initboard(info);
 		break;
+	case MMIO_CAM_FLASH_ENABLE:
+		{
+			ret = enable_flash_from_host(arg);
+			if(ret){
+				printk("Unable to %s:  %s camera, flash mode\n",
+					(arg ?"Enable":"Disable"));
+			}
+		}
+		break;
 	case MMIO_CAM_DESINITBOARD:
 		ret = mmio_cam_desinitboard(info);
+		info->pdata->camera_slot = -1;
 		break;
 	case MMIO_CAM_PWR_SENSOR:
 		no_of_bytes = sizeof(struct mmio_input_output_t);
@@ -642,7 +685,7 @@ static long mmio_ioctl(struct file *filp, u32 cmd,
 		break;
 	case MMIO_CAM_SET_EXT_CLK:
 		no_of_bytes = sizeof(struct mmio_input_output_t);
-		memset(&data, 0, sizeof(struct mmio_input_output_t));
+                memset(&data, 0, sizeof(struct mmio_input_output_t));
 
 		if (copy_from_user
 				(&data, (struct mmio_input_output_t *)arg,
@@ -779,21 +822,7 @@ static long mmio_ioctl(struct file *filp, u32 cmd,
 		}
 
 		break;
-	case MMIO_CAM_SET_TRACE_BUFFER:
-		no_of_bytes = sizeof(struct mmio_input_output_t);
-		memset(&data, 0, sizeof(struct mmio_input_output_t));
 
-		if (copy_from_user
-				(&data, (struct mmio_input_output_t *) arg,
-				 no_of_bytes)) {
-			dev_err(info->dev,
-				"Copy from userspace failed\n");
-			ret = -EFAULT;
-			break;
-		}
-
-		ret = mmio_set_trace_buffer(info, &data.mmio_arg.trace_buf);
-		break;
 	default:
 		dev_err(info->dev, "Not an ioctl for this module\n");
 		ret = -EINVAL;
@@ -807,17 +836,18 @@ static int mmio_release(struct inode *node, struct file *filp)
 {
 	struct mmio_info *info = filp->private_data;
 	BUG_ON(info == NULL);
-	mmio_activate_i2c2(info, MMIO_DEACTIVATE_I2C);
-	info->pdata->config_xshutdown_pins(info->pdata, MMIO_DISABLE_XSHUTDOWN,
-					   -1);
 
-	mutex_lock(&info->lock);
-	if (info->trace_buffer) {
-		flush_delayed_work_sync(&info->trace_work);
-		iounmap(info->trace_buffer);
-		info->trace_buffer = NULL;
+
+	/* If not already done... */
+	if (info->pdata->camera_slot != -1) {
+		/* ...force camera to power off */
+		mmio_cam_pwr_sensor(info, false);
+		mmio_cam_control_clocks(info, false);
+		/* ...force to desinit board */
+		mmio_cam_desinitboard(info);
+		info->pdata->camera_slot = -1;
 	}
-	mutex_unlock(&info->lock);
+
 	return 0;
 }
 
@@ -834,210 +864,6 @@ static const struct file_operations mmio_fops = {
 	.release = mmio_release,
 };
 
-
-static ssize_t xp70_data_show(struct device *device,
-			      struct device_attribute *attr, char *buf)
-{
-	int i;
-	int len;
-	int size = 0;
-	int count = 0;
-	int first_index;
-	mutex_lock(&info->lock);
-	first_index = info->trace_status.prev_block_id + 1;
-
-	if (!info->trace_buffer || info->trace_buffer->block_id ==
-			XP70_MAX_BLOCK_ID)
-		goto out_unlock;
-
-	if (info->trace_allowed != 1) {
-		dev_warn(info->dev, "xp70 trace disabled in kernel\n");
-		size = sprintf(buf, "xp70 trace disabled in kernel, "
-			       "use sysfs to enable\n");
-		goto out_unlock;
-	}
-
-	count = info->trace_buffer->block_id - info->trace_status.prev_block_id;
-
-	if ((info->trace_buffer->overwrite_count -
-			info->trace_status.prev_overwrite_count) * XP70_NB_BLOCK
-			+ (info->trace_buffer->block_id -
-			   info->trace_status.prev_block_id)
-			>= XP70_NB_BLOCK) {
-		/* overflow case */
-		info->trace_status.prev_block_id =
-			info->trace_buffer->block_id - XP70_NB_BLOCK;
-		first_index = info->trace_buffer->block_id + 1;
-		count = XP70_NB_BLOCK;
-		len = sprintf(buf, "XP70 trace overflow\n");
-		size += len;
-		buf += len;
-	}
-
-	for (i = first_index; count; count--) {
-		int msg_len;
-
-		if (i < 0 || i >= XP70_NB_BLOCK || count > XP70_NB_BLOCK) {
-			dev_err(info->dev, "trace index out-of-bounds\n");
-			goto out_unlock;
-		}
-
-		msg_len = strnlen(info->trace_buffer->block[i].data,
-				  XP70_BLOCK_SIZE);
-
-		if (msg_len > 0) {
-			/* zero terminate full length message */
-			if (msg_len == XP70_BLOCK_SIZE)
-				info->trace_buffer->block[i].data[
-					XP70_BLOCK_SIZE - 1] = '\0';
-
-			len = snprintf(buf, PAGE_SIZE - size, "%d %s\n",
-				       info->trace_buffer->block[i].msg_id,
-				       info->trace_buffer->block[i].data);
-
-			if (len > PAGE_SIZE - size) {
-				dev_err(info->dev, "sysfs buffer overflow\n");
-				size = PAGE_SIZE;
-				goto out_unlock;
-			}
-
-			size += len;
-			buf += len;
-		}
-
-		i = (i + 1) % XP70_NB_BLOCK;
-	}
-
-out_unlock:
-	mutex_unlock(&info->lock);
-	return size;
-}
-
-static ssize_t xp70_trace_allowed_show(struct device *device,
-				       struct device_attribute *attr,
-				       char *buf)
-{
-	int len;
-	len = sprintf(buf, "%d\n", info->trace_allowed);
-	return len;
-}
-
-static ssize_t xp70_trace_allowed_store(struct device *device,
-					struct device_attribute *attr,
-					const char *buf, size_t count)
-{
-	if (count <= 0) {
-		dev_err(info->dev, "empty buffer to store\n");
-		return 0;
-	}
-
-	if (buf[0] == '1')
-		info->trace_allowed = 1;
-	else if (buf[0] == '0')
-		info->trace_allowed = 0;
-	else
-		dev_err(info->dev, "illegal trace_allowed val %c\n",
-			buf[0]);
-
-	return count;
-}
-
-static struct device_attribute xp70_device_attrs[] = {
-	__ATTR_RO(xp70_data),
-	__ATTR(trace_allowed, S_IRUGO | S_IWUSR, xp70_trace_allowed_show,
-	xp70_trace_allowed_store),
-	__ATTR_NULL
-};
-
-static void xp70_buffer_wqtask(struct work_struct *data)
-{
-	int i;
-	int first_index = info->trace_status.prev_block_id + 1;
-	int count;
-	mutex_lock(&info->lock);
-
-	if (!info->trace_buffer)
-		goto out_err;
-
-	dev_dbg(info->dev, "xp70 overwrite_cnt=%d (0x%x) blk_id=%d (0x%x)",
-		 info->trace_buffer->overwrite_count,
-		 info->trace_buffer->overwrite_count,
-		 info->trace_buffer->block_id, info->trace_buffer->block_id);
-
-	/* check if trace already started */
-	if (info->trace_buffer->block_id == XP70_MAX_BLOCK_ID ||
-		info->trace_buffer->block_id == XP70_DEFAULT_MSG_ID ||
-		info->trace_buffer->overwrite_count == XP70_DEFAULT_MSG_ID)
-		goto out;
-
-	if ((info->trace_buffer->overwrite_count -
-			info->trace_status.prev_overwrite_count) * XP70_NB_BLOCK
-			+ (info->trace_buffer->block_id -
-			   info->trace_status.prev_block_id)
-			>= XP70_NB_BLOCK) {
-		/* overflow case */
-		info->trace_status.prev_block_id =
-			info->trace_buffer->block_id - XP70_NB_BLOCK;
-		first_index = info->trace_buffer->block_id + 1;
-		count = XP70_NB_BLOCK;
-
-		pr_info_ratelimited("XP70 trace overflow\n");
-	} else if (info->trace_buffer->block_id
-			>= info->trace_status.prev_block_id) {
-		count = info->trace_buffer->block_id -
-			info->trace_status.prev_block_id;
-	} else {
-		u32 block_id, prev_block_id, diff;
-		block_id = (u32)(info->trace_buffer->block_id);
-		prev_block_id = (u32)(info->trace_status.prev_block_id);
-		diff = (block_id + XP70_NB_BLOCK) - prev_block_id;
-		count = (u32)diff;
-	}
-
-	for (i = first_index; count; count--) {
-		if (i < 0 || i >= XP70_NB_BLOCK || count > XP70_NB_BLOCK) {
-				pr_info_ratelimited("trace index out-of-bounds"
-					 "i=%d count=%d XP70_NB_BLOCK=%d\n",
-					 i, count, XP70_NB_BLOCK);
-
-			break;
-		}
-
-		if (info->trace_buffer->block[i].msg_id !=
-				XP70_DEFAULT_MSG_ID) {
-			int msg_len = strnlen(
-					      info->trace_buffer->block[i].data,
-					      XP70_BLOCK_SIZE);
-
-			/* zero terminate full length message */
-			if (msg_len > 0) {
-				if (msg_len == XP70_BLOCK_SIZE)
-					info->trace_buffer->block[i].data[
-						XP70_BLOCK_SIZE - 1] = '\0';
-
-				dev_info(info->dev, "%d %s\n",
-					 info->trace_buffer->block[i].msg_id,
-					 info->trace_buffer->block[i].data);
-			}
-		}
-
-		i = (i + 1) % XP70_NB_BLOCK;
-	}
-
-	info->trace_status.prev_overwrite_count =
-		info->trace_buffer->overwrite_count;
-	info->trace_status.prev_block_id = info->trace_buffer->block_id;
-out:
-	/* Schedule work */
-	if (!schedule_delayed_work(&info->trace_work,
-				   msecs_to_jiffies(XP70_TIMEOUT_MSEC)))
-		dev_info(info->dev, "failed to schedule work\n");
-
-out_err:
-	mutex_unlock(&info->lock);
-	return;
-}
-
 /**
 * mmio_probe() - Initialize MMIO Camera resources.
 * @pdev: Platform device.
@@ -1053,9 +879,8 @@ out_err:
 static int __devinit mmio_probe(struct platform_device *pdev)
 {
 	int err;
-	int i;
-	int ret;
-	printk(KERN_INFO "%s\n", __func__);
+
+	dev_dbg(&pdev->dev, "%s\n", __func__);
 	/* Initialize private data. */
 	info = kzalloc(sizeof(struct mmio_info), GFP_KERNEL);
 
@@ -1073,10 +898,10 @@ static int __devinit mmio_probe(struct platform_device *pdev)
 	info->misc_dev.name = MMIO_NAME;
 	info->misc_dev.fops = &mmio_fops;
 	info->misc_dev.parent = pdev->dev.parent;
-	mutex_init(&info->lock);
+
 	info->xshutdown_enabled = 0;
 	info->xshutdown_is_active_high = 0;
-	info->trace_allowed = 0;
+
 	/* Register Misc character device */
 	err = misc_register(&(info->misc_dev));
 
@@ -1102,30 +927,10 @@ static int __devinit mmio_probe(struct platform_device *pdev)
 		goto err_ioremap_cr_base;
 	}
 
-	/* Initialize platform specific data */
-	err = info->pdata->platform_init(info->pdata);
-
-	if (err)
-		goto err_platform_init;
-
-	/* create sysfs entries */
-	for (i = 0; attr_name(xp70_device_attrs[i]); i++) {
-		ret = device_create_file(info->misc_dev.this_device,
-					 &xp70_device_attrs[i]);
-
-		if (ret) {
-			dev_err(info->dev, "Error creating SYSFS entry"
-				" %s (%d)\n", xp70_device_attrs[i].attr.name,
-				ret);
-		}
-	}
-
-	INIT_DELAYED_WORK(&info->trace_work, xp70_buffer_wqtask);
 	dev_info(&pdev->dev, "MMIO driver initialized with minor=%d\n",
 		 info->misc_dev.minor);
 	return 0;
-err_platform_init:
-	iounmap(info->crbase);
+
 err_ioremap_cr_base:
 	iounmap(info->siabase);
 err_ioremap_sia_base:
@@ -1150,27 +955,17 @@ err_alloc:
 static int __devexit mmio_remove(struct platform_device *pdev)
 {
 	int err;
-	int i;
 
 	if (!info)
 		return 0;
-
-	flush_scheduled_work();
-
-	/* sysfs parameters */
-	for (i = 0; attr_name(xp70_device_attrs[i]); i++)
-		device_remove_file(info->misc_dev.this_device,
-				   &xp70_device_attrs[i]);
 
 	err = misc_deregister(&info->misc_dev);
 
 	if (err)
 		dev_err(&pdev->dev, "Error %d deregistering misc dev", err);
 
-	info->pdata->platform_exit(info->pdata);
 	iounmap(info->siabase);
 	iounmap(info->crbase);
-	mutex_destroy(&info->lock);
 	kfree(info);
 	info = NULL;
 	return 0;
@@ -1191,7 +986,6 @@ static struct platform_driver mmio_driver = {
 */
 static int __init mmio_init(void)
 {
-	printk(KERN_INFO "%s\n", __func__);
 	return platform_driver_register(&mmio_driver);
 }
 
@@ -1202,7 +996,6 @@ static int __init mmio_init(void)
 */
 static void __exit mmio_exit(void)
 {
-	printk(KERN_INFO "%s\n", __func__);
 	platform_driver_unregister(&mmio_driver);
 }
 

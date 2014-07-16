@@ -23,7 +23,6 @@
 
 t_cm_domain_desc domainDesc[MAX_USER_DOMAIN_NB];
 t_cm_domain_scratch_desc domainScratchDesc[MAX_SCRATCH_DOMAIN_NB];
-
 static t_cm_allocator_desc *cm_DM_getAllocator(t_cm_domain_id domainId, t_dsp_memory_type_id memType);
 static void cm_DM_DomainError(const t_cm_domain_id parentId, const t_nmf_client_id client);
 
@@ -328,11 +327,26 @@ PUBLIC t_cm_error cm_DM_DestroyDomains(const t_nmf_client_id client)
 {
     t_cm_domain_id handle;
     t_cm_error error, status=CM_OK;
+    t_cm_domain_id phandle[MAX_USER_DOMAIN_NB];	//parent domain IDs
+    int pcount;	//Count for parent domains
 
-    for (handle=0; handle<MAX_USER_DOMAIN_NB; handle++) {
-        if ((domainDesc[handle].client == client)
-            && ((error=cm_DM_DestroyDomain(handle)) != CM_OK)) {
-            LOG_INTERNAL(0, "Error (%d) destroying remaining domainId %d for client %u\n", error, handle, client, 0, 0, 0);
+    for (handle=0,pcount=0; handle<MAX_USER_DOMAIN_NB; handle++) {
+        if (domainDesc[handle].client == client){
+            if(domainDesc[handle].type ==DOMAIN_SCRATCH_PARENT){
+                phandle[pcount++] = handle;
+            }
+            else{
+                if((error=cm_DM_DestroyDomain(handle)) != CM_OK) {
+                LOG_INTERNAL(0, "Error (%d) destroying remaining domainId %d for client %u\n", error, handle, client, 0, 0, 0);
+                status = error;
+                }
+            }
+        }
+    }
+    for(pcount -= 1; pcount >= 0; pcount--){
+        if ((domainDesc[phandle[pcount]].client == client)
+            && ((error=cm_DM_DestroyDomain(phandle[pcount])) != CM_OK)) {
+            LOG_INTERNAL(0, "Error (%d) destroying remaining parent domainId %d for client %u\n", error, phandle[pcount], client, 0, 0, 0);
             status = error;
         }
     }

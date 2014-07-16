@@ -7,7 +7,6 @@
  * it under the terms of the GNU General Public License version 2, as
  * published by the Free Software Foundation.
  *
- * Copyright 2012 Sony Ericsson Mobile Communications AB
  */
 #include <linux/types.h>
 #include <linux/platform_device.h>
@@ -23,7 +22,7 @@ static struct dbx500_ml_area modem_areas[] = {
 
 static struct dbx500_ml_fw modem_fws[] = {
 	{ .name = "MODEM", .area = &modem_areas[0], .offset = 0x0 },
-	/* S1 boot handles MODEM and IPL in one elf file */
+	{ .name = "IPL", .area = &modem_areas[1], .offset = 0x00 },
 };
 
 static struct dbx500_mloader_pdata mloader_fw_data = {

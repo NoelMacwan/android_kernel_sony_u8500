@@ -10,36 +10,15 @@
 #include <linux/sort.h>
 #include <linux/pasr.h>
 
+#include "init.h"
 #include "helper.h"
 
-#define NR_DIES 8
-#define NR_INT 8
-
-struct ddr_die {
-	phys_addr_t addr;
-	unsigned long size;
-};
-
-struct interleaved_area {
-	phys_addr_t addr1;
-	phys_addr_t addr2;
-	unsigned long size;
-};
-
-struct pasr_info {
-	int nr_dies;
-	struct ddr_die die[NR_DIES];
-
-	int nr_int;
-	struct interleaved_area int_area[NR_INT];
-};
-
-static struct pasr_info __initdata pasr_info;
+struct pasr_info pasr_info;
 static struct pasr_map pasr_map;
 
 static void add_ddr_die(phys_addr_t addr, unsigned long size);
-static void add_interleaved_area(phys_addr_t a1,
-		phys_addr_t a2, unsigned long size);
+static void add_interleaved_area(phys_addr_t a1, phys_addr_t a2,
+		unsigned long size, int granularity);
 
 static int __init ddr_die_param(char *p)
 {
@@ -65,6 +44,7 @@ static int __init interleaved_param(char *p)
 {
 	phys_addr_t start1, start2;
 	unsigned long size;
+	int granularity = GRANULARITY_NOT_SET;
 
 	size = memparse(p, &p);
 
@@ -78,7 +58,11 @@ static int __init interleaved_param(char *p)
 
 	start2 = memparse(p + 1, &p);
 
-	add_interleaved_area(start1, start2, size);
+	/* check for optional granularity param */
+	if (*p == '_')
+		granularity = memparse(p + 1, &p);
+
+	add_interleaved_area(start1, start2, size, granularity);
 
 	return 0;
 err:
@@ -95,13 +79,14 @@ void __init add_ddr_die(phys_addr_t addr, unsigned long size)
 }
 
 void __init add_interleaved_area(phys_addr_t a1, phys_addr_t a2,
-		unsigned long size)
+		unsigned long size, int granularity)
 {
 	BUG_ON(pasr_info.nr_int >= NR_INT);
 
 	pasr_info.int_area[pasr_info.nr_int].addr1 = a1;
 	pasr_info.int_area[pasr_info.nr_int].addr2 = a2;
-	pasr_info.int_area[pasr_info.nr_int++].size = size;
+	pasr_info.int_area[pasr_info.nr_int].size = size;
+	pasr_info.int_area[pasr_info.nr_int++].granularity = granularity;
 }
 
 #ifdef DEBUG
@@ -126,16 +111,17 @@ static void __init pasr_print_info(struct pasr_info *info)
 	}
 
 	pr_info("Interleaving layout:\n");
-	pr_info("\tid - start @1 - end @2 : start @2 - end @2\n");
+	pr_info("\tid - start @1 - end @2 : start @2 - end @2 granularity\n");
 	for (i = 0; i < info->nr_int; i++)
-		pr_info("\t-%d - %#08x - %#08x : %#08x - %#08x\n"
+		pr_info("\t-%d - %#08x - %#08x : %#08x - %#08x %08x\n"
 			, i
 			, (unsigned int)info->int_area[i].addr1
 			, (unsigned int)(info->int_area[i].addr1
 				+ info->int_area[i].size - 1)
 			, (unsigned int)info->int_area[i].addr2
 			, (unsigned int)(info->int_area[i].addr2
-				+ info->int_area[i].size - 1));
+				+ info->int_area[i].size - 1)
+			, (unsigned int)info->int_area[i].granularity);
 }
 #else
 #define pasr_print_info(info) do {} while (0)
@@ -143,7 +129,7 @@ static void __init pasr_print_info(struct pasr_info *info)
 
 static int __init is_in_physmem(phys_addr_t addr, struct ddr_die *d)
 {
-	return ((addr >= d->addr) && (addr <= d->addr + d->size));
+	return ((addr >= d->addr) && (addr <= d->addr + d->size - 1));
 }
 
 static int __init pasr_check_interleave_in_physmem(struct pasr_info *info,
@@ -157,11 +143,11 @@ static int __init pasr_check_interleave_in_physmem(struct pasr_info *info,
 		d = &info->die[j];
 		if (is_in_physmem(i->addr1, d))
 			err--;
-		if (is_in_physmem(i->addr1 + i->size, d))
+		if (is_in_physmem(i->addr1 + i->size - 1, d))
 			err--;
 		if (is_in_physmem(i->addr2, d))
 			err--;
-		if (is_in_physmem(i->addr2 + i->size, d))
+		if (is_in_physmem(i->addr2 + i->size - 1, d))
 			err--;
 	}
 
@@ -243,17 +229,6 @@ static int __init pasr_info_sanity_check(struct pasr_info *info)
 			return -EINVAL;
 		}
 
-		/* Check area is aligned on section boundaries */
-		if (((i1->addr1 & ~(PASR_SECTION_SZ - 1)) != i1->addr1)
-			|| ((i1->addr2 & ~(PASR_SECTION_SZ - 1)) != i1->addr2)
-			|| ((i1->size & ~(PASR_SECTION_SZ - 1)) != i1->size)) {
-			pr_err("%s: Interleaved area at %#x/%#x (size %#lx) is not"
-					"aligned on section boundaries %#x\n",
-					__func__, i1->addr1, i1->addr2,
-					i1->size, PASR_SECTION_SZ);
-			return -EINVAL;
-		}
-
 		/* Check interleaved areas are not overlapping */
 		if ((i1->addr1 + i1->size - 1) >= i1->addr2) {
 			pr_err("%s: Interleaved areas %#x"
@@ -322,6 +297,7 @@ static int __init pasr_build_map(struct pasr_info *info, struct pasr_map *map)
 			section[j].start = addr;
 			addr += PASR_SECTION_SZ;
 			section[j].die = &die[i];
+			section[j].state = PASR_REFRESH;
 		}
 	}
 

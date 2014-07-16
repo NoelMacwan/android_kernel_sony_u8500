@@ -37,7 +37,6 @@
 #include <linux/list.h>
 #include <linux/timer.h>
 #include <linux/spinlock.h>
-#include <linux/init.h>
 #include <linux/device.h>
 #include <linux/interrupt.h>
 
@@ -100,7 +99,6 @@ static int service_tx_status_request(
 						USB_DEVICE_SELF_POWERED;
 			result[0] |= musb->may_wakeup <<
 						USB_DEVICE_REMOTE_WAKEUP;
-	#ifdef CONFIG_USB_MUSB_OTG
 			if (musb->g.is_otg) {
 				result[0] |= musb->g.b_hnp_enable
 					<< USB_DEVICE_B_HNP_ENABLE;
@@ -113,7 +111,6 @@ static int service_tx_status_request(
 			} else {
 				result[0] = 1 & musb->g.otg_hnp_reqd;
 		}
-#endif
 #endif
 		break;
 
@@ -431,7 +428,6 @@ __acquires(musb->lock)
 					if (handled > 0)
 						musb->test_mode = true;
 					break;
-#ifdef CONFIG_USB_MUSB_OTG
 				case USB_DEVICE_B_HNP_ENABLE:
 					if (!musb->g.is_otg)
 						goto stall;
@@ -448,7 +444,6 @@ __acquires(musb->lock)
 						goto stall;
 					musb->g.a_alt_hnp_support = 1;
 					break;
-#endif
 				case USB_DEVICE_DEBUG_MODE:
 					handled = 0;
 					break;
@@ -721,6 +716,14 @@ irqreturn_t musb_g_ep0_irq(struct musb *musb)
 			csr, len,
 			musb_readb(mbase, MUSB_FADDR),
 			decode_ep0stage(musb->ep0_state));
+
+	if (csr & MUSB_CSR0_P_DATAEND) {
+		/*
+		 * If DATAEND is set we should not call the callback,
+		 * hence the status stage is not complete.
+		 */
+		return IRQ_HANDLED;
+	}
 
 	/* I sent a stall.. need to acknowledge it now.. */
 	if (csr & MUSB_CSR0_P_SENTSTALL) {

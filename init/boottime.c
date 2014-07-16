@@ -44,7 +44,7 @@ struct boottime_list {
 	/* Time in us since power on, possible including boot loader. */
 	unsigned long time;
 	bool cpu_load;
-	struct cpu_usage_stat cpu_usage[NR_CPUS];
+	struct kernel_cpustat cpu_usage[NR_CPUS];
 };
 
 enum boottime_filter_type {
@@ -64,13 +64,13 @@ enum boottime_cpu_load {
 };
 
 static LIST_HEAD(boottime_list);
-static __initdata DEFINE_SPINLOCK(boottime_list_lock);
-static __initdata struct boottime_timer boottime_timer;
-static __initdata int num_const_boottime_list;
+static DEFINE_SPINLOCK(boottime_list_lock);
+static struct boottime_timer boottime_timer;
+static int num_const_boottime_list;
 static struct boottime_list const_boottime_list[NUM_STATIC_BOOTTIME_ENTRIES];
 static unsigned long time_kernel_done;
 static unsigned long time_bootloader_done;
-static __initdata bool system_up;
+static bool system_up;
 static bool boottime_done;
 
 int __attribute__((weak)) boottime_arch_startup(void)
@@ -83,7 +83,7 @@ int __attribute__((weak)) boottime_bootloader_idle(void)
 	return 0;
 }
 
-static void __init boottime_mark_core(char *name,
+static void boottime_mark_core(char *name,
 				      unsigned long time,
 				      enum boottime_symbolic_print symbolic,
 				      enum boottime_cpu_load cpu_load)
@@ -124,10 +124,14 @@ static void __init boottime_mark_core(char *name,
 
 	if (cpu_load == BOOTTIME_CPU_LOAD && system_up)
 		for_each_possible_cpu(i) {
-			b->cpu_usage[i].system = kstat_cpu(i).cpustat.system;
-			b->cpu_usage[i].idle = kstat_cpu(i).cpustat.idle;
-			b->cpu_usage[i].iowait = kstat_cpu(i).cpustat.iowait;
-			b->cpu_usage[i].irq = kstat_cpu(i).cpustat.irq;
+			b->cpu_usage[i].cpustat[CPUTIME_SYSTEM] =
+				kcpustat_cpu(i).cpustat[CPUTIME_SYSTEM];
+			b->cpu_usage[i].cpustat[CPUTIME_IDLE] =
+				kcpustat_cpu(i).cpustat[CPUTIME_IDLE];
+			b->cpu_usage[i].cpustat[CPUTIME_IOWAIT] =
+				kcpustat_cpu(i).cpustat[CPUTIME_IOWAIT];
+			b->cpu_usage[i].cpustat[CPUTIME_IRQ] =
+				kcpustat_cpu(i).cpustat[CPUTIME_IRQ];
 			/*
 			 * TODO: Make sure that user, nice, softirq, steal
 			 * and guest are not used during boot
@@ -165,7 +169,7 @@ void __ref boottime_mark_symbolic(void *name)
 				   BOOTTIME_CPU_LOAD);
 }
 
-void __init boottime_mark(char *name)
+void boottime_mark(char *name)
 {
 	if (boottime_timer.get_time)
 		boottime_mark_core(name,
@@ -223,7 +227,7 @@ void __init boottime_system_up(void)
 	system_up = true;
 }
 
-void __init boottime_deactivate(void)
+void boottime_deactivate(void)
 {
 	struct boottime_list *b;
 	unsigned long flags;
@@ -253,23 +257,27 @@ static void boottime_debugfs_load(struct seq_file *s,
 	unsigned long system_load, idle_load, irq_load, iowait_load;
 
 	for_each_possible_cpu(i) {
-		total_b = (b->cpu_usage[i].system +
-			   b->cpu_usage[i].idle +
-			   b->cpu_usage[i].iowait +
-			   b->cpu_usage[i].irq);
+		total_b = (b->cpu_usage[i].cpustat[CPUTIME_SYSTEM] +
+			   b->cpu_usage[i].cpustat[CPUTIME_IDLE] +
+			   b->cpu_usage[i].cpustat[CPUTIME_IOWAIT] +
+			   b->cpu_usage[i].cpustat[CPUTIME_IRQ]);
 
-		total_p = (p->cpu_usage[i].system +
-			   p->cpu_usage[i].idle +
-			   p->cpu_usage[i].iowait +
-			   p->cpu_usage[i].irq);
+		total_p = (p->cpu_usage[i].cpustat[CPUTIME_SYSTEM] +
+			   p->cpu_usage[i].cpustat[CPUTIME_IDLE] +
+			   p->cpu_usage[i].cpustat[CPUTIME_IOWAIT] +
+			   p->cpu_usage[i].cpustat[CPUTIME_IRQ]);
 
 		if (total_b == total_p)
 			continue;
 
-		system_total = b->cpu_usage[i].system - p->cpu_usage[i].system;
-		idle_total = b->cpu_usage[i].idle - p->cpu_usage[i].idle;
-		irq_total = b->cpu_usage[i].irq - p->cpu_usage[i].irq;
-		iowait_total = b->cpu_usage[i].iowait - p->cpu_usage[i].iowait;
+		system_total = b->cpu_usage[i].cpustat[CPUTIME_SYSTEM]
+			- p->cpu_usage[i].cpustat[CPUTIME_SYSTEM];
+		idle_total = b->cpu_usage[i].cpustat[CPUTIME_IDLE]
+			- p->cpu_usage[i].cpustat[CPUTIME_IDLE];
+		irq_total = b->cpu_usage[i].cpustat[CPUTIME_IRQ]
+			- p->cpu_usage[i].cpustat[CPUTIME_IRQ];
+		iowait_total = b->cpu_usage[i].cpustat[CPUTIME_IOWAIT]
+			- p->cpu_usage[i].cpustat[CPUTIME_IOWAIT];
 
 		system_load = (100 * system_total / (total_b - total_p));
 		idle_load = (100 * idle_total / (total_b - total_p));

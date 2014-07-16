@@ -42,19 +42,30 @@ static inline struct stmpe_gpio *to_stmpe_gpio(struct gpio_chip *chip)
 	return container_of(chip, struct stmpe_gpio, chip);
 }
 
+static inline u8 stmpe_gpio_reg(struct stmpe *stmpe, u8 index, int offset)
+{
+	u8 reg;
+	if (stmpe->partnum == STMPE1801)
+		reg = stmpe->regs[index] + offset;
+	else
+		reg = stmpe->regs[index] - offset;
+	return reg;
+}
+
 static int stmpe_gpio_get(struct gpio_chip *chip, unsigned offset)
 {
 	struct stmpe_gpio *stmpe_gpio = to_stmpe_gpio(chip);
 	struct stmpe *stmpe = stmpe_gpio->stmpe;
-	u8 reg = stmpe->regs[STMPE_IDX_GPMR_LSB] - (offset / 8);
-	u8 mask = 1 << (offset % 8);
 	int ret;
+	u8 reg, mask;
 
+	reg = stmpe_gpio_reg(stmpe, STMPE_IDX_GPMR_LSB, offset / 8);
+	mask = 1 << (offset % 8);
 	ret = stmpe_reg_read(stmpe, reg);
 	if (ret < 0)
 		return ret;
 
-	return ret & mask;
+	return !!(ret & mask);
 }
 
 static void stmpe_gpio_set(struct gpio_chip *chip, unsigned offset, int val)
@@ -62,8 +73,10 @@ static void stmpe_gpio_set(struct gpio_chip *chip, unsigned offset, int val)
 	struct stmpe_gpio *stmpe_gpio = to_stmpe_gpio(chip);
 	struct stmpe *stmpe = stmpe_gpio->stmpe;
 	int which = val ? STMPE_IDX_GPSR_LSB : STMPE_IDX_GPCR_LSB;
-	u8 reg = stmpe->regs[which] - (offset / 8);
-	u8 mask = 1 << (offset % 8);
+	u8 reg, mask;
+
+	reg = stmpe_gpio_reg(stmpe, which, offset / 8);
+	mask = 1 << (offset % 8);
 
 	/*
 	 * Some variants have single register for gpio set/clear functionality.
@@ -80,8 +93,10 @@ static int stmpe_gpio_direction_output(struct gpio_chip *chip,
 {
 	struct stmpe_gpio *stmpe_gpio = to_stmpe_gpio(chip);
 	struct stmpe *stmpe = stmpe_gpio->stmpe;
-	u8 reg = stmpe->regs[STMPE_IDX_GPDR_LSB] - (offset / 8);
-	u8 mask = 1 << (offset % 8);
+	u8 reg, mask;
+
+	reg = stmpe_gpio_reg(stmpe, STMPE_IDX_GPDR_LSB, offset / 8);
+	mask = 1 << (offset % 8);
 
 	stmpe_gpio_set(chip, offset, val);
 
@@ -93,8 +108,10 @@ static int stmpe_gpio_direction_input(struct gpio_chip *chip,
 {
 	struct stmpe_gpio *stmpe_gpio = to_stmpe_gpio(chip);
 	struct stmpe *stmpe = stmpe_gpio->stmpe;
-	u8 reg = stmpe->regs[STMPE_IDX_GPDR_LSB] - (offset / 8);
-	u8 mask = 1 << (offset % 8);
+	u8 reg, mask;
+
+	reg = stmpe_gpio_reg(stmpe, STMPE_IDX_GPDR_LSB, offset / 8);
+	mask = 1 << (offset % 8);
 
 	return stmpe_set_bits(stmpe, reg, mask, 0);
 }
@@ -174,6 +191,7 @@ static void stmpe_gpio_irq_sync_unlock(struct irq_data *d)
 		[REG_IE]	= STMPE_IDX_IEGPIOR_LSB,
 	};
 	int i, j;
+	u8 reg;
 
 	for (i = 0; i < CACHE_NR_REGS; i++) {
 		/* STMPE801 doesn't have RE and FE registers */
@@ -189,7 +207,8 @@ static void stmpe_gpio_irq_sync_unlock(struct irq_data *d)
 				continue;
 
 			stmpe_gpio->oldregs[i][j] = new;
-			stmpe_reg_write(stmpe, stmpe->regs[regmap[i]] - j, new);
+			reg = stmpe_gpio_reg(stmpe, regmap[i], j);
+			stmpe_reg_write(stmpe, reg, new);
 		}
 	}
 
@@ -229,18 +248,20 @@ static irqreturn_t stmpe_gpio_irq(int irq, void *dev)
 {
 	struct stmpe_gpio *stmpe_gpio = dev;
 	struct stmpe *stmpe = stmpe_gpio->stmpe;
-	u8 statmsbreg = stmpe->regs[STMPE_IDX_ISGPIOR_MSB];
 	int num_banks = DIV_ROUND_UP(stmpe->num_gpios, 8);
 	u8 status[num_banks];
 	int ret;
 	int i;
+	bool lsb = stmpe->partnum == STMPE1801;
+	u8 statmsbreg = lsb ? stmpe->regs[STMPE_IDX_ISGPIOR_LSB] :
+			stmpe->regs[STMPE_IDX_ISGPIOR_MSB];
 
 	ret = stmpe_block_read(stmpe, statmsbreg, num_banks, status);
 	if (ret < 0)
 		return IRQ_NONE;
 
 	for (i = 0; i < num_banks; i++) {
-		int bank = num_banks - i - 1;
+		int bank = lsb ? i : num_banks - i - 1;
 		unsigned int enabled = stmpe_gpio->regs[REG_IE][bank];
 		unsigned int stat = status[i];
 
@@ -258,10 +279,11 @@ static irqreturn_t stmpe_gpio_irq(int irq, void *dev)
 
 		stmpe_reg_write(stmpe, statmsbreg + i, status[i]);
 
-		/* Edge detect register is not present on 801 */
-		if (stmpe->partnum != STMPE801)
-			stmpe_reg_write(stmpe, stmpe->regs[STMPE_IDX_GPEDR_MSB]
-					+ i, status[i]);
+		/* Edge detect register is not present on 801 and 1801 */
+		if (stmpe->partnum != STMPE801 && stmpe->partnum != STMPE1801)
+			stmpe_reg_write(stmpe,
+				stmpe->regs[STMPE_IDX_GPEDR_MSB] + i,
+				status[i]);
 	}
 
 	return IRQ_HANDLED;

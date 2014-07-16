@@ -9,5 +9,5 @@ config DRM_NOVA
 	select MCDE
 	help
 	  Choose this option to enable KMS display driver support for
-	  u5500/u8500/u9540 SoCs.
+	  u8500/u9540 SoCs.
 

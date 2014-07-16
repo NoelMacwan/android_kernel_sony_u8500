@@ -244,6 +244,9 @@ foundNew:
     chunk->next_free_mem = 0;
     chunk->domainId = domainId;
 
+    if((alloc->currentUsedMemory = alloc->currentUsedMemory+chunk->size)>alloc->maxUsedMemory)
+        alloc->maxUsedMemory = alloc->currentUsedMemory;
+
     //TODO, juraj, alloc impacts trace format
     cm_TRC_traceMem(TRACE_ALLOC_COMMAND_ALLOC, 0, chunk->offset, chunk->size);
 
@@ -427,6 +430,8 @@ PUBLIC void cm_MM_Free(t_cm_allocator_desc* alloc, t_memory_handle memHandle)
     cm_TRC_traceMem(TRACE_ALLOC_COMMAND_FREE, 0,
             chunk->offset, chunk->size);
 
+    alloc->currentUsedMemory = alloc->currentUsedMemory - chunk->size;
+
     /* Update chunk status */
     chunk->status = MEM_FREE;
     chunk->domainId = 0x0;
@@ -502,6 +507,8 @@ PUBLIC t_cm_error cm_MM_GetAllocatorStatus(t_cm_allocator_desc* alloc, t_uint32 
     pStatus->global.minimum_free_size = 0xFFFFFFFF;
     pStatus->global.accumulate_free_memory = 0;
     pStatus->global.accumulate_used_memory = 0;
+    pStatus->global.max_used_memory = alloc->maxUsedMemory;
+    pStatus->global.current_used_memory = alloc->currentUsedMemory;
     pStatus->global.size = alloc->maxSize;
     pStatus->domain.maximum_free_size = 0;
     pStatus->domain.minimum_free_size = 0xFFFFFFFF;

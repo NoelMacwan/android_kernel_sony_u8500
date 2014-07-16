@@ -27,148 +27,25 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/wakelock.h>
-#include <mach/id.h>
-#include <mach/usb.h>
+#include <linux/platform_data/usb-musb-ux500.h>
 
 #include "musb_core.h"
 
-#define DEFAULT_DEVCTL 0x81
 static void ux500_musb_set_vbus(struct musb *musb, int is_on);
-#if 0
-static u8 ulpi_read_register(struct musb *musb, u8 address);
-#endif
-static u8 ulpi_write_register(struct musb *musb, u8 address, u8 data);
-static spinlock_t musb_ulpi_spinlock;
 
 struct ux500_glue {
 	struct device		*dev;
 	struct platform_device	*musb;
 	struct clk		*clk;
-	bool RIDA;
 };
 #define glue_to_musb(g)	platform_get_drvdata(g->musb)
 
 static struct timer_list notify_timer;
 static struct musb_context_registers context;
 static bool context_stored;
+static bool powersave_quirks;
 struct musb *_musb;
 static struct wake_lock ux500_usb_wakelock;
-
-#if 0
-/**
- * ulpi_read_register() - Read the usb register from address writing into ULPI
- * @musb: struct musb pointer.
- * @address: address for reading from ULPI register of USB
- *
- * This function read the value from the specific address in USB host mode.
- */
-static u8 ulpi_read_register(struct musb *musb, u8 address)
-{
-	void __iomem *mbase = musb->mregs;
-	unsigned long flags;
-	int count = 200;
-	u8 val;
-
-	spin_lock_irqsave(&musb_ulpi_spinlock, flags);
-
-	/* set ULPI register address */
-	musb_writeb(mbase, OTG_UREGADDR, address);
-
-	/* request a read access */
-	val = musb_readb(mbase, OTG_UREGCTRL);
-	val |= OTG_UREGCTRL_URW;
-	musb_writeb(mbase, OTG_UREGCTRL, val);
-
-	/* perform access */
-	val = musb_readb(mbase, OTG_UREGCTRL);
-	val |= OTG_UREGCTRL_REGREQ;
-	musb_writeb(mbase, OTG_UREGCTRL, val);
-
-	/* wait for completion with a time-out */
-	do {
-		udelay(10);
-		val = musb_readb(mbase, OTG_UREGCTRL);
-		count--;
-	} while (!(val & OTG_UREGCTRL_REGCMP) && (count > 0));
-
-	/* check for time-out */
-	if (!(val & OTG_UREGCTRL_REGCMP) && (count == 0)) {
-		spin_unlock_irqrestore(&musb_ulpi_spinlock, flags);
-		if (printk_ratelimit())
-			printk(KERN_ALERT "U8500 USB : ULPI read timed out\n");
-		return 0;
-	}
-
-	/* acknowledge completion */
-	val &= ~OTG_UREGCTRL_REGCMP;
-	musb_writeb(mbase, OTG_UREGCTRL, val);
-
-	/* get data */
-	val = musb_readb(mbase, OTG_UREGDATA);
-	spin_unlock_irqrestore(&musb_ulpi_spinlock, flags);
-
-	return val;
-}
-#endif
-
-/**
- * ulpi_write_register() - Write to a usb phy's ULPI register
- * using the Mentor ULPI wrapper functionality
- * @musb: struct musb pointer.
- * @address: address of ULPI register
- * @data: data for ULPI register
- * This function writes the value given by data to the specific address
- */
-static u8 ulpi_write_register(struct musb *musb, u8 address, u8 data)
-{
-	void __iomem *mbase = musb->mregs;
-	unsigned long flags;
-	int count = 200;
-	u8 val;
-
-	spin_lock_irqsave(&musb_ulpi_spinlock, flags);
-
-	/* First write to ULPI wrapper registers */
-	/* set ULPI register address */
-	musb_writeb(mbase, OTG_UREGADDR, address);
-
-	/* request a write access */
-	val = musb_readb(mbase, OTG_UREGCTRL);
-	val &= ~OTG_UREGCTRL_URW;
-	musb_writeb(mbase, OTG_UREGCTRL, val);
-
-	/* Write data to ULPI wrapper data register */
-	musb_writeb(mbase, OTG_UREGDATA, data);
-
-	/* perform access  */
-	val = musb_readb(mbase, OTG_UREGCTRL);
-	val |= OTG_UREGCTRL_REGREQ;
-	musb_writeb(mbase, OTG_UREGCTRL, val);
-
-	/* wait for completion with a time-out */
-	do {
-		udelay(10);
-		val = musb_readb(mbase, OTG_UREGCTRL);
-		count--;
-	} while (!(val & OTG_UREGCTRL_REGCMP) && (count > 0));
-
-	/* check for time-out */
-	if (!(val & OTG_UREGCTRL_REGCMP) && (count == 0)) {
-		spin_unlock_irqrestore(&musb_ulpi_spinlock, flags);
-		if (printk_ratelimit())
-			printk(KERN_ALERT "U8500 USB : ULPI write timed out\n");
-		return 0;
-	}
-
-	/* acknowledge completion */
-	val &= ~OTG_UREGCTRL_REGCMP;
-	musb_writeb(mbase, OTG_UREGCTRL, val);
-
-	spin_unlock_irqrestore(&musb_ulpi_spinlock, flags);
-
-	return 0;
-
-}
 
 static void ux500_store_context(struct musb *musb)
 {
@@ -177,7 +54,7 @@ static void ux500_store_context(struct musb *musb)
 	void __iomem *musb_base;
 	void __iomem *epio;
 
-	if (cpu_is_u5500()) {
+	if (powersave_quirks) {
 		if (musb != NULL)
 			_musb = musb;
 		else
@@ -191,12 +68,10 @@ static void ux500_store_context(struct musb *musb)
 		context.testmode = musb_readb(musb_base, MUSB_TESTMODE);
 		context.busctl = musb_read_ulpi_buscontrol(musb->mregs);
 	}
-	context.power = musb_readb(musb_base, MUSB_POWER);
 	context.intrtxe = musb_readw(musb_base, MUSB_INTRTXE);
 	context.intrrxe = musb_readw(musb_base, MUSB_INTRRXE);
-	context.intrusbe = musb_readb(musb_base, MUSB_INTRUSBE);
 	context.index = musb_readb(musb_base, MUSB_INDEX);
-	context.devctl = DEFAULT_DEVCTL;
+	context.intrusbe = musb_readb(musb_base, MUSB_INTRUSBE);
 
 	for (i = 0; i < musb->config->num_eps; ++i) {
 		struct musb_hw_ep       *hw_ep;
@@ -266,27 +141,34 @@ void ux500_restore_context(struct musb *musb)
 	void __iomem *ep_target_regs;
 	void __iomem *epio;
 
-	if (!context_stored)
-		return;
-
-	if (cpu_is_u5500()) {
+	if (powersave_quirks) {
 		if (_musb != NULL)
 			musb = _musb;
 		else
 			return;
 	}
 
+	if (!context_stored)
+		return;
+
 	musb_base = musb->mregs;
+	/*
+	 * Controller reset needs to be done before the context is
+	 * restored to ensure incorrect values are not  present.
+	 */
+	musb_writeb(musb_base, MUSB_SOFT_RST, MUSB_SOFT_RST_NRST
+			| MUSB_SOFT_RST_NRSTX);
 	if (is_host_enabled(musb)) {
 		musb_writew(musb_base, MUSB_FRAME, context.frame);
 		musb_writeb(musb_base, MUSB_TESTMODE, context.testmode);
 		musb_write_ulpi_buscontrol(musb->mregs, context.busctl);
 	 }
-	musb_writeb(musb_base, MUSB_POWER, context.power);
+
+	musb_writeb(musb_base, MUSB_POWER, MUSB_POWER_SOFTCONN
+						| MUSB_POWER_HSENAB);
 	musb_writew(musb_base, MUSB_INTRTXE, context.intrtxe);
 	musb_writew(musb_base, MUSB_INTRRXE, context.intrrxe);
 	musb_writeb(musb_base, MUSB_INTRUSBE, context.intrusbe);
-	musb_writeb(musb_base, MUSB_DEVCTL, context.devctl);
 
 	for (i = 0; i < musb->config->num_eps; ++i) {
 		struct musb_hw_ep       *hw_ep;
@@ -328,8 +210,8 @@ void ux500_restore_context(struct musb *musb)
 		musb_writeb(epio, MUSB_RXTYPE,
 			context.index_regs[i].rxtype);
 		musb_writeb(epio, MUSB_RXINTERVAL,
+			context.index_regs[i].rxinterval);
 
-		musb->context.index_regs[i].rxinterval);
 		musb_write_txfunaddr(musb_base, i,
 			context.index_regs[i].txfunaddr);
 		musb_write_txhubaddr(musb_base, i,
@@ -358,7 +240,7 @@ static void musb_notify_idle(unsigned long _musb)
 	unsigned long	flags;
 
 	u8	devctl;
-	dev_dbg(musb->controller, "musb_notify_idle %s",
+	dev_dbg(musb->controller, "musb_notify_idle %s\n",
 				otg_state_string(musb->xceiv->state));
 	spin_lock_irqsave(&musb->lock, flags);
 
@@ -372,7 +254,7 @@ static void musb_notify_idle(unsigned long _musb)
 			musb->xceiv->state = OTG_STATE_A_IDLE;
 			MUSB_HST_MODE(musb);
 		}
-		if (cpu_is_u8500() && !((devctl && MUSB_DEVCTL_SESSION) == 1)) {
+		if (!powersave_quirks && !((devctl & MUSB_DEVCTL_SESSION) == 1)) {
 			pm_runtime_mark_last_busy(musb->controller);
 			pm_runtime_put_autosuspend(musb->controller);
 		}
@@ -390,13 +272,10 @@ static void musb_notify_idle(unsigned long _musb)
 static int musb_otg_notifications(struct notifier_block *nb,
 		unsigned long event, void *unused)
 {
-	u8	busctl;
 	struct musb	*musb = container_of(nb, struct musb, nb);
-	struct ux500_glue *glue = dev_get_drvdata(musb->controller->parent);
 
 	dev_dbg(musb->controller, "musb_otg_notifications %ld %s\n",
 				event, otg_state_string(musb->xceiv->state));
-
 	switch (event) {
 
 	case USB_EVENT_PREPARE:
@@ -404,39 +283,11 @@ static int musb_otg_notifications(struct notifier_block *nb,
 		pm_runtime_get_sync(musb->controller);
 		ux500_restore_context(musb);
 		break;
-/**
- *	- The Vbus information is sent by the Phy to the controller
- *           through RxCMD.
- *	- Vbus information sent through RxCMD has to be masked
- *
- *	- If bit[6:3]=8, system is in ACA-RID-A then
- *		- In ULPI register, mask VBUSVLD by writing before setting
- *	          the session bit of the MUSB
- *			* Register ULPI Vbuscontrol (offset - 0x70)  = 0x2
- *			* In Interface control register @0x08 = x60
- *	                * In OTG control register @0x0B = x80
- *		- On it_link_update (x0E2B bit7) notification
- *			and link_status <> x8,
- *	          SW must reset previous settings:
- *			* Register ULPI Vbuscontrol (offset - 0x70)  = 0
- *			* In Interface control register @0x09 = x60
- *	                * In OTG control register @0x0C = x80
- */
-	case USB_EVENT_RIDA:
-		busctl = musb_read_ulpi_buscontrol(musb->mregs);
-		busctl |= 0x02;
-		musb_write_ulpi_buscontrol(musb->mregs, busctl);
-		ulpi_write_register(musb, 0x08, 0x60);
-		ulpi_write_register(musb, 0x0B, 0x80);
-		glue->RIDA = true;
 	case USB_EVENT_ID:
+	case USB_EVENT_RIDA:
 		dev_dbg(musb->controller, "ID GND\n");
-		if (!(glue->RIDA)){
-			ulpi_write_register(musb, 0x09, 0x60);
-			ulpi_write_register(musb, 0x0C, 0x80);
-		}
 		if (is_otg_enabled(musb)) {
-			ux500_musb_set_vbus(musb, 1);
+				ux500_musb_set_vbus(musb, 1);
 		}
 		break;
 
@@ -444,11 +295,9 @@ static int musb_otg_notifications(struct notifier_block *nb,
 		dev_dbg(musb->controller, "VBUS Connect\n");
 
 		break;
-	case USB_EVENT_RIDB:
+/* 	case USB_EVENT_RIDB: FIXME, not yet managed */
 	case USB_EVENT_NONE:
 		dev_dbg(musb->controller, "VBUS Disconnect\n");
-		if (glue->RIDA)
-			glue->RIDA = false;
 		if (is_otg_enabled(musb) && musb->is_host)
 			ux500_musb_set_vbus(musb, 0);
 		else
@@ -471,10 +320,18 @@ static void ux500_musb_set_vbus(struct musb *musb, int is_on)
 	u8		devctl;
 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 	int ret = 1;
+#ifdef	CONFIG_USB_OTG_20
+	int val = 0;
+#endif
 	/* HDRC controls CPEN, but beware current surges during device
 	 * connect.  They can trigger transient overcurrent conditions
 	 * that must be ignored.
 	 */
+#ifdef	CONFIG_USB_OTG_20
+	val = musb_readb(musb->mregs, MUSB_MISC);
+	val |= 0x1C;
+	musb_writeb(musb->mregs, MUSB_MISC, val);
+#endif
 	devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
 
 	if (is_on) {
@@ -517,7 +374,7 @@ static void ux500_musb_set_vbus(struct musb *musb, int is_on)
 
 		} else {
 			musb->is_active = 1;
-			musb->xceiv->default_a = 1;
+			musb->xceiv->otg->default_a = 1;
 			musb->xceiv->state = OTG_STATE_A_WAIT_VRISE;
 			devctl |= MUSB_DEVCTL_SESSION;
 			MUSB_HST_MODE(musb);
@@ -528,12 +385,21 @@ static void ux500_musb_set_vbus(struct musb *musb, int is_on)
 		/* NOTE:  we're skipping A_WAIT_VFALL -> A_IDLE and
 		 * jumping right to B_IDLE...
 		 */
-		musb->xceiv->default_a = 0;
+		musb->xceiv->otg->default_a = 0;
 		devctl &= ~MUSB_DEVCTL_SESSION;
 		MUSB_DEV_MODE(musb);
 	}
 	musb_writeb(musb->mregs, MUSB_DEVCTL, devctl);
+	/*
+	 * Devctl values will be updated after vbus goes below
+	 * session_valid. The time taken depends on the capacitance
+	 * on VBUS line. The max discharge time can be upto 1 sec
+	 * as per the spec. Typically on our platform, it is 200ms
+	 */
 
+	/* TODO: Check discharge time values for other platforms */
+	if (!is_on)
+		mdelay(200);
 	dev_dbg(musb->controller, "VBUS %s, devctl %02x "
 		/* otg %3x conf %08x prcm %08x */ "\n",
 		otg_state_string(musb->xceiv->state),
@@ -579,6 +445,45 @@ static void ux500_musb_enable(struct musb *musb)
 	ux500_store_context(musb);
 }
 
+static int ux500_musb_restore_endpoints(struct musb *musb)
+{
+	struct usb_ep *ep = NULL;
+	struct musb_hw_ep *hw_ep = musb->endpoints;
+	struct usb_gadget *gadget = &musb->g;
+	int hw_epnum = 1, i = 1; /* leave aside control endpoints */
+
+	list_for_each_entry(ep, &gadget->ep_list, ep_list) {
+		/*
+		 * The hardware eplist contains one entry for
+		 * {81,1}, but the gadget ep list contains separate
+		 * entries for {81} and {1}. Hence the hardware ep list
+		 * is advanced only for every two entries in the
+		 * gadget ep list
+		 */
+		hw_epnum += ((i & 1) ? 0 : 1);
+
+		/* ignore the unused endpoints */
+		if (!ep->address) {
+			i++;
+			continue;
+		}
+
+		if (ep->address & USB_DIR_IN) {
+			dev_dbg(musb->controller, "%s: %s %d->%d\n",
+				__func__, ep->name, ep->maxpacket,
+				hw_ep[hw_epnum].max_packet_sz_tx);
+			ep->maxpacket = hw_ep[hw_epnum].max_packet_sz_tx;
+		} else {
+			dev_dbg(musb->controller, "%s: %s %d->%d\n",
+				__func__, ep->name, ep->maxpacket,
+				hw_ep[hw_epnum].max_packet_sz_rx);
+			ep->maxpacket = hw_ep[hw_epnum].max_packet_sz_rx;
+		}
+		i++;
+	}
+	return 0;
+}
+
 static struct usb_ep *ux500_musb_configure_endpoints(struct musb *musb,
 		u8 type, struct usb_endpoint_descriptor  *desc)
 {
@@ -605,18 +510,13 @@ static int ux500_musb_init(struct musb *musb)
 {
 	int status;
 
-	musb->xceiv = otg_get_transceiver();
+	musb->xceiv = usb_get_transceiver();
 	if (!musb->xceiv) {
 		pr_err("HS USB OTG: no transceiver configured\n");
 		return -ENODEV;
 	}
-	status = pm_runtime_get_sync(musb->controller);
-	if (status < 0) {
-		dev_err(musb->controller, "pm_runtime_get_sync FAILED");
-		goto err1;
-	}
 	musb->nb.notifier_call = musb_otg_notifications;
-	status = otg_register_notifier(musb->xceiv, &musb->nb);
+	status = usb_register_notifier(musb->xceiv, &musb->nb);
 
 	if (status < 0) {
 		dev_dbg(musb->controller, "notification register failed\n");
@@ -639,7 +539,7 @@ err1:
  */
 static int ux500_musb_exit(struct musb *musb)
 {
-	otg_put_transceiver(musb->xceiv);
+	usb_put_transceiver(musb->xceiv);
 
 	return 0;
 }
@@ -653,6 +553,7 @@ static const struct musb_platform_ops ux500_ops = {
 
 	.enable		= ux500_musb_enable,
 	.configure_endpoints	= ux500_musb_configure_endpoints,
+	.restore_endpoints = ux500_musb_restore_endpoints,
 };
 
 /**
@@ -662,9 +563,10 @@ static const struct musb_platform_ops ux500_ops = {
  * This function allocates the required memory for the
  * structures and initialize interrupts.
  */
-static int __init ux500_probe(struct platform_device *pdev)
+static int __devinit ux500_probe(struct platform_device *pdev)
 {
 	struct musb_hdrc_platform_data	*pdata = pdev->dev.platform_data;
+	struct ux500_musb_board_data	*bdata = pdata->board_data;
 	struct platform_device		*musb;
 	struct ux500_glue		*glue;
 	struct clk			*clk;
@@ -698,7 +600,7 @@ static int __init ux500_probe(struct platform_device *pdev)
 	glue->dev			= &pdev->dev;
 	glue->musb			= musb;
 	glue->clk			= clk;
-	glue->RIDA			= false;
+
 	pdata->platform_ops		= &ux500_ops;
 
 	platform_set_drvdata(pdev, glue);
@@ -732,14 +634,14 @@ static int __init ux500_probe(struct platform_device *pdev)
 		goto err4;
 	}
 
+	powersave_quirks = bdata->powersave_quirks;
+
 	pm_runtime_enable(&pdev->dev);
 
 	return 0;
 err4:
 	platform_device_del(musb);
 err3:
-	if (cpu_is_u5500())
-		clk_disable(clk);
 	clk_put(clk);
 
 err2:
@@ -752,14 +654,12 @@ err0:
 	return ret;
 }
 
-static int __exit ux500_remove(struct platform_device *pdev)
+static int __devexit ux500_remove(struct platform_device *pdev)
 {
 	struct ux500_glue	*glue = platform_get_drvdata(pdev);
 
 	platform_device_del(glue->musb);
 	platform_device_put(glue->musb);
-	if (cpu_is_u5500())
-		clk_disable(glue->clk);
 	clk_put(glue->clk);
 	pm_runtime_put(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
@@ -782,15 +682,7 @@ static int ux500_suspend(struct device *dev)
 	struct ux500_glue	*glue = dev_get_drvdata(dev);
 	struct musb		*musb = glue_to_musb(glue);
 
-	otg_set_suspend(musb->xceiv, 1);
-
-	if (cpu_is_u5500())
-		/*
-		 * Since this clock is in the APE domain, it will
-		 * automatically be disabled on suspend.
-		 * (And enabled on resume automatically.)
-		 */
-		clk_disable(glue->clk);
+	usb_phy_set_suspend(musb->xceiv, 1);
 
 	dev_dbg(dev, "ux500_suspend\n");
 	return 0;
@@ -806,11 +698,12 @@ static int ux500_suspend(struct device *dev)
 static int ux500_resume(struct device *dev)
 {
 	struct ux500_glue	*glue = dev_get_drvdata(dev);
+	struct musb		*musb = glue_to_musb(glue);
 
-	if (cpu_is_u5500())
-		/* No point in propagating errors on resume */
-		(void) clk_enable(glue->clk);
 	dev_dbg(dev, "ux500_resume\n");
+
+	usb_phy_set_suspend(musb->xceiv, 0);
+
 	return 0;
 }
 #ifdef CONFIG_UX500_SOC_DB8500
@@ -818,9 +711,6 @@ static int ux500_musb_runtime_resume(struct device *dev)
 {
 	struct ux500_glue	*glue = dev_get_drvdata(dev);
 	int ret;
-
-	if (cpu_is_u5500())
-		return 0;
 
 	ret = clk_enable(glue->clk);
 	if (ret) {
@@ -834,9 +724,6 @@ static int ux500_musb_runtime_resume(struct device *dev)
 static int ux500_musb_runtime_suspend(struct device *dev)
 {
 	struct ux500_glue	*glue = dev_get_drvdata(dev);
-
-	if (cpu_is_u5500())
-		return 0;
 
 	clk_disable(glue->clk);
 	dev_dbg(dev, "ux500_musb_runtime_suspend\n");
@@ -858,7 +745,8 @@ static const struct dev_pm_ops ux500_pm_ops = {
 #endif
 
 static struct platform_driver ux500_driver = {
-	.remove		= __exit_p(ux500_remove),
+	.probe		= ux500_probe,
+	.remove		= __devexit_p(ux500_remove),
 	.driver		= {
 		.name	= "musb-ux500",
 		.pm	= DEV_PM_OPS,
@@ -871,7 +759,7 @@ MODULE_LICENSE("GPL v2");
 
 static int __init ux500_init(void)
 {
-	return platform_driver_probe(&ux500_driver, ux500_probe);
+	return platform_driver_register(&ux500_driver);
 }
 subsys_initcall(ux500_init);
 

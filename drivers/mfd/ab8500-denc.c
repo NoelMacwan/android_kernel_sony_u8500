@@ -21,7 +21,7 @@
 #include <linux/spinlock.h>
 #include <linux/err.h>
 #include <linux/uaccess.h>
-#include <linux/mfd/ab8500.h>
+#include <linux/mfd/abx500/ab8500.h>
 #include <linux/mfd/abx500.h>
 #include <linux/mfd/abx500/ab8500-denc-regs.h>
 #include <linux/mfd/abx500/ab8500-denc.h>

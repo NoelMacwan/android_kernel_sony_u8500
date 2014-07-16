@@ -37,6 +37,9 @@ static struct hrtimer timer;
 /* debug functionality */
 #define ISA_DEBUG 0
 
+/* count for no of msg to be check befor suspend */
+#define CHK_SLP_MSG_CNT 3
+
 #define PHONET_TASKLET
 #define MAX_RCV_LEN	2048
 
@@ -317,7 +320,7 @@ void do_phonet_rcv_tasklet(unsigned long unused)
 	dev_dbg(shrm->dev, "%s OUT\n", __func__);
 }
 
-static int shrm_probe(struct platform_device *pdev)
+static int __init shrm_probe(struct platform_device *pdev)
 {
 	int err = 0;
 	struct resource *res;
@@ -511,16 +514,17 @@ static int shrm_probe(struct platform_device *pdev)
 		err = -EBUSY;
 		goto rollback_map;
 	}
+	shrm->ca_reset_status_rptr =
+		(void __iomem *)ioremap(SHM_CA_MOD_RESET_STATUS_AMCU, SHM_PTR_SIZE);
+	if (!(shrm->ca_reset_status_rptr)) {
+		dev_err(shrm->dev, "Unable to map register base\n");
+		err = -EBUSY;
+		goto rollback_map;
+	}
 
 	if (isa_init(shrm) != 0) {
 		dev_err(shrm->dev, "Driver Initialization Error\n");
 		err = -EBUSY;
-	}
-	/* install handlers and tasklets */
-	if (shm_initialise_irq(shrm)) {
-		dev_err(shrm->dev,
-				"shm error in interrupt registration\n");
-		goto rollback_irq;
 	}
 #ifdef CONFIG_HIGH_RES_TIMERS
 	hrtimer_init(&timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -529,15 +533,31 @@ static int shrm_probe(struct platform_device *pdev)
 #endif
 	err = shrm_register_netdev(shrm);
 	if (err < 0)
-		goto rollback_irq;
+		goto rollback_map;
 
 	tasklet_init(&phonet_rcv_tasklet, do_phonet_rcv_tasklet, 0);
 	phonet_rcv_tasklet.data = (unsigned long)shrm;
 
+	/* request sysclk which is required for modem */
+	shrm->clk  = clk_get(shrm->dev, "sysclk");
+	if (IS_ERR(shrm->clk)) {
+		dev_err(shrm->dev, "failed to request sysclk\n");
+		err = PTR_ERR(shrm->clk);
+		shrm->clk = NULL;
+		goto rollback_map;
+	}
+
+	/* install handlers and tasklets */
+	if (shm_initialise_irq(shrm)) {
+		dev_err(shrm->dev,
+				"shm error in interrupt registration\n");
+		goto rollback_irq;
+	}
 	platform_set_drvdata(pdev, shrm);
 
 	return err;
 rollback_irq:
+	clk_put(shrm->clk);
 	free_shm_irq(shrm);
 rollback_map:
 	iounmap(shrm->ac_common_shared_wptr);
@@ -583,7 +603,50 @@ static int __exit shrm_remove(struct platform_device *pdev)
 	iounmap(shrm->ca_audio_shared_rptr);
 	shrm_unregister_netdev(shrm);
 	isa_exit(shrm);
+	clk_put(shrm->clk);
 	kfree(shrm);
+
+	return 0;
+}
+
+static int check_shrm_unread_msg(struct shrm_dev *shrm)
+{
+	struct message_queue *q;
+	struct isadev_context *isa_dev;
+	int idx;
+	u8 cnt;
+
+	struct sleep_msg_list {
+		u8 l2_header;
+		char *name;
+	};
+
+	/* list of messages or l2 header to be check before going susped */
+	struct sleep_msg_list slp_msg[] = {
+		{RPC_MESSAGING, "RPC"},
+		{SECURITY_MESSAGING, "Security"},
+		{ISI_MESSAGING, "ISI"},
+	};
+
+	for (cnt = 0; cnt < CHK_SLP_MSG_CNT; cnt++) {
+		idx = shrm_get_cdev_index(slp_msg[cnt].l2_header);
+		isa_dev = &shrm->isa_context->isadev[idx];
+		q = &isa_dev->dl_queue;
+		if (!list_empty(&q->msg_list)) {
+
+			if (atomic_dec_and_test(&shrm->isa_context->is_open[idx])) {
+				atomic_inc(&shrm->isa_context->is_open[idx]);
+				dev_info(shrm->dev, "%s device not opened yet, flush queue\n",
+					slp_msg[cnt].name);
+				shrm_char_reset_queues(shrm);
+			} else {
+				atomic_inc(&shrm->isa_context->is_open[idx]);
+				dev_info(shrm->dev, "Some %s msg unread = %d\n",
+					slp_msg[cnt].name, get_size_of_new_msg(q));
+				return -EBUSY;
+			}
+		}
+	}
 
 	return 0;
 }
@@ -603,41 +666,21 @@ int u8500_shrm_suspend(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct shrm_dev *shrm = platform_get_drvdata(pdev);
-	struct message_queue *q;
-	struct isadev_context *isa_dev;
 	int err;
-	int idx;
 
 	dev_dbg(&pdev->dev, "%s called...\n", __func__);
 	dev_dbg(&pdev->dev, "ca_wake_req_state = %x\n",
 						get_ca_wake_req_state());
 
 	/*
-	 * Is there are any messages unread in the RPC queue, dont suspend
-	 * as these are real time and modem expects response within 1sec
-	 * else will end up in a crash.
-	 */
-	idx = shrm_get_cdev_index(RPC_MESSAGING);
-	isa_dev = &shrm->isa_context->isadev[idx];
-	q = &isa_dev->dl_queue;
-	if (!list_empty(&q->msg_list)) {
-		dev_info(shrm->dev, "Some RPC msg unread = %d\n",
-				get_size_of_new_msg(q));
+	* Is there are any messages unread in the RPC or Security queue,
+	* dont suspend as these are real time and modem expects response
+	* within 1sec else will end up in a crash. If userspace doesn't
+	* open the device, then will flush the queue and allow device go to suspend
+	*/
+
+	if (check_shrm_unread_msg(shrm))
 		return -EBUSY;
-	}
-	/*
-	 * Is there are any messages unread in the Security queue, dont suspend
-	 * as these are real time and modem expects response within 1sec
-	 * else will end up in a crash.
-	 */
-	idx = shrm_get_cdev_index(SECURITY_MESSAGING);
-	isa_dev = &shrm->isa_context->isadev[idx];
-	q = &isa_dev->dl_queue;
-	if (!list_empty(&q->msg_list)) {
-		dev_info(shrm->dev, "Some Security msg unread = %d\n",
-				get_size_of_new_msg(q));
-		return -EBUSY;
-	}
 
 	/* if ca_wake_req is high, prevent system suspend */
 	if (!get_ca_wake_req_state()) {

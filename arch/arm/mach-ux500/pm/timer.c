@@ -30,6 +30,8 @@
 #include <mach/hardware.h>
 #include <mach/irqs-db8500.h>
 
+#include "../id.h"
+
 #define RTC_IMSC	0x10
 #define RTC_MIS		0x18
 #define RTC_ICR		0x1C
@@ -186,7 +188,7 @@ static irqreturn_t rtcrtt_interrupt(int irq, void *data)
 
 static int __init ux500_rtcrtt_init(void)
 {
-	if (cpu_is_u8500() || cpu_is_u9540()) {
+	if (cpu_is_u8500_family() || cpu_is_ux540_family()) {
 		rtc_base  = __io_address(U8500_RTC_BASE);
 	} else {
 		pr_err("timer-rtt: Unknown DB Asic!\n");

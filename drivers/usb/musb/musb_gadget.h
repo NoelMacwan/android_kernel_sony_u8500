@@ -90,6 +90,9 @@ struct musb_ep {
 	u8				busy;
 
 	u8				hb_mult;
+
+	/* true if packet is received in fifo and req_list is empty */
+	u8				rx_pending;
 };
 
 static inline struct musb_ep *to_musb_ep(struct usb_ep *ep)

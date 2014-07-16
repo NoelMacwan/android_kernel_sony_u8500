@@ -13,14 +13,18 @@
  * by the Free Software Foundation.
  */
 
+#include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/debugfs.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
 #include <linux/regulator/consumer.h>
 #include <linux/mfd/dbx500-prcmu.h>
+#include <linux/types.h>
 
 #include <mach/hardware.h>
 #include <mach/msp.h>
@@ -29,8 +33,9 @@
 
 #include "ux500_msp_i2s.h"
 
-static int
-ux500_msp_i2s_enable(struct msp *msp, struct msp_config *config);
+#define MSP_DEBUG_STRING_SZ	(20)
+
+static int ux500_msp_i2s_enable(struct msp *msp, struct msp_config *config);
 
  /* Protocol desciptors */
 static const struct msp_protocol_desc prot_descs[] = {
@@ -491,20 +496,19 @@ int ux500_msp_i2s_open(struct ux500_msp_i2s_drvdata *drvdata, struct msp_config 
 		msp_config->rx_frame_sync_pol | msp_config->tx_frame_sync_pol |
 		msp_config->rx_frame_sync_sel | msp_config->tx_frame_sync_sel |
 		msp_config->rx_fifo_config | msp_config->tx_fifo_config |
-		msp_config->srg_clock_sel | msp_config->loopback_enable |
-		msp_config->tx_data_enable);
+		msp_config->srg_clock_sel | msp_config->tx_data_enable);
 
 	old_reg = readl(msp->registers + MSP_GCR);
 	old_reg &= ~mask;
 	new_reg |= old_reg;
+	if (drvdata->loopback)
+		new_reg |= 0x80;
 	writel(new_reg, msp->registers + MSP_GCR);
 
 	if (ux500_msp_i2s_enable(msp, msp_config) != 0) {
 		pr_err("%s: ERROR: ux500_msp_i2s_enable failed!\n", __func__);
 		return -EBUSY;
 	}
-	if (msp_config->loopback_enable & 0x80)
-		msp->loopback_enable = 1;
 
 	/* Flush FIFOs */
 	flush_fifo_tx(msp);
@@ -629,11 +633,10 @@ ux500_msp_i2s_trigger(
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		if (direction == SNDRV_PCM_STREAM_PLAYBACK) {
+		if (direction == SNDRV_PCM_STREAM_PLAYBACK)
 			enable_bit = TX_ENABLE;
-		} else {
+		else
 			enable_bit = RX_ENABLE;
-		}
 		reg_val_GCR = readl(msp->registers + MSP_GCR);
 		writel(reg_val_GCR | enable_bit, msp->registers + MSP_GCR);
 		break;
@@ -641,11 +644,10 @@ ux500_msp_i2s_trigger(
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		if (direction == SNDRV_PCM_STREAM_PLAYBACK) {
+		if (direction == SNDRV_PCM_STREAM_PLAYBACK)
 			ux500_msp_i2s_disable_tx(msp);
-		} else {
+		else
 			ux500_msp_i2s_disable_rx(msp);
-		}
 		break;
 	default:
 		return -EINVAL;
@@ -705,6 +707,49 @@ end:
 
 }
 
+static int msp_registers_print(struct seq_file *s, void *p)
+{
+	struct device *dev = s->private;
+	struct ux500_msp_i2s_drvdata *drvdata = dev_get_drvdata(dev);
+	struct msp *msp = drvdata->msp;
+	u32 reg;
+
+	for (reg = 0; reg <= 0x70; reg += 4) {
+		u32 value;
+		int err;
+
+		value = readl(msp->registers + reg);
+
+		if (s) {
+			err = seq_printf(s, "  [0x%02X]: 0x%08X\n",
+				reg, value);
+			if (err < 0) {
+				dev_err(dev,
+					"seq_printf overflow reg=0x%02X\n",
+					reg);
+				return 0;
+			}
+		} else {
+			pr_info("%s: [0x%02X]: 0x%08X\n", __func__, reg,
+				value);
+		}
+	}
+	return 0;
+}
+
+static int msp_registers_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, msp_registers_print, inode->i_private);
+}
+
+static const struct file_operations msp_registers_fops = {
+	.open = msp_registers_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+	.owner = THIS_MODULE,
+};
+
 struct ux500_msp_i2s_drvdata *ux500_msp_i2s_init(struct platform_device *pdev,
 					struct msp_i2s_platform_data *platform_data)
 {
@@ -713,6 +758,8 @@ struct ux500_msp_i2s_drvdata *ux500_msp_i2s_init(struct platform_device *pdev,
 	struct resource *res = NULL;
 	struct i2s_controller *i2s_cont;
 	struct msp *msp;
+	struct dentry *dbg_entry;
+	char dbg_name[MSP_DEBUG_STRING_SZ + 1];
 
 	pr_debug("%s: Enter (pdev->name = %s).\n", __func__, pdev->name);
 
@@ -753,7 +800,7 @@ struct ux500_msp_i2s_drvdata *ux500_msp_i2s_init(struct platform_device *pdev,
 	}
 	dev_set_drvdata(&pdev->dev, msp_i2s_drvdata);
 
-	prcmu_qos_add_requirement(PRCMU_QOS_APE_OPP, (char *)pdev->name,
+	prcmu_qos_add_requirement(PRCMU_QOS_APE_OPP, pdev->name,
 				  PRCMU_QOS_DEFAULT_VALUE);
 	msp->clk = clk_get(&pdev->dev, NULL);
 	if (IS_ERR(msp->clk)) {
@@ -763,7 +810,6 @@ struct ux500_msp_i2s_drvdata *ux500_msp_i2s_init(struct platform_device *pdev,
 	}
 
 	msp->msp_state = MSP_STATE_IDLE;
-	msp->loopback_enable = 0;
 
 	/* I2S Controller is allocated and added in I2S controller class. */
 	i2s_cont = kzalloc(sizeof(*i2s_cont), GFP_KERNEL);
@@ -782,6 +828,32 @@ struct ux500_msp_i2s_drvdata *ux500_msp_i2s_init(struct platform_device *pdev,
 	pr_debug("I2S device-name :%s\n", i2s_cont->name);
 	msp->i2s_cont = i2s_cont;
 
+
+	memset(dbg_name, 0, sizeof(dbg_name));
+	snprintf(dbg_name, sizeof(dbg_name), "msp.%x", msp->id);
+
+	msp_i2s_drvdata->dbg_dir = debugfs_create_dir(dbg_name, NULL);
+
+	if (msp_i2s_drvdata->dbg_dir == NULL ||
+		msp_i2s_drvdata->dbg_dir == ERR_PTR(-ENODEV)) {
+		msp_i2s_drvdata->dbg_dir = NULL;
+		goto out;
+	}
+
+	dbg_entry = debugfs_create_file("all-registers", S_IRUGO,
+		msp_i2s_drvdata->dbg_dir,
+		&pdev->dev,
+		&msp_registers_fops);
+
+	if (!dbg_entry) {
+		debugfs_remove_recursive(msp_i2s_drvdata->dbg_dir);
+		msp_i2s_drvdata->dbg_dir = NULL;
+	}
+
+	dbg_entry = debugfs_create_u32("loopback", S_IWUGO | S_IRUGO,
+		msp_i2s_drvdata->dbg_dir, &msp_i2s_drvdata->loopback);
+
+out:
 	return msp_i2s_drvdata;
 
 del_clk:
@@ -800,6 +872,7 @@ int ux500_msp_i2s_exit(struct ux500_msp_i2s_drvdata *drvdata)
 
 	pr_debug("%s: Enter (drvdata->id = %d).\n", __func__, drvdata->id);
 
+	debugfs_remove_recursive(drvdata->dbg_dir);
 	device_unregister(&msp->i2s_cont->dev);
 	clk_put(msp->clk);
 	iounmap(msp->registers);

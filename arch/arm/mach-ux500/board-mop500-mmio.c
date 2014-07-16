@@ -44,15 +44,21 @@ static pin_cfg_t i2c_disable_pins[] = {
 };
 static pin_cfg_t xshutdown_host[] = {
 	GPIO141_GPIO,
-	GPIO142_GPIO
+	GPIO140_GPIO
 };
 static pin_cfg_t xshutdown_fw[] = {
 	GPIO141_IP_GPIO2,
 	GPIO142_IP_GPIO3
 };
+//joe debug font camera
 static pin_cfg_t xshutdown_disable[] = {
+#if 0	
 	GPIO141_GPIO | PIN_OUTPUT_LOW,
 	GPIO142_GPIO | PIN_OUTPUT_LOW
+#else
+	GPIO141_GPIO | PIN_OUTPUT_LOW,
+	GPIO140_GPIO | PIN_OUTPUT_LOW,
+#endif	
 };
 
 struct mmio_board_data {
@@ -64,6 +70,10 @@ struct mmio_board_data {
 	/* Internal clocks */
 	struct clk *clk_ptr_bml;
 	struct clk *clk_ptr_ipi2c;
+//joe debug	
+#if 1
+	struct clk *clk_ptr_i2c;
+#endif	
 	/* External clocks */
 	struct clk *clk_ptr_ext[CAMERA_SLOT_END];
 };
@@ -133,47 +143,110 @@ static int mmio_clock_init(struct mmio_platform_data *pdata)
 	if (IS_ERR(extra->clk_ptr_bml)) {
 		err = PTR_ERR(extra->clk_ptr_bml);
 		dev_err(pdata->dev, "Error %d getting clock 'bml'\n", err);
-		goto err_bml_clk;
+		goto err_bml_clk_get;
 	}
+
+	err = clk_prepare(extra->clk_ptr_bml);
+	if (err) {
+		dev_err(pdata->dev, "Error %d preparing clock 'bml'\n", err);
+		goto err_bml_clk_prepare;
+	}
+
 	extra->clk_ptr_ipi2c = clk_get_sys("ipi2", NULL);
 	if (IS_ERR(extra->clk_ptr_ipi2c)) {
 		err = PTR_ERR(extra->clk_ptr_ipi2c);
 		dev_err(pdata->dev, "Error %d getting clock 'ipi2'\n", err);
-		goto err_ipi2c_clk;
+		goto err_ipi2c_clk_get;
 	}
+//joe debug	
+#if 1
+	extra->clk_ptr_i2c = clk_get_sys("I2C", NULL);
+	if (IS_ERR(extra->clk_ptr_i2c)) {
+		err = PTR_ERR(extra->clk_ptr_i2c);
+		dev_err(pdata->dev, "Error %d getting clock 'I2C'\n", err);
+		goto err_pri_ext_clk_get;
+	}	
+#endif	
+
+	err = clk_prepare(extra->clk_ptr_ipi2c);
+	if (err) {
+		dev_err(pdata->dev, "Error %d preparing clock 'ipi2'\n", err);
+		goto err_ipi2c_clk_prepare;
+	}
+
 	extra->clk_ptr_ext[PRIMARY_CAMERA] = clk_get_sys("pri-cam", NULL);
 	if (IS_ERR(extra->clk_ptr_ext[PRIMARY_CAMERA])) {
 		err = PTR_ERR(extra->clk_ptr_ext[PRIMARY_CAMERA]);
 		dev_err(pdata->dev, "Error %d getting clock 'pri-cam'\n", err);
-		goto err_pri_ext_clk;
+		goto err_pri_ext_clk_get;
 	}
+
+	err = clk_prepare(extra->clk_ptr_ext[PRIMARY_CAMERA]);
+	if (err) {
+		dev_err(pdata->dev, "Error %d preparing clock 'pri-cam'\n", err);
+		goto err_pri_ext_clk_prepare;
+	}
+
 	extra->clk_ptr_ext[SECONDARY_CAMERA] = clk_get_sys("sec-cam", NULL);
 	if (IS_ERR(extra->clk_ptr_ext[SECONDARY_CAMERA])) {
 		err = PTR_ERR(extra->clk_ptr_ext[SECONDARY_CAMERA]);
 		dev_err(pdata->dev, "Error %d getting clock 'sec-cam'\n", err);
-		goto err_sec_ext_clk;
+		goto err_sec_ext_clk_get;
 	}
+
+	err = clk_prepare(extra->clk_ptr_ext[SECONDARY_CAMERA]);
+	if (err) {
+		dev_err(pdata->dev, "Error %d preparing clock 'sec-cam'\n", err);
+		goto err_sec_ext_clk_prepare;
+	}
+
 	dev_dbg(pdata->dev , "Board %s() Exit\n", __func__);
 	return 0;
-err_sec_ext_clk:
+err_sec_ext_clk_prepare:
+	clk_put(extra->clk_ptr_ext[SECONDARY_CAMERA]);
+err_sec_ext_clk_get:
+	clk_unprepare(extra->clk_ptr_ext[PRIMARY_CAMERA]);
+err_pri_ext_clk_prepare:
 	clk_put(extra->clk_ptr_ext[PRIMARY_CAMERA]);
-err_pri_ext_clk:
+err_pri_ext_clk_get:
+//joe debug
+#if 0
+	clk_unprepare(extra->clk_ptr_ipi2c);
+#else
+	clk_put(extra->clk_ptr_i2c);
+err_ipi2c_clk_prepare:
 	clk_put(extra->clk_ptr_ipi2c);
-err_ipi2c_clk:
+#endif	
+err_ipi2c_clk_get:
+	clk_unprepare(extra->clk_ptr_bml);
+err_bml_clk_prepare:
 	clk_put(extra->clk_ptr_bml);
-err_bml_clk:
+err_bml_clk_get:
 	return err;
 }
+
 static void mmio_clock_exit(struct mmio_platform_data *pdata)
 {
 	struct mmio_board_data *extra = pdata->extra;
 	dev_dbg(pdata->dev , "Board %s() Enter\n", __func__);
-	clk_put(extra->clk_ptr_bml);
-	clk_put(extra->clk_ptr_ipi2c);
-	clk_put(extra->clk_ptr_ext[PRIMARY_CAMERA]);
-	clk_put(extra->clk_ptr_ext[SECONDARY_CAMERA]);
-}
 
+	clk_unprepare(extra->clk_ptr_bml);
+	clk_put(extra->clk_ptr_bml);
+
+	clk_unprepare(extra->clk_ptr_ipi2c);
+	clk_put(extra->clk_ptr_ipi2c);
+//joe debug
+#if 1
+	clk_put(extra->clk_ptr_i2c);
+#endif
+	clk_unprepare(extra->clk_ptr_ext[PRIMARY_CAMERA]);
+	clk_put(extra->clk_ptr_ext[PRIMARY_CAMERA]);
+
+	clk_unprepare(extra->clk_ptr_ext[SECONDARY_CAMERA]);
+	clk_put(extra->clk_ptr_ext[SECONDARY_CAMERA]);
+
+	dev_dbg(pdata->dev, "Board %s() Exit\n", __func__);
+}
 
 static int mmio_pin_cfg_init(struct mmio_platform_data *pdata)
 {
@@ -185,25 +258,27 @@ static int mmio_pin_cfg_init(struct mmio_platform_data *pdata)
 	extra->xshutdown_pins[PRIMARY_CAMERA].active_high = 0;
 	extra->xshutdown_pins[PRIMARY_CAMERA].udelay = 500;
 
+       extra->xshutdown_pins[SECONDARY_CAMERA].gpio = XSHUTDOWN_SECONDARY_SENSOR;
 	extra->xshutdown_pins[SECONDARY_CAMERA].active_high = 0;
 	extra->xshutdown_pins[SECONDARY_CAMERA].udelay = 500;
 
 	/* Update GPIO mappings according to board */
-	if (machine_is_hrefv60() || machine_is_u8520() || machine_is_u9540()) {
+	if (machine_is_hrefv60() || machine_is_u8520() || machine_is_u9540() || machine_is_a9500()) {
 		extra->xenon_charge = HREFV60_MMIO_XENON_CHARGE;
 		xshutdown_host[SECONDARY_CAMERA] = GPIO140_GPIO;
 		xshutdown_fw[SECONDARY_CAMERA] = GPIO140_IP_GPIO7;
 		xshutdown_disable[SECONDARY_CAMERA] =
 						GPIO140_GPIO  | PIN_OUTPUT_LOW;
-		extra->xshutdown_pins[SECONDARY_CAMERA].gpio = 140;
+		extra->xshutdown_pins[SECONDARY_CAMERA].gpio = XSHUTDOWN_SECONDARY_SENSOR;
 	} else {
 		extra->xenon_charge = GPIO_MMIO_XENON_CHARGE;
-		xshutdown_host[SECONDARY_CAMERA] = GPIO142_GPIO;
-		xshutdown_fw[SECONDARY_CAMERA] = GPIO142_IP_GPIO3;
+		xshutdown_host[SECONDARY_CAMERA] = GPIO140_GPIO;
+		xshutdown_fw[SECONDARY_CAMERA] = GPIO140_IP_GPIO7;
 		xshutdown_disable[SECONDARY_CAMERA] =
-						GPIO142_GPIO | PIN_OUTPUT_LOW;
-		extra->xshutdown_pins[SECONDARY_CAMERA].gpio = 142;
+						GPIO140_GPIO | PIN_OUTPUT_LOW;
+		extra->xshutdown_pins[SECONDARY_CAMERA].gpio = XSHUTDOWN_SECONDARY_SENSOR;
 	}
+#if 0
 	/* Setup Xenon Charge */
 	err = gpio_request(extra->xenon_charge, "xenon charge");
 	if (err) {
@@ -217,6 +292,7 @@ static int mmio_pin_cfg_init(struct mmio_platform_data *pdata)
 			"output mode\n", err);
 		goto err_xenon_gpio_set_dir;
 	}
+#endif
 	dev_dbg(pdata->dev , "Board %s() Exit\n", __func__);
 	return 0;
 err_xenon_gpio_set_dir:
@@ -229,7 +305,9 @@ static void mmio_pin_cfg_exit(struct mmio_platform_data *pdata)
 {
 	struct mmio_board_data *extra = pdata->extra;
 	dev_dbg(pdata->dev , "Board %s() Enter\n", __func__);
+#if 0
 	gpio_free(extra->xenon_charge);
+#endif
 }
 
 /* For now, both sensors on HREF have some power up sequence. If different
@@ -252,10 +330,13 @@ static int mmio_power_init(struct mmio_platform_data *pdata)
 		err = -ENOMEM;
 		goto err_no_mem_reg;
 	}
+
 	for (i = 0; i <
 		extra->number_of_regulators; i++) {
 		extra->mmio_regulators[i] =
 			regulator_get(pdata->dev, regulator_names[i]);
+
+	
 		if (IS_ERR(extra->mmio_regulators[i])) {
 			err = PTR_ERR(extra->mmio_regulators[i]);
 			dev_err(pdata->dev , "Error %d getting regulator '%s'"
@@ -299,8 +380,6 @@ static int mmio_platform_init(struct mmio_platform_data *pdata)
 	}
 	/* Hook the data for other callbacks to use */
 	pdata->extra = extra;
-
-	pdata->camera_slot = -1;
 
 	err = mmio_power_init(pdata);
 	if (err)
@@ -356,6 +435,7 @@ static int mmio_power_enable(struct mmio_platform_data *pdata)
 	struct mmio_board_data *extra = pdata->extra;
 	dev_dbg(pdata->dev , "Board %s() Enter\n", __func__);
 	/* Enable the regulators */
+
 	for (i = 0; i < extra->number_of_regulators; i++) {
 		err = regulator_enable(extra->mmio_regulators[i]);
 		if (IS_ERR(extra->mmio_regulators[i])) {
@@ -365,8 +445,10 @@ static int mmio_power_enable(struct mmio_platform_data *pdata)
 			goto err_regulator;
 		}
 	}
+#if 0
 	/* Set Xenon Charge */
 	gpio_set_value_cansleep(extra->xenon_charge, 1);
+#endif
 	dev_dbg(pdata->dev , "Board %s() Exit\n", __func__);
 	return 0;
 err_regulator:
@@ -384,8 +466,10 @@ static void mmio_power_disable(struct mmio_platform_data *pdata)
 	/* Disable the regulators */
 	for (i = 0; i < extra->number_of_regulators; i++)
 		regulator_disable(extra->mmio_regulators[i]);
+#if 0
 	/* Disable Xenon Charge */
 	gpio_set_value_cansleep(extra->xenon_charge, 0);
+#endif
 }
 static int mmio_clock_enable(struct mmio_platform_data *pdata)
 {
@@ -403,6 +487,16 @@ static int mmio_clock_enable(struct mmio_platform_data *pdata)
 		dev_err(pdata->dev, "Error activating i2c2 clock %d\n", err);
 		goto err_ipi2c_clk;
 	}
+//joe debug		
+#if 1	
+	if(pdata->camera_slot == SECONDARY_CAMERA) {
+    	err = clk_enable(extra->clk_ptr_i2c);
+        if (err) {
+        	dev_err(pdata->dev, "Error activating i2c2 clock %d\n", err);
+            goto err_i2c_clk;
+        }
+	}
+#endif
 	/* Enable appropriate external clock */
 	err = clk_enable(extra->clk_ptr_ext[pdata->camera_slot]);
 	if (err) {
@@ -413,7 +507,16 @@ static int mmio_clock_enable(struct mmio_platform_data *pdata)
 	dev_dbg(pdata->dev , "Board %s() Exit\n", __func__);
 	return 0;
 err_ext_clk:
+//joe debug
+#if 0
 	clk_disable(extra->clk_ptr_ipi2c);
+#else
+	clk_disable(extra->clk_ptr_ipi2c);
+        if(pdata->camera_slot == SECONDARY_CAMERA)
+                clk_disable(extra->clk_ptr_i2c);
+err_i2c_clk:
+        clk_disable(extra->clk_ptr_ipi2c);
+#endif	
 err_ipi2c_clk:
 	clk_disable(extra->clk_ptr_bml);
 err_bml_clk:
@@ -424,8 +527,17 @@ static void mmio_clock_disable(struct mmio_platform_data *pdata)
 {
 	struct mmio_board_data *extra = pdata->extra;
 	dev_dbg(pdata->dev , "Board %s() Enter\n", __func__);
+//joe debug	
+#if 0	
 	clk_disable(extra->clk_ptr_bml);
 	clk_disable(extra->clk_ptr_ipi2c);
+#else
+    clk_disable(extra->clk_ptr_bml);
+    clk_disable(extra->clk_ptr_ipi2c);
+    if(pdata->camera_slot == SECONDARY_CAMERA) {
+            clk_disable(extra->clk_ptr_i2c);
+    }
+#endif	
 	clk_disable(extra->clk_ptr_ext[pdata->camera_slot]);
 }
 
@@ -437,10 +549,12 @@ static int mmio_config_xshutdown_pins(struct mmio_platform_data *pdata,
 	int err = 0;
 	struct mmio_board_data *extra = pdata->extra;
 	dev_dbg(pdata->dev , "Board %s() Enter\n", __func__);
+
 	switch (select) {
 	case MMIO_ENABLE_XSHUTDOWN_HOST:
 		extra->xshutdown_pins[pdata->camera_slot].active_high =
 			is_active_high;
+
 		err = nmk_config_pin(xshutdown_host[pdata->camera_slot] |
 			(is_active_high ? PIN_OUTPUT_LOW : PIN_OUTPUT_HIGH),
 			0);
@@ -458,6 +572,7 @@ static int mmio_config_xshutdown_pins(struct mmio_platform_data *pdata,
 	if (err)
 		dev_dbg(pdata->dev , "Error configuring xshutdown, err = %d\n",
 		err);
+
 	return err;
 }
 static void mmio_set_xshutdown(struct mmio_platform_data *pdata)

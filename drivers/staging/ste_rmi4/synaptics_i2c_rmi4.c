@@ -30,7 +30,10 @@
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/regulator/consumer.h>
+#include <linux/module.h>
+#ifdef CONFIG_HAS_EARLYSUSPEND
 #include <linux/earlysuspend.h>
+#endif
 #include "synaptics_i2c_rmi4.h"
 
 /* TODO: for multiple device support will need a per-device mutex */
@@ -192,7 +195,9 @@ struct synaptics_rmi4_data {
 	bool			touch_stopped;
 	bool			enable;
 	struct work_struct	resume_wq_handler;
+#ifdef CONFIG_HAS_EARLYSUSPEND
 	struct early_suspend	early_suspend;
+#endif
 };
 
 #ifdef CONFIG_HAS_EARLYSUSPEND

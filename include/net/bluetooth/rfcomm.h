@@ -158,6 +158,7 @@ struct rfcomm_session {
 	struct timer_list timer;
 	unsigned long    state;
 	unsigned long    flags;
+	atomic_t         refcnt;
 	int              initiator;
 
 	/* Default DLC parameters */
@@ -256,8 +257,8 @@ static inline void rfcomm_dlc_put(struct rfcomm_dlc *d)
 		rfcomm_dlc_free(d);
 }
 
-void __rfcomm_dlc_throttle(struct rfcomm_dlc *d);
-void __rfcomm_dlc_unthrottle(struct rfcomm_dlc *d);
+extern void __rfcomm_dlc_throttle(struct rfcomm_dlc *d);
+extern void __rfcomm_dlc_unthrottle(struct rfcomm_dlc *d);
 
 static inline void rfcomm_dlc_throttle(struct rfcomm_dlc *d)
 {
@@ -274,6 +275,11 @@ static inline void rfcomm_dlc_unthrottle(struct rfcomm_dlc *d)
 /* ---- RFCOMM sessions ---- */
 void   rfcomm_session_getaddr(struct rfcomm_session *s, bdaddr_t *src,
 								bdaddr_t *dst);
+
+static inline void rfcomm_session_hold(struct rfcomm_session *s)
+{
+	atomic_inc(&s->refcnt);
+}
 
 /* ---- RFCOMM sockets ---- */
 struct sockaddr_rc {
@@ -300,8 +306,6 @@ struct rfcomm_conninfo {
 
 struct rfcomm_pinfo {
 	struct bt_sock bt;
-	bdaddr_t src;
-	bdaddr_t dst;
 	struct rfcomm_dlc   *dlc;
 	u8     channel;
 	u8     sec_level;

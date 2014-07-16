@@ -14,6 +14,7 @@
 #include <linux/gpio.h>
 #include <linux/mfd/dbx500-prcmu.h>
 #include <linux/regulator/consumer.h>
+#include <linux/delay.h>
 
 #include <asm/mach-types.h>
 #include <plat/gpio-nomadik.h>
@@ -33,7 +34,7 @@
 #define STM_ERR(msg) dev_err(STM_DEVICE, msg)
 #define STM_WARN(msg) dev_warn(STM_DEVICE, msg)
 
-static struct regulator *regulator_aux3;
+static struct regulator *regu_aux3;
 static enum stm_connection_type
 	stm_current_connection = STM_STE_INVALID_CONNECTION;
 
@@ -43,8 +44,7 @@ static pin_cfg_t mop500_stm_mipi34_pins[] = {
 	GPIO72_STMAPE_DAT2 | PIN_SLPM_USE_MUX_SETTINGS_IN_SLEEP,
 	GPIO73_STMAPE_DAT1 | PIN_SLPM_USE_MUX_SETTINGS_IN_SLEEP,
 	GPIO74_STMAPE_DAT0 | PIN_SLPM_USE_MUX_SETTINGS_IN_SLEEP,
-	GPIO24_UARTMOD_RXD | PIN_SLPM_USE_MUX_SETTINGS_IN_SLEEP \
-		| PIN_INPUT_PULLUP,
+	GPIO75_U2_RXD | PIN_SLPM_USE_MUX_SETTINGS_IN_SLEEP,
 	GPIO76_U2_TXD | PIN_SLPM_USE_MUX_SETTINGS_IN_SLEEP,
 };
 
@@ -207,13 +207,38 @@ static void control_level_shifter_for_microsd(int gpio_dir)
 {
 	int gpio[2];
 
-	if (machine_is_hrefv60() || machine_is_u9540()) {
+	if (machine_is_u8540()) {
+		static struct regulator *regu_sdio;
+
+		if (gpio_dir) {
+			regu_sdio = regulator_get(&ux500_stm_device.dev,
+					"vmmc_io");
+			if (IS_ERR(regu_sdio)) {
+				regu_sdio = NULL;
+				STM_ERR("Failed to get regulator vmmc_io\n");
+				return;
+			}
+
+			regulator_disable(regu_sdio);
+			prcmu_set_sdmmc_psw(gpio_dir);
+			regulator_set_voltage(regu_sdio, 2750000, 3000000);
+			regulator_enable(regu_sdio);
+			usleep_range(3000, 4000);
+		} else if (regu_sdio) {
+			regulator_disable(regu_sdio);
+			regulator_put(regu_sdio);
+			regu_sdio = NULL;
+		}
+		return;
+	}
+
+	if (machine_is_hrefv60() || machine_is_u9540() || machine_is_a9500()) {
 		gpio[0] = HREFV60_SDMMC_EN_GPIO;
 		gpio[1] = HREFV60_SDMMC_1V8_3V_GPIO;
 	} else if (machine_is_u8520()) {
 		gpio[0] = U8520_SDMMC_EN_GPIO;
 		gpio[1] = U8520_SDMMC_1V8_3V_GPIO;
-	} else	{
+	} else {
 		gpio[0] = MOP500_EGPIO(17);
 		gpio[1] = MOP500_EGPIO(18);
 	}
@@ -244,15 +269,15 @@ static int enable_vaux3_for_microsd_cable(void)
 {
 	int error;
 
-	regulator_aux3 = regulator_get(&ux500_stm_device.dev, "v-SD-STM");
+	regu_aux3 = regulator_get(&ux500_stm_device.dev, "v-SD-STM");
 
-	if (IS_ERR(regulator_aux3)) {
-		error = PTR_ERR(regulator_aux3);
+	if (IS_ERR(regu_aux3)) {
+		error = PTR_ERR(regu_aux3);
 		STM_ERR("Failed to get regulator, supply: v-SD-STM\n");
 		return error;
 	}
 
-	error = regulator_enable(regulator_aux3);
+	error = regulator_enable(regu_aux3);
 
 	if (error) {
 		STM_ERR("Unable to enable regulator on SD card connector\n");
@@ -268,10 +293,10 @@ static int disable_vaux3_for_microsd_cable(void)
 {
 	int error = 0;
 
-	error = regulator_disable(regulator_aux3);
-
-	if (regulator_aux3)
-		regulator_put(regulator_aux3);
+	if (regu_aux3) {
+		error = regulator_disable(regu_aux3);
+		regulator_put(regu_aux3);
+	}
 
 	STM_WARN("Regulator for stm on SD card connector power off.\n");
 

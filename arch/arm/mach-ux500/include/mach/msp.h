@@ -215,7 +215,6 @@ struct trans_data {
  * @spi_clk_mode: In case of SPI protocol spi modes: Normal, Zero delay or
  * half cycle delay.
  * @spi_burst_mode: Spi burst mode is enabled or not.
- * @loopback_enable: Loopback mode.
  * @tx_data_enable: Transmit extra delay enable.
  * @default_protocol_desc: Flag to indicate client defined protocol desc or
  * statically defined in msp.h.
@@ -250,7 +249,6 @@ struct msp_config {
 	unsigned int tx_fifo_config;
 	unsigned int spi_clk_mode;
 	unsigned int spi_burst_mode;
-	unsigned int loopback_enable;
 	unsigned int tx_data_enable;
 	unsigned int default_protocol_desc;
 	struct msp_protocol_desc protocol_desc;
@@ -386,6 +384,8 @@ enum msp_mode {
 #define RX_FIFO_SYNC_HI       0x00000000
 #define TX_FIFO_SYNC_HI       0x00000000
 #define SPI_CLK_MODE_NORMAL   0x00000000
+#define SCKSEL_MSPSCK		  0x00080000
+#define SCKDIV_64			  0x00000040
 
 /* SPI Clock Modes enumertion
  * SPI clock modes of MSP provides compatibility with
@@ -971,7 +971,6 @@ struct msp {
 	unsigned int direction;
 	int users;
 	int reg_enabled;
-	int loopback_enable;
 	u32 backup_regs[MAX_MSP_BACKUP_REGS];
 	int vape_opp_constraint;
 };

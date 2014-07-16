@@ -26,14 +26,10 @@
 
 u32 ux500_uart_base;
 
-#define __UART_BASE(soc, x)	soc##_UART##x##_BASE
-#define UART_BASE(soc, x)	__UART_BASE(soc, x)
-
 static void putc(const char c)
 {
 	/* Do nothing if the UART is not enabled. */
-	if (!ux500_uart_base ||
-	    !(__raw_readb(ux500_uart_base + UART011_CR) & 0x1))
+	if (!(__raw_readb(ux500_uart_base + UART011_CR) & 0x1))
 		return;
 
 	if (c == '\n')
@@ -46,8 +42,7 @@ static void putc(const char c)
 
 static void flush(void)
 {
-	if (!ux500_uart_base ||
-	    !(__raw_readb(ux500_uart_base + UART011_CR) & 0x1))
+	if (!(__raw_readb(ux500_uart_base + UART011_CR) & 0x1))
 		return;
 	while (__raw_readb(ux500_uart_base + UART01x_FR) & (1 << 3))
 		barrier();
@@ -55,11 +50,7 @@ static void flush(void)
 
 static inline void arch_decomp_setup(void)
 {
-	/* Check in run time if we run on an U8500 or U5500 */
-	if (machine_is_u5500())
-		ux500_uart_base = UART_BASE(U5500, CONFIG_UX500_DEBUG_UART);
-	else
-		ux500_uart_base = UART_BASE(U8500, CONFIG_UX500_DEBUG_UART);
+	ux500_uart_base = U8500_UART2_BASE;
 }
 
 #define arch_decomp_wdog() /* nothing to do here */

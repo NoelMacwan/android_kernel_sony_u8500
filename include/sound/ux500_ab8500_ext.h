@@ -11,15 +11,15 @@
  * by the Free Software Foundation.
  */
 
-#ifndef UX500_AB8500_EXT_H
-#define UX500_AB8500_EXT_H
+#ifndef UX500_AB850X_EXT_H
+#define UX500_AB850X_EXT_H
 
 #include <linux/mfd/abx500/ab8500-gpadc.h>
 
-int ux500_ab8500_audio_gpadc_measure(struct ab8500_gpadc *gpadc,
+int ux500_ab850x_audio_gpadc_measure(struct ab8500_gpadc *gpadc,
 			u8 channel, bool mode, int *value);
 
-void ux500_ab8500_audio_pwm_vibra(unsigned char speed_left_pos,
+int ux500_ab850x_audio_pwm_vibra(unsigned char speed_left_pos,
 			unsigned char speed_left_neg,
 			unsigned char speed_right_pos,
 			unsigned char speed_right_neg);

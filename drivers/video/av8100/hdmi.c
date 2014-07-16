@@ -10,6 +10,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/miscdevice.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -2469,4 +2470,3 @@ void hdmi_exit(void)
 	/* Free device data */
 	kfree(hdev);
 }
-

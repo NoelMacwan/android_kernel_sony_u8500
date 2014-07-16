@@ -18,8 +18,6 @@
 
 static dev_t rtc_devt;
 
-#define RTC_DEV_MAX 16 /* 16 RTCs should be enough for everyone... */
-
 static int rtc_dev_open(struct inode *inode, struct file *file)
 {
 	int err;

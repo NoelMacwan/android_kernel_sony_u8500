@@ -151,10 +151,10 @@ To build the DDR physical layout representation, two parameters are requested:
      If no ddr_die parameter is passed, PASR intialization is skipped.
 
 * interleaved (optional): Should be added for every interleaved dependencies.
-   - Usage: interleaved=xxx[M|G]@yyy[M|G]:zzz[M|G] where xxx is the size of
-     the interleaved area between the adresses yyy and zzz. E.g
-     interleaved=256M@0:512M
-
+   - Usage: interleaved=xxx[M|G]@yyy[M|G]:zzz[M|G]_iii where xxx is the size of
+     the interleaved area between the adresses yyy and zzz using interleave
+     page size iii. The interleave page size param is optional. E.g
+     interleaved=256M@0:512M_64K
 
 3. Allocator patching
 

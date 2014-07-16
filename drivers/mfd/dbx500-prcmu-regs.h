@@ -61,7 +61,8 @@
 #define PRCM_PLLARM_LOCKP_PRCM_PLLARM_LOCKP3	0x2
 
 #define PRCM_ARM_CHGCLKREQ	(_PRCMU_BASE + 0x114)
-#define PRCM_ARM_CHGCLKREQ_PRCM_ARM_CHGCLKREQ	0x1
+#define PRCM_ARM_CHGCLKREQ_PRCM_ARM_CHGCLKREQ	BIT(0)
+#define PRCM_ARM_CHGCLKREQ_PRCM_ARM_DIVSEL	BIT(16)
 
 #define PRCM_PLLARM_ENABLE	(_PRCMU_BASE + 0x98)
 #define PRCM_PLLARM_ENABLE_PRCM_PLLARM_ENABLE	0x1
@@ -81,6 +82,7 @@
 #define PRCM_ARM_WFI_STANDBY    (_PRCMU_BASE + 0x130)
 #define PRCM_IOCR		(_PRCMU_BASE + 0x310)
 #define PRCM_IOCR_IOFORCE			0x1
+#define PRCM_IOCR_TDO_PULLUP_ENABLE		0x2
 
 /* CPU mailbox registers */
 #define PRCM_MBOX_CPU_VAL	(_PRCMU_BASE + 0x0fc)
@@ -124,6 +126,9 @@
 #define PRCM_ITSTATUS5		(_PRCMU_BASE + 0x484)
 #define PRCM_ITCLEAR5		(_PRCMU_BASE + 0x488)
 
+/* System reset register */
+#define PRCM_APE_SOFTRST	(_PRCMU_BASE + 0x228)
+
 /* Level shifter and clamp control registers */
 #define PRCM_MMIP_LS_CLAMP_SET     (_PRCMU_BASE + 0x420)
 #define PRCM_MMIP_LS_CLAMP_CLR     (_PRCMU_BASE + 0x424)
@@ -134,6 +139,7 @@
 /* PRCMU clock/PLL/reset registers */
 #define PRCM_PLLSOC0_FREQ	   (_PRCMU_BASE + 0x080)
 #define PRCM_PLLSOC1_FREQ	   (_PRCMU_BASE + 0x084)
+#define PRCM_PLLARM_FREQ	   (_PRCMU_BASE + 0x088)
 #define PRCM_PLLDDR_FREQ	   (_PRCMU_BASE + 0x08C)
 #define PRCM_PLL_FREQ_D_SHIFT	0
 #define PRCM_PLL_FREQ_D_MASK	BITS(0, 7)
@@ -193,11 +199,22 @@
 /* Debug power control unit registers */
 #define PRCM_POWER_STATE_SET       (_PRCMU_BASE + 0x254)
 
+/* DDR subsystem register */
+#define PRCM_DDRSUBSYS_STATUS			(_PRCMU_BASE + 0x43C)
+#define PRCM_DDRSUBSYS_STATUS_SHIFT		5
+#define PRCM_DDRSUBSYS_STATUS_MINBW_MASK	BITS(5, 6)
+
 /* Miscellaneous unit registers */
 #define PRCM_DSI_SW_RESET          (_PRCMU_BASE + 0x324)
 #define PRCM_GPIOCR                (_PRCMU_BASE + 0x138)
-#define PRCM_GPIOCR_DBG_STM_MOD_CMD1            0x800
-#define PRCM_GPIOCR_DBG_UARTMOD_CMD0            0x1
+#define PRCM_GPIOCR_DBG_ETM_R4_CMD2	BIT(19)
+#define PRCM_GPIOCR_DBG_ETM_R4_CMD1	BIT(15)
+#define PRCM_GPIOCR_DBG_PTM_A9_CMD2	BIT(14)
+#define PRCM_GPIOCR_DBG_STM_MOD_CMD1	BIT(11)
+#define PRCM_GPIOCR_DBG_PTM_A9_CMD1	BIT(6)
+#define PRCM_GPIOCR_DBG_PTM_A9_CMD0	BIT(5)
+#define PRCM_GPIOCR_DBG_ETM_R4_CMD0	BIT(2)
+#define PRCM_GPIOCR_DBG_UARTMOD_CMD0	BIT(0)
 
 /* PRCMU HW semaphore */
 #define PRCM_SEM                   (_PRCMU_BASE + 0x400)

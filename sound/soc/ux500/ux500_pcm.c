@@ -17,6 +17,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
+#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 
@@ -27,6 +28,13 @@
 #include <sound/soc.h>
 
 #include "ux500_pcm.h"
+
+enum {
+	UX500_XFER_STANDBY,
+	UX500_XFER_ONGOING,
+	UX500_XFER_COMPLETED,
+	UX500_XFER_IDLE,
+};
 
 static struct snd_pcm_hardware ux500_pcm_hw_playback = {
 	.info = SNDRV_PCM_INFO_INTERLEAVED |
@@ -80,8 +88,7 @@ static const char *stream_str(struct snd_pcm_substream *substream)
 		return "Capture";
 }
 
-static void
-ux500_pcm_dma_eot_handler(void *data)
+static void ux500_pcm_dma_eot_cyclic(void *data)
 {
 	struct snd_pcm_substream *substream = data;
 	struct snd_pcm_runtime *runtime;
@@ -99,22 +106,29 @@ ux500_pcm_dma_eot_handler(void *data)
 
 		/* calc the offset in the circular buffer */
 		private->offset += frames_to_bytes(runtime,
-				runtime->period_size);
+			runtime->period_size);
 		private->offset %= frames_to_bytes(runtime,
-				runtime->period_size) * runtime->periods;
+			runtime->period_size) * runtime->periods;
 
 		snd_pcm_period_elapsed(substream);
 	}
 }
 
-static int
-ux500_pcm_dma_start(
-	struct snd_pcm_substream *substream,
-	dma_addr_t dma_addr,
-	int period_cnt,
-	size_t period_len,
-	int dai_idx,
-	int stream_id)
+static void ux500_pcm_dma_eot(void *data)
+{
+	struct snd_pcm_substream *substream = data;
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct ux500_pcm_private *private = runtime->private_data;
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_dai *dai = rtd->cpu_dai;
+
+	pr_debug("%s: MSP %d (%s): Enter.\n", __func__, dai->id,
+		stream_str(substream));
+
+	private->state = UX500_XFER_COMPLETED;
+}
+
+static int ux500_pcm_dma_cyclic_start(struct snd_pcm_substream *substream)
 {
 	dma_cookie_t status_submit;
 	int direction;
@@ -124,10 +138,15 @@ ux500_pcm_dma_start(
 	struct ux500_pcm_private *private = runtime->private_data;
 	struct dma_async_tx_descriptor *cdesc;
 	struct ux500_pcm_dma_params *dma_params;
+	size_t period_len = frames_to_bytes(runtime, runtime->period_size);
 
 	pr_debug("%s: Enter\n", __func__);
 
 	dma_params = snd_soc_dai_get_dma_data(dai, substream);
+
+	/* Check if it is buffer free transfer */
+	if (dma_params == NULL)
+		return 0;
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 		direction = DMA_TO_DEVICE;
@@ -135,65 +154,145 @@ ux500_pcm_dma_start(
 		direction = DMA_FROM_DEVICE;
 
 	cdesc = private->pipeid->device->device_prep_dma_cyclic(
-		private->pipeid,
-		dma_addr,
-		period_cnt * period_len,
-		period_len,
-		direction);
+		private->pipeid, runtime->dma_addr,
+		runtime->periods * period_len, period_len, direction, NULL);
 
 	if (IS_ERR(cdesc)) {
 		pr_err("%s: ERROR: device_prep_dma_cyclic failed (%ld)!\n",
-			__func__,
-			PTR_ERR(cdesc));
-		return -EINVAL;
+			__func__, PTR_ERR(cdesc));
+		return -EIO;
 	}
 
-	cdesc->callback = ux500_pcm_dma_eot_handler;
+	cdesc->callback = ux500_pcm_dma_eot_cyclic;
 	cdesc->callback_param = substream;
 
 	status_submit = dmaengine_submit(cdesc);
 
 	if (dma_submit_error(status_submit)) {
 		pr_err("%s: ERROR: dmaengine_submit failed!\n", __func__);
-		return -EINVAL;
+		return -EIO;
 	}
 
 	dma_async_issue_pending(private->pipeid);
 
-	pr_debug("%s: Leave\n", __func__);
+	return 0;
+}
+
+static int ux500_pcm_dma_start(struct snd_pcm_substream *substream,
+		dma_addr_t dma_addr)
+{
+	dma_cookie_t status_submit;
+	int direction;
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_dai *dai = rtd->cpu_dai;
+	struct ux500_pcm_private *private = runtime->private_data;
+	struct dma_async_tx_descriptor *cdesc;
+	struct ux500_pcm_dma_params *dma_params;
+	struct scatterlist sg;
+
+	pr_debug("%s: Enter\n", __func__);
+
+	dma_params = snd_soc_dai_get_dma_data(dai, substream);
+
+	/* Check if it is buffer free transfer */
+	if (dma_params == NULL)
+		return 0;
+
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		direction = DMA_TO_DEVICE;
+	else
+		direction = DMA_FROM_DEVICE;
+
+	sg_init_table(&sg, 1);
+	sg_set_page(&sg, pfn_to_page(PFN_DOWN(dma_addr)),
+		frames_to_bytes(runtime, runtime->period_size),
+		offset_in_page(dma_addr));
+	sg_dma_address(&sg) = dma_addr;
+	sg_dma_len(&sg) = frames_to_bytes(runtime, runtime->period_size);
+
+	cdesc = private->pipeid->device->device_prep_slave_sg(private->pipeid,
+		&sg, 1, direction, DMA_PREP_INTERRUPT | DMA_CTRL_ACK, NULL);
+
+	if (IS_ERR(cdesc)) {
+		pr_err("%s: ERROR: device_prep_slave_sg failed (%ld)!\n",
+			__func__, PTR_ERR(cdesc));
+		return -EIO;
+	}
+
+	cdesc->callback = ux500_pcm_dma_eot;
+	cdesc->callback_param = substream;
+
+	status_submit = dmaengine_submit(cdesc);
+
+	if (dma_submit_error(status_submit)) {
+		pr_err("%s: ERROR: dmaengine_submit failed!\n", __func__);
+		return -EIO;
+	}
+
+	dma_async_issue_pending(private->pipeid);
+
+	private->state = UX500_XFER_ONGOING;
 
 	return 0;
 }
 
-static void
-ux500_pcm_dma_stop(struct work_struct *work)
+static void ux500_pcm_dma_stop(struct work_struct *work)
 {
 	struct ux500_pcm_private *private = container_of(work,
 		struct ux500_pcm_private, ws_stop);
 
-	pr_debug("%s: Enter\n", __func__);
-
-	if (private != NULL) {
-		struct dma_chan *chan;
-
-		mutex_lock(&private->pipeLock);
-		chan = private->pipeid;
+	if (private->pipeid != NULL) {
+		dmaengine_terminate_all(private->pipeid);
+		dma_release_channel(private->pipeid);
 		private->pipeid = NULL;
-		mutex_unlock(&private->pipeLock);
-
-		if (chan != NULL) {
-			dmaengine_terminate_all(chan);
-			dma_release_channel(chan);
-		}
 	}
-
-	pr_debug("%s: Leave\n", __func__);
+	private->state = UX500_XFER_IDLE;
 }
 
-static void
-ux500_pcm_dma_hw_free(
-	struct device *dev,
-	struct snd_pcm_substream *substream)
+void ux500_pcm_wakeup(struct snd_pcm_substream *substream)
+{
+	struct ux500_pcm_private *private = substream->runtime->private_data;
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	int err;
+
+	switch (private->state) {
+	case  UX500_XFER_COMPLETED:
+		private->offset += frames_to_bytes(runtime,
+			runtime->period_size);
+		private->offset %= frames_to_bytes(runtime,
+			runtime->period_size) * runtime->periods;
+
+		err = ux500_pcm_dma_start(substream,
+			runtime->dma_addr + private->offset);
+
+		if (err) {
+			pr_err("%s: Failed to re-start DMA! (%d)\n", __func__,
+				err);
+		}
+		snd_pcm_period_elapsed(substream);
+		break;
+
+	case UX500_XFER_ONGOING:
+		pr_debug("%s: Spurious wakeup!\n", __func__);
+		break;
+
+	case UX500_XFER_STANDBY:
+		err = ux500_pcm_dma_start(substream, runtime->dma_addr);
+
+		if (err) {
+			pr_err("%s: Failed to start dma! (%d)\n", __func__,
+				err);
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+static void ux500_pcm_dma_hw_free(struct device *dev,
+		struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct snd_dma_buffer *buf = runtime->dma_buffer_p;
@@ -202,10 +301,7 @@ ux500_pcm_dma_hw_free(
 		return;
 
 	if (buf != &substream->dma_buffer) {
-		dma_free_coherent(
-			buf->dev.dev,
-			buf->bytes,
-			buf->area,
+		dma_free_coherent(buf->dev.dev, buf->bytes, buf->area,
 			buf->addr);
 		kfree(runtime->dma_buffer_p);
 	}
@@ -222,25 +318,23 @@ static int ux500_pcm_open(struct snd_pcm_substream *substream)
 	struct snd_soc_dai *dai = rtd->cpu_dai;
 	int ret;
 
-	pr_debug("%s: MSP %d (%s): Enter.\n", __func__,
-		dai->id,
+	pr_debug("%s: MSP %d (%s): Enter.\n", __func__, dai->id,
 		stream_str(substream));
 
 	pr_debug("%s: Set runtime hwparams.\n", __func__);
+
 	if (stream_id == SNDRV_PCM_STREAM_PLAYBACK)
 		snd_soc_set_runtime_hwparams(substream, &ux500_pcm_hw_playback);
 	else
 		snd_soc_set_runtime_hwparams(substream, &ux500_pcm_hw_capture);
 
 	/* ensure that buffer size is a multiple of period size */
-	ret = snd_pcm_hw_constraint_integer(
-		runtime,
+	ret = snd_pcm_hw_constraint_integer(runtime,
 		SNDRV_PCM_HW_PARAM_PERIODS);
 
 	if (ret < 0) {
 		pr_err("%s: Error: snd_pcm_hw_constraints failed (%d)\n",
-			__func__,
-			ret);
+			__func__, ret);
 		return ret;
 	}
 
@@ -248,21 +342,20 @@ static int ux500_pcm_open(struct snd_pcm_substream *substream)
 	private = kzalloc(sizeof(struct ux500_pcm_private), GFP_KERNEL);
 	if (private == NULL)
 		return -ENOMEM;
-	mutex_init(&private->pipeLock);
 	private->msp_id = dai->id;
 	private->wq = alloc_ordered_workqueue("ux500/pcm", 0);
+	private->cyclic = true;
+	private->state = UX500_XFER_IDLE;
+
 	INIT_WORK(&private->ws_stop, ux500_pcm_dma_stop);
 
 	runtime->private_data = private;
 
-	pr_debug("%s: Set hw-struct for %s.\n",
-		__func__,
+	pr_debug("%s: Set hw-struct for %s.\n", __func__,
 		stream_str(substream));
 
 	runtime->hw = (stream_id == SNDRV_PCM_STREAM_PLAYBACK) ?
 		ux500_pcm_hw_playback : ux500_pcm_hw_capture;
-
-	pr_debug("%s: Leave\n", __func__);
 
 	return 0;
 }
@@ -273,29 +366,20 @@ static int ux500_pcm_close(struct snd_pcm_substream *substream)
 
 	pr_debug("%s: Enter\n", __func__);
 
-	if (private != NULL) {
-		struct dma_chan *chan;
-
-		mutex_lock(&private->pipeLock);
-		chan = private->pipeid;
+	if (private->pipeid != NULL) {
+		dmaengine_terminate_all(private->pipeid);
+		dma_release_channel(private->pipeid);
 		private->pipeid = NULL;
-		mutex_unlock(&private->pipeLock);
-
-		if (chan != NULL) {
-			dma_release_channel(chan);
-		}
-
-		destroy_workqueue(private->wq);
-		kfree(private);
 	}
 
-	pr_debug("%s: Leave\n", __func__);
+	destroy_workqueue(private->wq);
+	kfree(private);
 
 	return 0;
 }
 
 static int ux500_pcm_hw_params(struct snd_pcm_substream *substream,
-			struct snd_pcm_hw_params *hw_params)
+		struct snd_pcm_hw_params *hw_params)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct snd_dma_buffer *buf = runtime->dma_buffer_p;
@@ -322,10 +406,7 @@ static int ux500_pcm_hw_params(struct snd_pcm_substream *substream,
 
 		buf->dev.type = SNDRV_DMA_TYPE_DEV;
 		buf->dev.dev = NULL;
-		buf->area = dma_alloc_coherent(
-			NULL,
-			size,
-			&buf->addr,
+		buf->area = dma_alloc_coherent(NULL, size, &buf->addr,
 			GFP_KERNEL);
 		buf->bytes = size;
 		buf->private_data = NULL;
@@ -345,8 +426,7 @@ static int ux500_pcm_hw_params(struct snd_pcm_substream *substream,
 	return -ENOMEM;
 }
 
-static int
-ux500_pcm_hw_free(struct snd_pcm_substream *substream)
+static int ux500_pcm_hw_free(struct snd_pcm_substream *substream)
 {
 	pr_debug("%s: Enter\n", __func__);
 
@@ -355,8 +435,7 @@ ux500_pcm_hw_free(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-static int
-ux500_pcm_prepare(struct snd_pcm_substream *substream)
+static int ux500_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct stedma40_chan_cfg *dma_cfg;
 	struct snd_pcm_runtime *runtime = substream->runtime;
@@ -366,21 +445,25 @@ ux500_pcm_prepare(struct snd_pcm_substream *substream)
 	struct ux500_pcm_dma_params *dma_params;
 	dma_cap_mask_t mask;
 	u16 per_data_width, mem_data_width;
-	struct dma_chan *chan;
 
 	pr_debug("%s: Enter\n", __func__);
 
-	mutex_lock(&private->pipeLock);
-	chan = private->pipeid;
-	private->pipeid = NULL;
-	mutex_unlock(&private->pipeLock);
+	dma_params = snd_soc_dai_get_dma_data(dai, substream);
 
-	if (chan != NULL) {
-		flush_workqueue(private->wq);
-		dma_release_channel(chan);
+	/* Check if it is buffer free transfer */
+	if (dma_params == NULL)
+		return 0;
+
+	if (private->pipeid != NULL) {
+		dmaengine_terminate_all(private->pipeid);
+		dma_release_channel(private->pipeid);
+		private->pipeid = NULL;
 	}
 
-	dma_params = snd_soc_dai_get_dma_data(dai, substream);
+	if (runtime->sample_bits < dma_params->data_size)
+		return -EINVAL;
+
+	private->cyclic = dma_params->cyclic;
 
 	switch (runtime->sample_bits) {
 	case 32:
@@ -397,6 +480,9 @@ ux500_pcm_prepare(struct snd_pcm_substream *substream)
 	case 32:
 		per_data_width = STEDMA40_WORD_WIDTH;
 		break;
+	case 20:
+		per_data_width = STEDMA40_WORD_WIDTH;
+		break;
 	case 16:
 		per_data_width = STEDMA40_HALFWORD_WIDTH;
 		break;
@@ -407,6 +493,7 @@ ux500_pcm_prepare(struct snd_pcm_substream *substream)
 		per_data_width = STEDMA40_WORD_WIDTH;
 		pr_warn("%s: Unknown data-size (%d)! Assuming 32 bits.\n",
 			__func__, dma_params->data_size);
+		break;
 	}
 
 	dma_cfg = dma_params->dma_cfg;
@@ -422,24 +509,16 @@ ux500_pcm_prepare(struct snd_pcm_substream *substream)
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_SLAVE, mask);
 
-	chan  = dma_request_channel(mask, stedma40_filter, dma_cfg);
-
-	mutex_lock(&private->pipeLock);
-	private->pipeid = chan;
-	mutex_unlock(&private->pipeLock);
-
-	pr_debug("%s: Leave\n", __func__);
+	private->pipeid = dma_request_channel(mask, stedma40_filter, dma_cfg);
 
 	return 0;
 }
 
-static int
-ux500_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+static int ux500_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	int ret = 0;
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct ux500_pcm_private *private = runtime->private_data;
-	int stream_id = substream->pstr->stream;
 
 	pr_debug("%s: Enter\n", __func__);
 
@@ -449,20 +528,18 @@ ux500_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		pr_debug("%s: START/PAUSE-RELEASE\n", __func__);
 		if (runtime->status->state == SNDRV_PCM_STATE_XRUN) {
 			pr_debug("XRUN occurred\n");
-				return 0;
+			return 0;
 		}
 
 		private->offset = 0;
-		ret = ux500_pcm_dma_start(
-				substream,
-				runtime->dma_addr,
-				runtime->periods,
-				frames_to_bytes(runtime, runtime->period_size),
-				private->msp_id,
-				stream_id);
+		private->state = UX500_XFER_STANDBY;
+
+		if (private->cyclic)
+			ret = ux500_pcm_dma_cyclic_start(substream);
+
 		if (ret) {
-			pr_err("%s: Failed to configure I2S!\n", __func__);
-			return -EINVAL;
+			pr_err("%s: Failed to start dma transfer!\n", __func__);
+			return ret;
 		}
 		break;
 	case SNDRV_PCM_TRIGGER_RESUME:
@@ -474,40 +551,89 @@ ux500_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		break;
 
 	default:
-		pr_err("%s: Invalid command in pcm trigger\n",
-			__func__);
+		pr_err("%s: Invalid command in pcm trigger\n", __func__);
 		return -EINVAL;
 	}
 
 	return ret;
 }
 
-static snd_pcm_uframes_t
-ux500_pcm_pointer(struct snd_pcm_substream *substream)
+static snd_pcm_uframes_t ux500_pcm_pointer(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct ux500_pcm_private *private = runtime->private_data;
 
 	pr_debug("%s: dma_offset %d frame %ld\n", __func__, private->offset,
-			bytes_to_frames(substream->runtime, private->offset));
+		bytes_to_frames(substream->runtime, private->offset));
 
 	return bytes_to_frames(substream->runtime, private->offset);
 }
 
-static int
-ux500_pcm_mmap(
-	struct snd_pcm_substream *substream,
-	struct vm_area_struct *vma)
+
+static int ux500_pcm_copy(struct snd_pcm_substream *substream, int channel,
+		snd_pcm_uframes_t pos, void __user *buf,
+		snd_pcm_uframes_t count)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_dai *dai = rtd->cpu_dai;
+	struct ux500_pcm_dma_params *dma_params =
+		snd_soc_dai_get_dma_data(dai, substream);
+	int shift;
+	int *dma = (int *)(runtime->dma_area + frames_to_bytes(runtime, pos));
+	int words =  frames_to_bytes(runtime, count) / sizeof(int);
+	int i;
+
+	/* Check if it is buffer free transfer */
+	if (dma_params == NULL)
+		return 0;
+
+	shift = runtime->sample_bits - dma_params->data_size;
+
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+
+		if (copy_from_user(dma, buf, frames_to_bytes(runtime, count)))
+			return -EFAULT;
+
+		switch (shift) {
+		case 0:
+			break;
+		default:
+			for (i = 0; i < words; i++) {
+				*dma = *dma >> shift;
+				dma++;
+			}
+			break;
+		}
+	} else {
+		switch (shift) {
+		case 0:
+			break;
+		default:
+			for (i = 0; i < words; i++) {
+				*dma = *dma << shift;
+				dma++;
+			}
+			break;
+		}
+
+		dma = (int *)(runtime->dma_area +
+			frames_to_bytes(runtime, pos));
+
+		if (copy_to_user(buf, dma, frames_to_bytes(runtime, count)))
+			return -EFAULT;
+	}
+	return 0;
+}
+
+static int ux500_pcm_mmap(struct snd_pcm_substream *substream,
+		struct vm_area_struct *vma)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	pr_debug("%s: Enter.\n", __func__);
 
-	return dma_mmap_coherent(
-		NULL,
-		vma,
-		runtime->dma_area,
-		runtime->dma_addr,
-		runtime->dma_bytes);
+	return dma_mmap_coherent(NULL, vma, runtime->dma_area,
+		runtime->dma_addr, runtime->dma_bytes);
 }
 
 static struct snd_pcm_ops ux500_pcm_ops = {
@@ -519,13 +645,14 @@ static struct snd_pcm_ops ux500_pcm_ops = {
 	.prepare	= ux500_pcm_prepare,
 	.trigger	= ux500_pcm_trigger,
 	.pointer	= ux500_pcm_pointer,
+	.copy		= ux500_pcm_copy,
 	.mmap		= ux500_pcm_mmap
 };
 
-int ux500_pcm_new(struct snd_card *card,
-		struct snd_soc_dai *dai,
-		struct snd_pcm *pcm)
+int ux500_pcm_new(struct snd_soc_pcm_runtime *rtd)
 {
+	struct snd_pcm *pcm = rtd->pcm;
+
 	pr_debug("%s: pcm = %d\n", __func__, (int)pcm);
 
 	pcm->info_flags = 0;
@@ -571,10 +698,8 @@ static int __devexit ux500_pcm_drv_probe(struct platform_device *pdev)
 	pr_info("%s: Register ux500-pcm SoC platform driver.\n", __func__);
 	ret = snd_soc_register_platform(&pdev->dev, &ux500_pcm_soc_drv);
 	if (ret < 0) {
-		pr_err("%s: Error: Failed to register "
-			"ux500-pcm SoC platform driver (%d)!\n",
-			__func__,
-			ret);
+		pr_err("%s: Error: Failed to register ux500-pcm SoC platform driver (%d)!\n",
+			__func__, ret);
 		return ret;
 	}
 

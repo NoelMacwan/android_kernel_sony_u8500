@@ -131,10 +131,6 @@ struct isp_write_t {
 	unsigned long count;
 };
 
-struct trace_buf_t {
-	void *address;
-	unsigned int size;
-};
 
 #ifdef SRA_SUPPORT
 struct s_reg {
@@ -157,7 +153,6 @@ struct mmio_input_output_t {
 		unsigned int		addr_to_map;
 		struct xshutdown_info_t	xshutdown_info;
 		enum camera_slot_t	camera_slot;
-		struct trace_buf_t	trace_buf;
 #ifdef SRA_SUPPORT
 		struct s_reg_list s_reg_list;
 #endif
@@ -174,6 +169,7 @@ struct mmio_input_output_t {
 /* kept for backward compatibility */
 #define MMIO_XSHUTDOWN_ACTIVE_HIGH		(0x2)
 #define MMIO_MAGIC_NUMBER 0x15
+#define MMIO_CAM_FLASH_ENABLE	0x111111
 
 #define MMIO_CAM_INITBOARD	_IOW(MMIO_MAGIC_NUMBER, 1,\
 struct mmio_input_output_t*)
@@ -199,9 +195,6 @@ struct mmio_input_output_t*)
 #define MMIO_CAM_GET_IP_GPIO	_IOWR(MMIO_MAGIC_NUMBER, 12,\
 struct mmio_input_output_t*)
 #define MMIO_CAM_DESINITBOARD	_IO(MMIO_MAGIC_NUMBER, 13)
-#define MMIO_CAM_SET_TRACE_BUFFER _IOW(MMIO_MAGIC_NUMBER, 14,\
-struct mmio_input_output_t*)
-
 #ifdef SRA_SUPPORT
 #define MMIO_CAM_READ_REGS	_IOWR(MMIO_MAGIC_NUMBER, 15,\
 struct mmio_input_output_t*)

@@ -19,14 +19,15 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/ioctl.h>
+#include <linux/module.h>
 #include <linux/clonedev.h>
 #include <linux/compdev.h>
 #include <linux/compdev_util.h>
 #include <linux/hwmem.h>
-#include <linux/mm.h>
 #include <linux/kobject.h>
 #include <linux/sched.h>
 #include <linux/workqueue.h>
+#include <linux/mm.h>
 
 #include <video/mcde.h>
 #include <video/b2r2_blt.h>
@@ -48,7 +49,6 @@ struct clonedev {
 	struct compdev *src_compdev;
 	struct compdev *dst_compdev;
 	bool overlay_case;
-	struct compdev_size src_size;
 	struct compdev_size dst_size;
 	struct compdev_rect crop_rect;
 	struct compdev_scene_info s_info;
@@ -56,8 +56,28 @@ struct clonedev {
 	u8 scene_img_count;
 	enum clonedev_mode mode;
 	struct buffer_cache_context cache_ctx;
+	struct buffer_cache_context cache_tmp_ctx;
 	int blt_handle;
 	u8 crop_ratio;
+};
+
+struct scene_scale_factors {
+	/* aspect ratio in 26.6 fixed point with remainder */
+	uint32_t aqw;
+	uint32_t arw;
+	uint32_t dw;
+	uint32_t aqh;
+	uint32_t arh;
+	uint32_t dh;
+	uint32_t scene_width;
+	uint32_t scene_height;
+};
+
+struct rect_span {
+	uint32_t width;
+	uint32_t height;
+	uint32_t xtot;
+	uint32_t ytot;
 };
 
 static int clonedev_blt(struct clonedev *cd,
@@ -78,6 +98,10 @@ static int clonedev_blt(struct clonedev *cd,
 		req.src_img.buf.fd = src_img->buf.fd;
 	} else {
 		struct hwmem_alloc *alloc;
+		enum hwmem_access access = HWMEM_ACCESS_READ |
+				HWMEM_ACCESS_WRITE;
+		size_t size;
+		enum hwmem_mem_type memtype;
 
 		req.src_img.buf.type = B2R2_BLT_PTR_HWMEM_BUF_NAME_OFFSET;
 		req.src_img.buf.hwmem_buf_name = src_img->buf.hwmem_buf_name;
@@ -86,9 +110,12 @@ static int clonedev_blt(struct clonedev *cd,
 		if (IS_ERR_OR_NULL(alloc)) {
 			dev_err(cd->dev, "HWMEM resolve src failed\n");
 		} else {
-			hwmem_set_access(alloc,
-				HWMEM_ACCESS_READ | HWMEM_ACCESS_IMPORT,
-				task_tgid_nr(current));
+			hwmem_get_info(alloc, &size, &memtype,
+					&access);
+			if (!(access & HWMEM_ACCESS_IMPORT))
+				hwmem_set_access(alloc,
+					access | HWMEM_ACCESS_IMPORT,
+					task_tgid_nr(current));
 			hwmem_release(alloc);
 		}
 	}
@@ -130,6 +157,13 @@ static int clonedev_blt(struct clonedev *cd,
 	if (blend)
 		req.flags |= B2R2_BLT_FLAG_PER_PIXEL_ALPHA_BLEND;
 
+	dev_dbg(cd->dev, "%s: src_rect: x %d, y %d, w %d h %d, ",
+			__func__, req.src_rect.x, req.src_rect.y,
+			req.src_rect.width,	req.src_rect.height);
+	dev_dbg(cd->dev, "%s: dst_rect: x %d, y %d, w %d h %d\n",
+			__func__, req.dst_rect.x, req.dst_rect.y,
+			req.dst_rect.width, req.dst_rect.height);
+
 	req_id = b2r2_blt_request(cd->blt_handle, &req);
 	if (req_id < 0)
 		dev_err(cd->dev, "%s: Err b2r2_blt_request, handle %d, id %d",
@@ -141,108 +175,75 @@ static int clonedev_blt(struct clonedev *cd,
 	return req_id;
 }
 
-static void clonedev_best_fit(struct compdev_rect *crop_rect,
+static void clonedev_best_fit(struct clonedev *cd,
+		struct compdev_rect *src_rect,
 		struct compdev_rect *dst_rect,
-		enum   compdev_transform  transform)
+		int coord_rot,
+		struct scene_scale_factors *ssfs)
 {
-	/* aspect ratio in 26.6 fixed point with remainder */
-	uint32_t aq;
-	uint32_t ar;
-	uint32_t nw;
-	uint32_t dw;
-	uint32_t nh;
-	uint32_t dh;
-	uint32_t dst_w;
-	uint32_t dst_h;
+	uint32_t dst_w = 0;
+	uint32_t dst_h = 0;
+	uint32_t dst_x = 0;
+	uint32_t dst_y = 0;
+	uint32_t span_x;
+	uint32_t span_y;
 
-	if (transform & COMPDEV_TRANSFORM_ROT_90_CW) {
-		nw = dst_rect->width << 6;
-		dw = dst_rect->height;
-		nh = dst_rect->height << 6;
-		dh = dst_rect->width;
+	/* Adjust orientation of dst_rect */
+	if (coord_rot % 180) {
+		dst_w = dst_rect->height;
+		dst_h = dst_rect->width;
+		dst_x = dst_rect->y;
+		dst_y = dst_rect->x;
 	} else {
-		nw = dst_rect->height << 6;
-		dw = dst_rect->width;
-		nh = dst_rect->width << 6;
-		dh = dst_rect->height;
-	}
-	aq = nw / dw;
-	ar = nw % dw;
-
-	/* Base destination rect on crop_rect width */
-	dst_w = crop_rect->width;
-	dst_h = (aq * crop_rect->width +
-			((ar * crop_rect->width) / dw)) >> 6;
-	dst_rect->x = 0;
-	dst_rect->y = 0;
-
-	/*
-	 * Clamp to crop_rect height if the destination rectangle
-	 * is too high, and base the destination rectangle width
-	 * on the crop_rect height instead.
-	 */
-	if (dst_h > crop_rect->height) {
-		aq = nh / dh;
-		ar = nh % dh;
-		dst_h = crop_rect->height;
-		dst_w = (aq * crop_rect->height +
-				((ar * crop_rect->height) / dh)) >> 6;
+		dst_w = dst_rect->width;
+		dst_h = dst_rect->height;
+		dst_x = dst_rect->x;
+		dst_y = dst_rect->y;
 	}
 
+	/* Scale up the dst_rect */
+	if (ssfs->aqw != 0 || ssfs->arw != 0) {
+		dst_x = (ssfs->aqw * dst_x +
+			((ssfs->arw * dst_x) / ssfs->dw)) >> 6;
+		dst_y = (ssfs->aqw * dst_y +
+			((ssfs->arw * dst_y) / ssfs->dw)) >> 6;
+		dst_w = (ssfs->aqw * dst_w +
+			((ssfs->arw * dst_w) / ssfs->dw)) >> 6;
+		dst_h = (ssfs->aqw * dst_h +
+			((ssfs->arw * dst_h) / ssfs->dw)) >> 6;
+	} else {
+		dst_y = (ssfs->aqh * dst_y +
+			((ssfs->arh * dst_y) / ssfs->dh)) >> 6;
+		dst_x = (ssfs->aqh * dst_x +
+			((ssfs->arh * dst_x) / ssfs->dh)) >> 6;
+		dst_h = (ssfs->aqh * dst_h +
+			((ssfs->arh * dst_h) / ssfs->dh)) >> 6;
+		dst_w = (ssfs->aqh * dst_w +
+			((ssfs->arh * dst_w) / ssfs->dh)) >> 6;
+	}
+
+	/* Center if necessary */
+	if (ssfs->scene_width < cd->crop_rect.width)
+		dst_x += (cd->crop_rect.width - ssfs->scene_width) >> 1;
+	if (ssfs->scene_height < cd->crop_rect.height)
+		dst_y += (cd->crop_rect.height - ssfs->scene_height) >> 1;
+
+	span_x = dst_w + dst_x;
+	span_y = dst_h + dst_y;
+
+	/* Avoid offseting off screen */
+	if (span_x > cd->crop_rect.width && dst_x > 0)
+		dst_x -= min((span_x - cd->crop_rect.width), dst_x);
+	if (span_y > cd->crop_rect.height && dst_y > 0)
+		dst_y -= min((span_y - cd->crop_rect.height), dst_y);
+
+	dev_dbg(cd->dev, "%s: x %u, y %u, w %u, h %u, spx %u, spy %u\n",
+		__func__, dst_x, dst_y, dst_w, dst_h, span_x, span_y);
+
+	dst_rect->x = dst_x;
+	dst_rect->y = dst_y;
 	dst_rect->width = dst_w;
 	dst_rect->height = dst_h;
-
-	/* Center the image if necessary */
-	if (dst_w < crop_rect->width)
-		dst_rect->x += (crop_rect->width - dst_w) >> 1;
-
-	if (dst_h < crop_rect->height)
-		dst_rect->y += (crop_rect->height - dst_h) >> 1;
-}
-
-static void clonedev_rescale_destrect(struct compdev_rect *boundary,
-		struct compdev_size *src_size,
-		struct compdev_rect *dst_rect,
-		enum compdev_transform transform)
-{
-	uint32_t q, r, src_width;
-	uint32_t x, y, height, width;
-
-	if (transform == COMPDEV_TRANSFORM_ROT_0) {
-		x = dst_rect->x;
-		y = dst_rect->y;
-		width = dst_rect->width;
-		height = dst_rect->height;
-		src_width = src_size->width;
-	} else if (transform == COMPDEV_TRANSFORM_ROT_90_CW) {
-		x = src_size->height - dst_rect->y - dst_rect->height;
-		y = dst_rect->x;
-		width = dst_rect->height;
-		height = dst_rect->width;
-		src_width = src_size->height;
-	} else if (transform == COMPDEV_TRANSFORM_ROT_90_CCW) {
-		x = dst_rect->y;
-		y = src_size->width - dst_rect->x - dst_rect->width;
-		width = dst_rect->height;
-		height = dst_rect->width;
-		src_width = src_size->height;
-	} else if (transform == COMPDEV_TRANSFORM_ROT_90_CW_FLIP_V) {
-		x = dst_rect->y;
-		y = dst_rect->x;
-		width = dst_rect->height;
-		height = dst_rect->width;
-		src_width = src_size->height;
-	}
-
-	q = (boundary->width << 6) / src_width;
-	r = (boundary->width << 6) % src_width;
-
-	dst_rect->x      = (((boundary->x << 6) + ((q * x + r * x / src_width) +
-				(0x1 << 5))) >> 6) & ~0x1;
-	dst_rect->y      = ((q * y + r * y / src_width) >> 6) + boundary->y;
-	dst_rect->width  = (((q * width + r * width / src_width) +
-				(0x1 << 5)) >> 6) & ~0x1;
-	dst_rect->height = (q * height + r * height / src_width) >> 6;
 }
 
 static int clonedev_set_mode_locked(struct clonedev *cd,
@@ -251,6 +252,9 @@ static int clonedev_set_mode_locked(struct clonedev *cd,
 	cd->mode = mode;
 	cd->scene_img_count = 0;
 	cd->s_info.img_count = 1;
+
+	if (cd->mode == CLONEDEV_CLONE_NONE)
+		compdev_clear_screen(cd->dst_compdev);
 
 	return 0;
 }
@@ -288,34 +292,104 @@ static int clonedev_set_crop_ratio_locked(struct clonedev *cd, u8 crop_ratio)
 	return ret;
 }
 
-static void set_transform_and_dest_rect(struct clonedev *cd,
-		struct compdev_img *img)
+static void clonedev_transform_to_rotation(
+		enum compdev_transform transform,
+		int *degrees,
+		enum compdev_transform *residual)
 {
-	struct compdev_rect temp_rect = {0};
-	temp_rect.width = cd->src_size.width;
-	temp_rect.height = cd->src_size.height;
+	enum compdev_transform rem = COMPDEV_TRANSFORM_ROT_0;
 
-	/* First adjust src rect to crop_rect */
-	clonedev_best_fit(&cd->crop_rect,
-			&temp_rect,
-			img->transform);
+	switch (transform) {
+	case COMPDEV_TRANSFORM_ROT_0:
+		*degrees = 0;
+		break;
+	case COMPDEV_TRANSFORM_ROT_90_CW:
+		*degrees = 90;
+		break;
+	case COMPDEV_TRANSFORM_ROT_180:
+		*degrees = 180;
+		break;
+	case COMPDEV_TRANSFORM_ROT_270_CW:
+		*degrees = 270;
+		break;
+	case COMPDEV_TRANSFORM_FLIP_H:
+		rem = COMPDEV_TRANSFORM_FLIP_H;
+		*degrees = 0;
+		break;
+	case COMPDEV_TRANSFORM_FLIP_V:
+		rem = COMPDEV_TRANSFORM_FLIP_V;
+		*degrees = 0;
+		break;
+	case COMPDEV_TRANSFORM_ROT_90_CW_FLIP_H:
+		rem = COMPDEV_TRANSFORM_FLIP_H;
+		*degrees = 90;
+		break;
+	case COMPDEV_TRANSFORM_ROT_90_CW_FLIP_V:
+		rem = COMPDEV_TRANSFORM_FLIP_V;
+		*degrees = 90;
+		break;
+	default:
+		*degrees = 0;
+		break;
+	}
 
-	/* Now use temp_rect as the boundary */
-	clonedev_rescale_destrect(&temp_rect,
-			&cd->src_size,
-			&img->dst_rect,
-			img->transform);
+	if (residual != NULL)
+		*residual = rem;
+}
 
-	if (cd->overlay_case && (img->flags & COMPDEV_OVERLAY_FLAG))
-		img->transform = cd->s_info.ovly_transform;
+static enum compdev_transform clonedev_rotation_to_transform(int degree)
+{
+	switch (degree) {
+	case 0:
+		return COMPDEV_TRANSFORM_ROT_0;
+	case 90:
+		return COMPDEV_TRANSFORM_ROT_90_CW;
+	case 180:
+		return COMPDEV_TRANSFORM_ROT_180;
+	case 270:
+		return COMPDEV_TRANSFORM_ROT_270_CW;
+	default:
+		return 0;
+	}
+}
+
+static void set_transform_and_dest_rect(struct clonedev *cd,
+		struct compdev_img *img, int coord_rot,
+		struct scene_scale_factors *ssfs)
+{
+	int img_rot;
+	int mcde_rot;
+	enum compdev_transform img_rem_trans = COMPDEV_TRANSFORM_ROT_0;
+	int tot_rot;
+
+	clonedev_transform_to_rotation(cd->s_info.hw_transform,
+			&mcde_rot, NULL);
+	clonedev_transform_to_rotation(img->transform,
+			&img_rot, &img_rem_trans);
+
+	dev_dbg(cd->dev, "%s: src_rect: x %d, y %d, w %d h %d\n",
+		__func__, img->src_rect.x, img->src_rect.y,
+		img->src_rect.width, img->src_rect.height);
+	dev_dbg(cd->dev, "%s: dst_rect: x %d, y %d, w %d h %d\n",
+		__func__, img->dst_rect.x, img->dst_rect.y,
+		img->dst_rect.width, img->dst_rect.height);
+
+	/* Check if layer is rendered already */
+	if (img->flags & COMPDEV_OVERLAY_FLAG)
+		tot_rot = (img_rot + coord_rot + mcde_rot) % 360;
 	else
-		img->transform = cd->s_info.fb_transform;
+		tot_rot = (coord_rot + mcde_rot) % 360;
 
-	/* Invert the rotation to adapt to TV */
-	if (img->transform == COMPDEV_TRANSFORM_ROT_90_CCW)
-		img->transform = COMPDEV_TRANSFORM_ROT_270_CCW;
-	else if (img->transform == COMPDEV_TRANSFORM_ROT_270_CCW)
-		img->transform = COMPDEV_TRANSFORM_ROT_90_CCW;
+	dev_dbg(cd->dev,
+		"%s: t 0x%02x, tot_rot %d, img_rot %d, mcde_rot %d, coord_rot %d\n",
+		__func__, img->transform, tot_rot, img_rot, mcde_rot, coord_rot);
+
+	img->transform = clonedev_rotation_to_transform(tot_rot) |
+		img_rem_trans;
+
+	/* Adjust destination rect */
+	clonedev_best_fit(cd, &img->src_rect,
+		&img->dst_rect,	coord_rot, ssfs);
 }
 
 static void get_bounding_rect(struct compdev_rect *rect1,
@@ -349,6 +423,29 @@ static enum compdev_fmt clonedev_compatible_fmt(enum compdev_fmt fmt)
 		return COMPDEV_FMT_RGBA8888;
 	}
 }
+static inline void set_src_dst_rects(struct compdev_img *img0,
+		struct compdev_img *img1,
+		struct compdev_rect *src_rect,
+		struct compdev_rect *dst_rect)
+{
+	if (img1 != NULL) {
+		get_bounding_rect(&img0->dst_rect,
+			&img1->dst_rect,
+			src_rect);
+		*dst_rect = *src_rect;
+		img0->dst_rect.x -= src_rect->x;
+		img1->dst_rect.x -= src_rect->x;
+		src_rect->x = 0;
+		img0->dst_rect.y -= src_rect->y;
+		img1->dst_rect.y -= src_rect->y;
+		src_rect->y = 0;
+	} else {
+		*dst_rect = img0->dst_rect;
+		img0->dst_rect.x = 0;
+		img0->dst_rect.y = 0;
+		*src_rect = img0->dst_rect;
+	}
+}
 
 static u32 get_b2r2_color_black(enum b2r2_blt_fmt fmt)
 {
@@ -363,7 +460,6 @@ static u32 get_b2r2_color_black(enum b2r2_blt_fmt fmt)
 		return 0;
 	}
 }
-
 
 static inline void clear_rect(struct clonedev *cd,
 		struct b2r2_blt_req *bltreq, int x, int y,
@@ -419,6 +515,135 @@ static void clonedev_clear_background(struct clonedev *cd,
 	kfree(bltreq);
 }
 
+static struct compdev_img_internal *clonedev_get_rotated_img(
+		struct clonedev *cd, struct compdev_img *img,
+		bool protected, int img_rot)
+{
+	struct compdev_img_internal *result = NULL;
+	enum compdev_fmt dst_fmt;
+
+	dst_fmt = clonedev_compatible_fmt(img->fmt);
+	result = compdev_buffer_cache_get_image(
+			&cd->cache_tmp_ctx, dst_fmt,
+			img->height, img->width, protected);
+
+	result->img.transform = COMPDEV_TRANSFORM_ROT_0;
+	result->img.z_position = 0;
+
+	/* Current dest rect is needed later */
+	result->img.dst_rect = img->dst_rect;
+
+	/* Set new dest rect (no scaling) */
+	img->dst_rect.x = 0;
+	img->dst_rect.y = 0;
+	if (img_rot % 180) {
+		img->dst_rect.height = img->src_rect.width;
+		img->dst_rect.width = img->src_rect.height;
+	} else {
+		img->dst_rect.height = img->src_rect.height;
+		img->dst_rect.width = img->src_rect.width;
+	}
+
+	/* Do rotation blit */
+	clonedev_blt(cd, img, &result->img, false, true);
+
+	/* Set new source rect */
+	result->img.src_rect = img->dst_rect;
+
+	return result;
+}
+
+static void get_span(struct compdev_rect *rect,
+		struct rect_span *span, int rot)
+{
+	if (rot % 180) {
+		span->width = rect->height;
+		span->height = rect->width;
+		span->xtot = rect->height + rect->y*2;
+		span->ytot = rect->width + rect->x*2;
+	} else {
+		span->width = rect->width;
+		span->height = rect->height;
+		span->xtot = rect->width + rect->x*2;
+		span->ytot = rect->height + rect->y*2;
+	}
+}
+
+static void get_scene_scale_factors(struct clonedev *cd,
+		struct compdev_img *img0,
+		struct compdev_img *img1,
+		int coord_rot,
+		struct scene_scale_factors *ssfs)
+{
+	uint32_t nw, nh;
+	bool base_on_width = false;
+	struct rect_span spanbig;
+	struct rect_span spansmall;
+	struct rect_span span0;
+	struct rect_span span1;
+
+	get_span(&img0->dst_rect, &span0, coord_rot);
+
+	if (img1 == NULL) {
+		spanbig = span0;
+	} else {
+		get_span(&img1->dst_rect, &span1, coord_rot);
+		if ((span0.width > span1.width &&
+					span0.height <= span1.height) ||
+				(span0.height > span1.height &&
+					span0.width <= span1.width)) {
+			spanbig = span0;
+			spansmall = span1;
+		} else {
+			spanbig = span1;
+			spansmall = span0;
+		}
+	}
+
+	nw = cd->crop_rect.width << 6;
+	ssfs->dw = spanbig.width;
+	nh = cd->crop_rect.height << 6;
+	ssfs->dh = spanbig.height;
+
+	if (img1 == NULL) {
+		if (span0.width >= span0.height)
+			base_on_width = true;
+	} else {
+		if (spanbig.height >= spansmall.height)
+			base_on_width = true;
+	}
+
+	if (base_on_width) {
+		/* Aspect quotient and remainder based on width */
+		ssfs->aqw = nw / ssfs->dw;
+		ssfs->arw = nw % ssfs->dw;
+		ssfs->aqh = 0;
+		ssfs->arh = 0;
+
+		ssfs->scene_width = cd->crop_rect.width;
+		ssfs->scene_height = ((ssfs->aqw * spanbig.ytot +
+			((ssfs->arw * spanbig.ytot) / ssfs->dw)) >> 6);
+	} else {
+		/* Aspect quotient and remainder based on height */
+		ssfs->aqh = nh / ssfs->dh;
+		ssfs->arh = nh % ssfs->dh;
+		ssfs->aqw = 0;
+		ssfs->arw = 0;
+
+		ssfs->scene_width = ((ssfs->aqh * spanbig.xtot +
+			((ssfs->arh * spanbig.xtot) / ssfs->dh)) >> 6);
+		ssfs->scene_height = cd->crop_rect.height;
+	}
+
+	dev_dbg(cd->dev, "%s: crop_w %u, sc_w %u, crop_h %u, sc_h %u\n",
+		__func__, cd->crop_rect.width, ssfs->scene_width,
+		cd->crop_rect.height, ssfs->scene_height);
+
+	dev_dbg(cd->dev,
+		"%s: aqw %u, arw %u, dw %u, aqh %u, arh %u, dh %u\n",
+		__func__, ssfs->aqw, ssfs->arw, ssfs->dw, ssfs->aqh,
+		ssfs->arh, ssfs->dh);
+}
 
 static void clonedev_compose_locked(struct clonedev *cd)
 {
@@ -426,8 +651,18 @@ static void clonedev_compose_locked(struct clonedev *cd)
 	struct compdev_img *img1 = NULL;
 	bool protected = false;
 	struct compdev_img_internal *dst_img;
+	struct compdev_rect src_rect;
+	struct compdev_rect dst_rect;
+	struct compdev_img_internal *rotated_img = NULL;
 	int b2r2_req_id;
 	enum compdev_fmt dst_fmt;
+	struct scene_scale_factors ssfs;
+	int display_to_tv_rot = 360 - 90;
+	int app_rot;
+
+	clonedev_transform_to_rotation(cd->s_info.app_transform,
+			&app_rot, NULL);
+	display_to_tv_rot = (display_to_tv_rot + app_rot) % 360;
 
 	/* Now there should be two images */
 	if (cd->scene_img_count == 0) {
@@ -440,10 +675,13 @@ static void clonedev_compose_locked(struct clonedev *cd)
 	if (cd->scene_img_count >= 2)
 		img1 = &cd->scene_images[1];
 
+	get_scene_scale_factors(cd, img0, img1,
+			display_to_tv_rot, &ssfs);
+
 	/* Adjust to output size */
-	set_transform_and_dest_rect(cd, img0);
+	set_transform_and_dest_rect(cd, img0, display_to_tv_rot, &ssfs);
 	if (img1)
-		set_transform_and_dest_rect(cd, img1);
+		set_transform_and_dest_rect(cd, img1, display_to_tv_rot, &ssfs);
 
 	/* Organize the images according to z-order, img1 on top of img0 */
 	if (img1 != NULL && img0->z_position < img1->z_position) {
@@ -457,6 +695,13 @@ static void clonedev_compose_locked(struct clonedev *cd)
 			(img1 != NULL && img1->flags & COMPDEV_PROTECTED_FLAG))
 		protected = true;
 
+
+	/*
+	 * Get src_rect and dst_rect for completed image
+	 * to be passed to MCDE
+	 */
+	set_src_dst_rects(img0, img1, &src_rect, &dst_rect);
+
 	/*
 	 * NOTE: Should be hard coded to RGB888 but somehow
 	 * the mcde driver can not handle the offset into
@@ -467,7 +712,9 @@ static void clonedev_compose_locked(struct clonedev *cd)
 	dst_fmt = clonedev_compatible_fmt(img0->fmt);
 
 	dst_img = compdev_buffer_cache_get_image(&cd->cache_ctx, dst_fmt,
-			cd->crop_rect.width, cd->crop_rect.height, protected);
+			src_rect.x + src_rect.width,
+			src_rect.y + src_rect.height,
+			protected);
 
 	if (dst_img != NULL) {
 		if (cd->blt_handle < 0) {
@@ -480,17 +727,11 @@ static void clonedev_compose_locked(struct clonedev *cd)
 		}
 
 		/* Set destination image parameters */
-		if (img1 != NULL)
-			get_bounding_rect(&img0->dst_rect,
-				&img1->dst_rect,
-				&dst_img->img.src_rect);
-		else
-			dst_img->img.src_rect = img0->dst_rect;
-		dst_img->img.dst_rect = dst_img->img.src_rect;
+		dst_img->img.src_rect = src_rect;
+		dst_img->img.dst_rect = dst_rect;
 		dst_img->img.z_position = 1;
 		dst_img->img.flags |= img0->flags;
 		dst_img->img.transform = COMPDEV_TRANSFORM_ROT_0;
-
 
 		/* Clear destination buf outside of img0 */
 		clonedev_clear_background(cd, &dst_img->img,
@@ -502,24 +743,42 @@ static void clonedev_compose_locked(struct clonedev *cd)
 						false, false);
 		} else {
 			int ret;
+			int img1_rot;
+
+			clonedev_transform_to_rotation(img1->transform,
+				&img1_rot, NULL);
+
+			if (img1_rot != 0)
+				/*
+				 * B2R2 cannot handle rotation, resizing and
+				 * blending at the same time. Split it into
+				 * two jobs.
+				 */
+				rotated_img = clonedev_get_rotated_img(cd,
+						img1, protected, img1_rot);
+
 			b2r2_req_id = clonedev_blt(cd, img0, &dst_img->img,
-						false, false);
-			ret = clonedev_blt(cd, img1, &dst_img->img,
-						true, false);
+					false, false);
+			if (rotated_img != NULL)
+				ret = clonedev_blt(cd,
+					&rotated_img->img, &dst_img->img,
+					true, false);
+			else
+				ret = clonedev_blt(cd,
+					img1, &dst_img->img,
+					true, false);
 			if (ret >= 0)
 				b2r2_req_id = ret;
 		}
 
-		dst_img->img.dst_rect = cd->crop_rect;
-		dst_img->img.src_rect.x = 0;
-		dst_img->img.src_rect.y = 0;
-		dst_img->img.src_rect.width = cd->crop_rect.width;
-		dst_img->img.src_rect.height = cd->crop_rect.height;
-
+		dst_img->img.dst_rect.x += cd->crop_rect.x;
+		dst_img->img.dst_rect.y += cd->crop_rect.y;
 		compdev_post_single_buffer_asynch(cd->dst_compdev,
 				&dst_img->img, cd->blt_handle, b2r2_req_id);
 
 		compdev_free_img(&cd->cache_ctx, dst_img);
+		if (rotated_img != NULL)
+			compdev_free_img(&cd->cache_tmp_ctx, rotated_img);
 	} else {
 		dev_err(cd->dev, "%s: Could not allocate hwmem "
 				"temporary buffer\n", __func__);
@@ -718,11 +977,13 @@ static int init_clonedev(struct clonedev *cd)
 {
 #ifdef CONFIG_COMPDEV_JANITOR
 	char wq_name[20];
+	char wq_name2[20];
 #endif
 	mutex_init(&cd->lock);
 	INIT_LIST_HEAD(&cd->list);
 	cd->blt_handle = -1;
 	memset(&cd->cache_ctx, 0, sizeof(cd->cache_ctx));
+	memset(&cd->cache_tmp_ctx, 0, sizeof(cd->cache_tmp_ctx));
 
 	cd->mdev.minor = MISC_DYNAMIC_MINOR;
 	cd->mdev.name = cd->name;
@@ -730,15 +991,23 @@ static int init_clonedev(struct clonedev *cd)
 
 #ifdef CONFIG_COMPDEV_JANITOR
 	snprintf(wq_name, sizeof(wq_name), "%s_janitor", cd->name);
-
 	mutex_init(&cd->cache_ctx.janitor_lock);
 	cd->cache_ctx.janitor_thread = create_workqueue(wq_name);
 	if (!cd->cache_ctx.janitor_thread) {
 		mutex_destroy(&cd->cache_ctx.janitor_lock);
 		return -ENOMEM;
 	}
-
 	INIT_DELAYED_WORK_DEFERRABLE(&cd->cache_ctx.free_buffers_work,
+		compdev_free_cache_context_buffers);
+
+	snprintf(wq_name2, sizeof(wq_name2), "%s_janitor2", cd->name);
+	mutex_init(&cd->cache_tmp_ctx.janitor_lock);
+	cd->cache_tmp_ctx.janitor_thread = create_workqueue(wq_name2);
+	if (!cd->cache_tmp_ctx.janitor_thread) {
+		mutex_destroy(&cd->cache_tmp_ctx.janitor_lock);
+		return -ENOMEM;
+	}
+	INIT_DELAYED_WORK_DEFERRABLE(&cd->cache_tmp_ctx.free_buffers_work,
 		compdev_free_cache_context_buffers);
 #endif
 
@@ -775,10 +1044,6 @@ int clonedev_create(void)
 	if (ret < 0)
 		goto fail_register_misc;
 
-	ret = compdev_get_size(cd->src_compdev, &cd->src_size);
-	if (ret < 0)
-		goto fail_register_misc;
-
 	ret = compdev_get_size(cd->dst_compdev, &cd->dst_size);
 	if (ret < 0)
 		goto fail_register_misc;
@@ -804,7 +1069,7 @@ int clonedev_create(void)
 		goto fail_register_misc;
 
 	/* Default setting */
-	cd->mode = CLONEDEV_CLONE_NONE;
+	cd->mode = CLONEDEV_CLONE_VIDEO_AND_UI;
 
 	ret = misc_register(&cd->mdev);
 	if (ret)
@@ -814,6 +1079,7 @@ int clonedev_create(void)
 
 	cd->dev = cd->mdev.this_device;
 	cd->cache_ctx.dev = cd->dev;
+	cd->cache_tmp_ctx.dev = cd->dev;
 
 	mutex_unlock(&cd->lock);
 	mutex_unlock(&dev_list_lock);
@@ -828,6 +1094,8 @@ fail_register_misc:
 #ifdef CONFIG_COMPDEV_JANITOR
 	mutex_destroy(&cd->cache_ctx.janitor_lock);
 	destroy_workqueue(cd->cache_ctx.janitor_thread);
+	mutex_destroy(&cd->cache_tmp_ctx.janitor_lock);
+	destroy_workqueue(cd->cache_tmp_ctx.janitor_thread);
 #endif
 	mutex_unlock(&cd->lock);
 	kfree(cd);
@@ -854,6 +1122,8 @@ void clonedev_destroy(void)
 #ifdef CONFIG_COMPDEV_JANITOR
 		cancel_delayed_work_sync(&cd->cache_ctx.free_buffers_work);
 		flush_workqueue(cd->cache_ctx.janitor_thread);
+		cancel_delayed_work_sync(&cd->cache_tmp_ctx.free_buffers_work);
+		flush_workqueue(cd->cache_tmp_ctx.janitor_thread);
 #endif
 
 		for (i = 0; i < BUFFER_CACHE_DEPTH; i++) {
@@ -863,10 +1133,19 @@ void clonedev_destroy(void)
 				cd->cache_ctx.img[i] = NULL;
 			}
 		}
+		for (i = 0; i < BUFFER_CACHE_DEPTH; i++) {
+			if (cd->cache_tmp_ctx.img[i] != NULL) {
+				kref_put(&cd->cache_tmp_ctx.img[i]->ref_count,
+					compdev_image_release);
+				cd->cache_tmp_ctx.img[i] = NULL;
+			}
+		}
 
 #ifdef CONFIG_COMPDEV_JANITOR
 		mutex_destroy(&cd->cache_ctx.janitor_lock);
 		destroy_workqueue(cd->cache_ctx.janitor_thread);
+		mutex_destroy(&cd->cache_tmp_ctx.janitor_lock);
+		destroy_workqueue(cd->cache_tmp_ctx.janitor_thread);
 #endif
 
 		if (cd->blt_handle >= 0)

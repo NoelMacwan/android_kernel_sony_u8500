@@ -18,10 +18,12 @@
 #include <linux/uaccess.h>
 #include <linux/mfd/dbx500-prcmu.h>
 #include <linux/wakelock.h>
+#include <linux/workqueue.h>
 
 #include <mach/pm.h>
 #include <mach/pm-timer.h>
 
+#include "../id.h"
 /* To reach main_wake_lock */
 #include "../../../../kernel/power/power.h"
 
@@ -35,6 +37,11 @@ static u32 sleep_enabled;
 static u32 deepsleep_enabled = 1;
 #else
 static u32 deepsleep_enabled;
+#endif
+
+#ifdef CONFIG_UX500_HATS_DEEP_DBG
+static u32 suspend_ape = 1;
+static u32 suspend_ulpclk = 1;
 #endif
 
 static u32 suspend_enabled = 1;
@@ -56,6 +63,33 @@ void ux500_suspend_dbg_add_wake_on_uart(void)
 void ux500_suspend_dbg_remove_wake_on_uart(void)
 {
 	irq_set_irq_wake(GPIO_TO_IRQ(ux500_console_uart_gpio_pin), 0);
+}
+#endif
+
+#ifdef CONFIG_UX500_HATS_DEEP_DBG
+bool ux500_suspend_ape(void)
+{
+	return suspend_ape != 0;
+}
+void ux500_suspend_dbg_cond(u8 *state, bool *keep_ulp_clk,
+		bool *keep_ap_pll)
+{
+	if (!cpu_is_ux540_family())
+		return;
+	if (!suspend_ape) {
+		*keep_ulp_clk = true;
+		*keep_ap_pll = true;
+		if (*state == PRCMU_AP_DEEP_SLEEP)
+			*state = PRCMU_AP_DEEP_IDLE;
+		else
+			*state = PRCMU_AP_IDLE;
+		return;
+	}
+	if (suspend_ulpclk)
+		return; /* cond unchanged : no hats test ongoing */
+	*keep_ulp_clk = true;
+	*keep_ap_pll = true;
+	return;
 }
 #endif
 
@@ -89,8 +123,6 @@ void ux500_suspend_dbg_sleep_status(bool is_deepsleep)
 			deepsleeps_done++;
 		else
 			deepsleeps_failed++;
-		pr_info("VBat after sleep: 0x%x\n",
-			db8500_prcmu_get_vbat_after_deep_sleep());
 	} else {
 		pr_info("Returning from ApSleep. PRCMU ret: 0x%x - %s\n",
 			prcmu_status,
@@ -108,12 +140,15 @@ int ux500_suspend_dbg_begin(suspend_state_t state)
 	return 0;
 }
 
+#ifdef CONFIG_DB8500_PWR_TEST
 /* The number of failed suspend attempts in a row before giving up */
 #define TEST_FAILS 10
 
 static int suspend_test_count;
 static int suspend_test_current;
 static int suspend_test_fail_count;
+static int suspend_test_up_len;
+static int suspend_test_down_len;
 
 void ux500_suspend_dbg_test_set_wakeup(void)
 {
@@ -125,23 +160,18 @@ void ux500_suspend_dbg_test_set_wakeup(void)
 	/* Make sure the rtc writes have been accepted */
 	udelay(120);
 
-	if (cpu_is_u9500())
-		prcmu_enable_wakeups(PRCMU_WAKEUP(ABB) | PRCMU_WAKEUP(RTC) |
-				     PRCMU_WAKEUP(HSI0));
-	else
-		prcmu_enable_wakeups(PRCMU_WAKEUP(ABB) | PRCMU_WAKEUP(RTC));
-
 	/* Program RTC to generate an interrupt 1s later */
-	ux500_rtcrtt_next(1000000);
+	ux500_rtcrtt_next(suspend_test_down_len * 1000000);
 }
 
-void ux500_suspend_dbg_test_start(int num)
+void ux500_suspend_dbg_test_start(int num, int down_len, int up_len)
 {
 	suspend_test_count = num;
 	suspend_test_current = deepsleeps_done;
 	suspend_test_fail_count = 0;
+	suspend_test_down_len = down_len;
+	suspend_test_up_len = up_len;
 }
-EXPORT_SYMBOL(ux500_suspend_dbg_test_start);
 
 bool ux500_suspend_test_success(bool *ongoing)
 {
@@ -149,13 +179,22 @@ bool ux500_suspend_test_success(bool *ongoing)
 		      (suspend_test_count > 0));
 	return suspend_test_fail_count < TEST_FAILS;
 }
-EXPORT_SYMBOL(ux500_suspend_test_success);
+
+static void go_to_sleep(struct work_struct *dw)
+{
+#ifdef CONFIG_WAKELOCK
+	wake_unlock(&main_wake_lock);
+#endif
+}
+
+static DECLARE_DELAYED_WORK(go_to_sleep_work, go_to_sleep);
 
 void ux500_suspend_dbg_end(void)
 {
 	static int attempts;
 
 	if (suspend_test_count > 0) {
+		ux500_rtcrtt_off();
 		attempts++;
 		pr_info("Suspend test: %d done\n", attempts);
 		suspend_test_count--;
@@ -176,16 +215,15 @@ void ux500_suspend_dbg_end(void)
 			       "failed suspend in a row\n",
 			       TEST_FAILS);
 		} else if (suspend_test_count > 0) {
-			msleep(100);
-#ifdef CONFIG_WAKELOCK
-			wake_unlock(&main_wake_lock);
-#endif
+			schedule_delayed_work(&go_to_sleep_work,
+					      suspend_test_up_len * HZ);
 		}
 
 		if (suspend_test_count == 0)
 			attempts = 0;
 	}
 }
+#endif
 
 void ux500_suspend_dbg_init(void)
 {
@@ -195,7 +233,19 @@ void ux500_suspend_dbg_init(void)
 	suspend_dir = debugfs_create_dir("suspend", NULL);
 	if (IS_ERR_OR_NULL(suspend_dir))
 		return;
+#ifdef CONFIG_UX500_HATS_DEEP_DBG
+	file = debugfs_create_bool("ape_to_suspend", S_IWUGO | S_IRUGO,
+				   suspend_dir,
+				   &suspend_ape);
+	if (IS_ERR_OR_NULL(file))
+		goto error;
 
+	file = debugfs_create_bool("ulpclk_to_suspend", S_IWUGO | S_IRUGO,
+				   suspend_dir,
+				   &suspend_ulpclk);
+	if (IS_ERR_OR_NULL(file))
+		goto error;
+#endif
 	file = debugfs_create_bool("sleep", S_IWUGO | S_IRUGO,
 				   suspend_dir,
 				   &sleep_enabled);
@@ -246,6 +296,5 @@ void ux500_suspend_dbg_init(void)
 
 	return;
 error:
-	if (!IS_ERR_OR_NULL(suspend_dir))
-		debugfs_remove_recursive(suspend_dir);
+	debugfs_remove_recursive(suspend_dir);
 }

@@ -18,13 +18,16 @@
 #define MAX_NBR_OF_DSILINKS 4
 
 #define DSILINK_MAX_DCS_READ   4
-#define DSILINK_MAX_DSI_DIRECT_CMD_WRITE 15
+#define DSILINK_MAX_DSI_DIRECT_CMD_WRITE 16
 
 /* Interface mode */
 enum dsilink_irq {
 	DSILINK_IRQ_BTA_TE		 = 0x1,
 	DSILINK_IRQ_NO_TE		 = 0x2,
 	DSILINK_IRQ_TRIGGER		 = 0x4,
+	DSILINK_IRQ_TE_MISS		 = 0x8,
+	DSILINK_IRQ_ACK_WITH_ERR	 = 0x10,
+	DSILINK_IRQ_MISSING_VSYNC        = 0x20,
 };
 
 /* Interface mode */
@@ -60,6 +63,8 @@ enum dsilink_cmd_datatype {
 	DSILINK_CMD_DCS_WRITE			= 1,
 	DSILINK_CMD_DCS_READ			= 2,
 	DSILINK_CMD_SET_MAX_PKT_SIZE		= 3,
+	DSILINK_CMD_TURN_ON_PERIPHERAL		= 4,
+	DSILINK_CMD_SHUT_DOWN_PERIPHERAL	= 5,
 };
 
 enum dsilink_lane_status {
@@ -67,6 +72,7 @@ enum dsilink_lane_status {
 	DSILINK_LANE_STATE_IDLE		= 0x01,
 	DSILINK_LANE_STATE_WRITE	= 0x02,
 	DSILINK_LANE_STATE_ULPM		= 0x03,
+	DSILINK_LANE_STATE_READ		= 0x04,
 };
 
 struct dsilink_dsi_vid_registers {
@@ -105,6 +111,14 @@ struct dsilink_phy {
 	u8 ui;
 	bool clk_cont;
 	bool host_eot_gen;
+	/*
+	* DPHY spec:
+	* After power-up, the Slave side PHY shall be initialized when
+	* the Master PHY drives a Stop State (LP-11) for a period
+	* longer then TINIT. The first Stop state longer than the
+	* specified TINIT is called the Initialization period.
+	*/
+	u32 t_init;
 
 	/* DSI video operating modes */
 	enum dsilink_vid_mode vid_mode;
@@ -128,8 +142,6 @@ struct dsilink_port {
 	enum dsilink_mode mode;
 	enum dsilink_sync_src sync_src;
 	u8 link;
-	/* TODO should refresh rate be in u16 fixed point ? */
-	u8 refresh_rate;	/* display refresh rate given in Hz */
 	struct dsilink_phy phy;
 };
 
@@ -150,6 +162,7 @@ struct dsilink_ops {
 				struct dsilink_dsi_vid_registers *vid_regs,
 									u8 bpp);
 	void (*set_clk_continous)(u8 *io, bool on);
+	void (*enable_video_mode)(u8 *io, bool enable);
 	int (*handle_ulpm)(u8 *io, struct device *dev,
 			const struct dsilink_port *port, bool enter_ulpm);
 };
@@ -177,14 +190,15 @@ struct dsilink_device {
 int nova_dsilink_setup(struct dsilink_device *dsilink,
 					const struct dsilink_port *port);
 int nova_dsilink_send_max_read_len(struct dsilink_device *dsilink);
+int nova_dsilink_turn_on_peripheral(struct dsilink_device *dsilink);
+int nova_dsilink_shut_down_peripheral(struct dsilink_device *dsilink);
 void nova_dsilink_wait_while_running(struct dsilink_device *dsilink);
 u8 nova_dsilink_handle_irq(struct dsilink_device *dsilink);
-int nova_dsilink_dsi_write(struct dsilink_device *dsilink,
-					u8 cmd, u8 *data, int len);
-int nova_dsilink_dcs_write(struct dsilink_device *dsilink,
-					u8 cmd, u8 *data, int len);
-int nova_dsilink_dsi_read(struct dsilink_device *dsilink, u8 cmd,
-						u32 *data, int *len);
+int nova_dsilink_dsi_write(struct dsilink_device *dsilink, u8 *data, int len);
+int nova_dsilink_dcs_write(struct dsilink_device *dsilink, u8 cmd, u8 *data,
+								int len);
+int nova_dsilink_dsi_read(struct dsilink_device *dsilink, u8 cmd, u32 *data,
+								int *len);
 void nova_dsilink_te_request(struct dsilink_device *dsilink);
 int nova_dsilink_enable(struct dsilink_device *dsilink);
 void nova_dsilink_disable(struct dsilink_device *dsilink);
@@ -192,8 +206,10 @@ int nova_dsilink_update_frame_parameters(struct dsilink_device *dsilink,
 				struct dsilink_video_mode *vmode, u8 bpp,
 						u8 pixel_mode, u8 rgb_header);
 void nova_dsilink_set_clk_continous(struct dsilink_device *dsilink, bool on);
+void nova_dsilink_enable_video_mode(struct dsilink_device *dsilink, bool en);
 int nova_dsilink_enter_ulpm(struct dsilink_device *dsilink);
 int nova_dsilink_exit_ulpm(struct dsilink_device *dsilink);
+int nova_dsilink_force_stop(struct dsilink_device *dsilink);
 struct dsilink_device *nova_dsilink_get(int link_id);
 void nova_dsilink_put(struct dsilink_device *dsilink);
 #endif

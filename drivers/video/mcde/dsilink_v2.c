@@ -49,108 +49,138 @@ static u8 handle_irq(u8 *io)
 		/* DSI TE polling answer received */
 		ret |= DSILINK_IRQ_TRIGGER;
 
+	if (irq_status &
+		DSI_DIRECT_CMD_STS_FLAG_ACKNOWLEDGE_WITH_ERR_RECEIVED_FLAG_MASK)
+		ret |= DSILINK_IRQ_ACK_WITH_ERR;
+
 	dsi_wreg(io, DSI_DIRECT_CMD_STS_CLR, irq_status);
 
 	irq_status = dsi_rreg(io, DSI_CMD_MODE_STS_FLAG);
 	if (irq_status & DSI_CMD_MODE_STS_FLAG_ERR_NO_TE_FLAG_MASK)
 		ret |= DSILINK_IRQ_NO_TE;
 
+	if (irq_status & DSI_CMD_MODE_STS_FLAG_ERR_TE_MISS_FLAG_MASK)
+		ret |= DSILINK_IRQ_TE_MISS;
+
 	dsi_wreg(io, DSI_CMD_MODE_STS_CLR, irq_status);
+
+	irq_status = dsi_rreg(io, DSI_VID_MODE_STS_FLAG);
+	dsi_wreg(io, DSI_VID_MODE_STS_CLR, irq_status);
+	if (irq_status & DSI_VID_MODE_STS_FLAG_ERR_MISSING_VSYNC_FLAG_MASK)
+		ret |= DSILINK_IRQ_MISSING_VSYNC;
 
 	return ret;
 }
 
 static int write(u8 *io, struct device *dev, enum dsilink_cmd_datatype type,
-						u8 cmd, u8 *data, int len)
+					u8 dcs_cmd, u8 *data, int data_len)
 {
 	int i, ret = 0;
 	u32 wrdat[4] = { 0, 0, 0, 0 };
-	u32 settings;
-	u32 counter = DSI_WRITE_CMD_TIMEOUT_MS;
+	u32 settings, pck_len, loop_counter;
+	const u32 loop_delay_us = 10 /* us */;
 
-	if (len > DSILINK_MAX_DSI_DIRECT_CMD_WRITE)
+	if (data_len < 0)
 		return -EINVAL;
 
+	/* Setup packet data and length */
 	if (type == DSILINK_CMD_DCS_WRITE) {
-		wrdat[0] = cmd;
-		for (i = 1; i <= len; i++)
+		pck_len = data_len + 1;
+		if (pck_len > DSILINK_MAX_DSI_DIRECT_CMD_WRITE)
+			return -EINVAL;
+		wrdat[0] = dcs_cmd;
+		for (i = 1; i <= data_len; i++)
 			wrdat[i>>2] |= ((u32)data[i-1] << ((i & 3) * 8));
 	} else if (type == DSILINK_CMD_GENERIC_WRITE) {
-		/* no explicit cmd byte for generic_write, only params */
-		for (i = 0; i < len; i++)
+		pck_len = data_len;
+		if (pck_len > DSILINK_MAX_DSI_DIRECT_CMD_WRITE)
+			return -EINVAL;
+		for (i = 0; i < data_len; i++)
 			wrdat[i>>2] |= ((u32)data[i] << ((i & 3) * 8));
 	} else if (type == DSILINK_CMD_SET_MAX_PKT_SIZE) {
-		wrdat[0] = cmd;
+		pck_len = 2;
+		if (data_len != 2)
+			return -EINVAL;
+		wrdat[0] = data[0] | ((u32)data[1] << 8);
+	} else {
+		pck_len = 0;
 	}
 
+	/* Setup command */
 	settings = DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_NAT_ENUM(WRITE) |
-		DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_LONGNOTSHORT(len > 1) |
+		DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_LONGNOTSHORT(pck_len > 2) |
 		DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_ID(0) |
-		DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_SIZE(len+1) |
+		DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_SIZE(pck_len) |
 		DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_LP_EN(true);
-	if (type == DSILINK_CMD_DCS_WRITE) {
-		if (len == 0)
+
+	switch (type) {
+	case DSILINK_CMD_DCS_WRITE:
+		if (data_len == 0)
 			settings |= DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_HEAD_ENUM(
-				DCS_SHORT_WRITE_0);
-		else if (len == 1)
+							DCS_SHORT_WRITE_0);
+		else if (data_len == 1)
 			settings |= DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_HEAD_ENUM(
-				DCS_SHORT_WRITE_1);
+							DCS_SHORT_WRITE_1);
 		else
 			settings |= DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_HEAD_ENUM(
-				DCS_LONG_WRITE);
-	} else if (type == DSILINK_CMD_GENERIC_WRITE) {
-		if (len == 0)
+							DCS_LONG_WRITE);
+		break;
+	case DSILINK_CMD_GENERIC_WRITE:
+		if (pck_len == 0)
 			settings |= DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_HEAD_ENUM(
-				GENERIC_SHORT_WRITE_0);
-		else if (len == 1)
+							GENERIC_SHORT_WRITE_0);
+		else if (pck_len == 1)
 			settings |= DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_HEAD_ENUM(
-				GENERIC_SHORT_WRITE_1);
-		else if (len == 2)
+							GENERIC_SHORT_WRITE_1);
+		else if (pck_len == 2)
 			settings |= DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_HEAD_ENUM(
-				GENERIC_SHORT_WRITE_2);
+							GENERIC_SHORT_WRITE_2);
 		else
 			settings |= DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_HEAD_ENUM(
-				GENERIC_LONG_WRITE);
-	} else if (type == DSILINK_CMD_SET_MAX_PKT_SIZE) {
+							GENERIC_LONG_WRITE);
+		break;
+	case DSILINK_CMD_SET_MAX_PKT_SIZE:
 		settings |= DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_HEAD_ENUM(
 							SET_MAX_PKT_SIZE);
+		break;
+	case DSILINK_CMD_TURN_ON_PERIPHERAL:
+		settings |= DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_HEAD_ENUM(
+							TURN_ON_PERIPHERAL);
+		break;
+	case DSILINK_CMD_SHUT_DOWN_PERIPHERAL:
+		settings |= DSI_DIRECT_CMD_MAIN_SETTINGS_CMD_HEAD_ENUM(
+							SHUT_DOWN_PERIPHERAL);
+		break;
+	default:
+		return -EINVAL;
 	}
 
 	dsi_wreg(io, DSI_DIRECT_CMD_MAIN_SETTINGS, settings);
 	dsi_wreg(io, DSI_DIRECT_CMD_WRDAT0, wrdat[0]);
-	if (len >  3)
+	if (pck_len >  4)
 		dsi_wreg(io, DSI_DIRECT_CMD_WRDAT1, wrdat[1]);
-	if (len >  7)
+	if (pck_len >  8)
 		dsi_wreg(io, DSI_DIRECT_CMD_WRDAT2, wrdat[2]);
-	if (len > 11)
+	if (pck_len > 12)
 		dsi_wreg(io, DSI_DIRECT_CMD_WRDAT3, wrdat[3]);
 
 	dsi_wreg(io, DSI_DIRECT_CMD_STS_CLR, ~0);
 	dsi_wreg(io, DSI_CMD_MODE_STS_CLR, ~0);
 	dsi_wreg(io, DSI_DIRECT_CMD_SEND, true);
 
-	/* loop will normally run zero or one time until WRITE_COMPLETED */
+	loop_counter = DSI_WRITE_CMD_TIMEOUT_MS * 1000 / loop_delay_us;
 	while (!dsi_rfld(io, DSI_DIRECT_CMD_STS, WRITE_COMPLETED)
-			&& --counter)
-		cpu_relax();
+							&& --loop_counter)
+		usleep_range(loop_delay_us, (loop_delay_us * 3) / 2);
 
-	if (!counter) {
-		dev_err(dev,
-			"%s: DSI write cmd 0x%x timeout!\n",
-			__func__, cmd);
+	if (!loop_counter) {
+		dev_err(dev, "%s: DSI write cmd 0x%x timeout!\n", __func__,
+								dcs_cmd);
 		ret = -ETIME;
 	} else {
-		/* inform if >100 loops before command completion */
-		if (counter <
-			(DSI_WRITE_CMD_TIMEOUT_MS-DSI_WRITE_CMD_TIMEOUT_MS/10))
-			dev_vdbg(dev,
-				"%s: %u loops for DSI command %x completion\n",
-				__func__, (DSI_WRITE_CMD_TIMEOUT_MS - counter),
-				cmd);
-
 		dev_vdbg(dev, "DSI Write ok %x error %x\n",
-			dsi_rreg(io, DSI_DIRECT_CMD_STS_FLAG),
-			dsi_rreg(io, DSI_CMD_MODE_STS_FLAG));
+					dsi_rreg(io, DSI_DIRECT_CMD_STS_FLAG),
+					dsi_rreg(io, DSI_CMD_MODE_STS_FLAG));
 	}
 
 	return ret;
@@ -170,9 +200,15 @@ static void te_request(u8 *io)
 	dsi_wreg(io, DSI_DIRECT_CMD_STS_CLR,
 		DSI_DIRECT_CMD_STS_CLR_TE_RECEIVED_CLR(true));
 	dsi_wfld(io, DSI_DIRECT_CMD_STS_CTL, TE_RECEIVED_EN, true);
+	dsi_wreg(io, DSI_DIRECT_CMD_STS_CLR,
+		DSI_DIRECT_CMD_STS_CLR_ACKNOWLEDGE_WITH_ERR_RECEIVED_CLR(true));
+	dsi_wfld(io, DSI_DIRECT_CMD_STS_CTL, ACKNOWLEDGE_WITH_ERR_EN, true);
 	dsi_wreg(io, DSI_CMD_MODE_STS_CLR,
 		DSI_CMD_MODE_STS_CLR_ERR_NO_TE_CLR(true));
 	dsi_wfld(io, DSI_CMD_MODE_STS_CTL, ERR_NO_TE_EN, true);
+	dsi_wreg(io, DSI_CMD_MODE_STS_CLR,
+		DSI_CMD_MODE_STS_CLR_ERR_TE_MISS_CLR(true));
+	dsi_wfld(io, DSI_CMD_MODE_STS_CTL, ERR_TE_MISS_EN, true);
 	dsi_wreg(io, DSI_DIRECT_CMD_SEND, true);
 }
 
@@ -229,7 +265,20 @@ static int read(u8 *io, struct device *dev, u8 cmd, u32 *data, int *len)
 			memcpy(data, &rddat, *len);
 		}
 	} else {
-		ret = -EIO;
+		u8 dat1_status;
+		u32 sts;
+
+		sts = dsi_rreg(io, DSI_DIRECT_CMD_STS);
+		dat1_status = dsi_rfld(io, DSI_MCTL_LANE_STS, DATLANE1_STATE);
+		dev_err(dev, "DCS read failed, err=%d, D0 state %d sts %X\n",
+						error, dat1_status, sts);
+		dsi_wreg(io, DSI_DIRECT_CMD_RD_INIT, true);
+		/* If dat1 is still in read to a force stop */
+		if (dat1_status == DSILINK_LANE_STATE_READ ||
+						sts == DSI_CMD_TRANSMISSION)
+			ret = -EAGAIN;
+		else
+			ret = -EIO;
 	}
 
 	dsi_wreg(io, DSI_CMD_MODE_STS_CLR, ~0);
@@ -241,8 +290,10 @@ static int read(u8 *io, struct device *dev, u8 cmd, u32 *data, int *len)
 static void force_stop(u8 *io)
 {
 	dsi_wfld(io, DSI_MCTL_MAIN_PHY_CTL, FORCE_STOP_MODE, true);
-	usleep_range(20, 20);
+	dsi_wfld(io, DSI_MCTL_MAIN_PHY_CTL, CLOCK_FORCE_STOP_MODE, true);
+	udelay(20);
 	dsi_wfld(io, DSI_MCTL_MAIN_PHY_CTL, FORCE_STOP_MODE, false);
+	dsi_wfld(io, DSI_MCTL_MAIN_PHY_CTL, CLOCK_FORCE_STOP_MODE, false);
 }
 
 static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
@@ -275,7 +326,7 @@ static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
 		DSI_MCTL_MAIN_PHY_CTL_DAT1_ULPM_EN(true) |
 		DSI_MCTL_MAIN_PHY_CTL_DAT2_ULPM_EN(true) |
 		DSI_MCTL_MAIN_PHY_CTL_CLK_CONTINUOUS(
-			port->phy.clk_cont));
+			false));
 	dsi_wreg(io, DSI_MCTL_ULPOUT_TIME,
 		DSI_MCTL_ULPOUT_TIME_CKLANE_ULPOUT_TIME(1) |
 		DSI_MCTL_ULPOUT_TIME_DATA_ULPOUT_TIME(1));
@@ -287,6 +338,7 @@ static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
 		DSI_MCTL_DPHY_TIMEOUT_CLK_DIV(0xf) |
 		DSI_MCTL_DPHY_TIMEOUT_HSTX_TO_VAL(0x3fff) |
 		DSI_MCTL_DPHY_TIMEOUT_LPRX_TO_VAL(0x3fff));
+	dsi_wfld(io, DSI_CMD_MODE_CTL, FIL_VALUE, 0x00);
 	dsi_wfld(io, DSI_CMD_MODE_CTL, ARB_MODE, false);
 	dsi_wfld(io, DSI_CMD_MODE_CTL, ARB_PRI, false);
 	dsi_wreg(io, DSI_MCTL_MAIN_EN,
@@ -353,17 +405,19 @@ static int enable(u8 *io, struct device *dev, const struct dsilink_port *port,
 
 		/* 1: if1 in video mode, 0: if1 in command mode */
 		dsi_wfld(io, DSI_MCTL_MAIN_DATA_CTL, IF1_MODE, 1);
+		dsi_wfld(io, DSI_CMD_MODE_CTL, IF1_LP_EN, false);
 
-		/* 1: enables the link, 0: disables the link */
-		dsi_wfld(io, DSI_MCTL_MAIN_DATA_CTL, VID_EN, 1);
-	} else {
+		/* enable error interrupts */
+		dsi_wfld(io, DSI_VID_MODE_STS_CTL, ERR_MISSING_VSYNC_EN, true);
+	} else
 		dsi_wfld(io, DSI_CMD_MODE_CTL, IF1_ID, 0);
-	}
+
 	return 0;
 }
 
 static void disable(u8 *io)
 {
+	dsi_wfld(io, DSI_VID_MODE_STS_CTL, ERR_MISSING_VSYNC_EN, false);
 }
 
 static int update_frame_parameters(u8 *io, struct dsilink_video_mode *vmode,
@@ -380,6 +434,9 @@ static int update_frame_parameters(u8 *io, struct dsilink_video_mode *vmode,
 	dsi_wfld(io, DSI_VID_HSIZE2, RGB_SIZE, vmode->xres * bpp);
 	dsi_wfld(io, DSI_VID_MAIN_CTL, VID_PIXEL_MODE, vid_regs->pixel_mode);
 	dsi_wfld(io, DSI_VID_MAIN_CTL, HEADER, vid_regs->rgb_header);
+	dsi_wfld(io, DSI_VID_MAIN_CTL, RECOVERY_MODE, 1);
+	dsi_wfld(io, DSI_TVG_IMG_SIZE, TVG_NBLINE, vmode->yres);
+	dsi_wfld(io, DSI_TVG_IMG_SIZE, TVG_LINE_SIZE, vmode->xres * bpp);
 
 	if (vid_regs->tvg_enable) {
 		/*
@@ -394,9 +451,6 @@ static int update_frame_parameters(u8 *io, struct dsilink_video_mode *vmode,
 		dsi_wfld(io, DSI_TVG_CTL, TVG_STOPMODE, 2);
 		dsi_wfld(io, DSI_TVG_CTL, TVG_RUN, 1);
 
-		dsi_wfld(io, DSI_TVG_IMG_SIZE, TVG_NBLINE, vmode->yres);
-		dsi_wfld(io, DSI_TVG_IMG_SIZE, TVG_LINE_SIZE,
-							vmode->xres * bpp);
 		dsi_wfld(io, DSI_TVG_COLOR1, COL1_BLUE, 0);
 		dsi_wfld(io, DSI_TVG_COLOR1, COL1_GREEN, 0);
 		dsi_wfld(io, DSI_TVG_COLOR1, COL1_RED, 0xFF);
@@ -423,8 +477,7 @@ static int update_frame_parameters(u8 *io, struct dsilink_video_mode *vmode,
 		dsi_wfld(io, DSI_VID_VCA_SETTING2, EXACT_BURST_LIMIT,
 							vid_regs->blkeol_pck);
 	}
-	if (vid_regs->sync_is_pulse)
-		dsi_wfld(io, DSI_VID_VCA_SETTING2, MAX_LINE_LIMIT,
+	dsi_wfld(io, DSI_VID_VCA_SETTING2, MAX_LINE_LIMIT,
 						vid_regs->blkline_pck - 6);
 
 	return 0;
@@ -433,6 +486,11 @@ static int update_frame_parameters(u8 *io, struct dsilink_video_mode *vmode,
 static void set_clk_continous(u8 *io, bool value)
 {
 	dsi_wfld(io, DSI_MCTL_MAIN_PHY_CTL, CLK_CONTINUOUS, value);
+}
+
+static void enable_video_mode(u8 *io, bool enable)
+{
+	dsi_wfld(io, DSI_MCTL_MAIN_DATA_CTL, VID_EN, enable);
 }
 
 static int handle_ulpm(u8 *io, struct device *dev,
@@ -505,7 +563,7 @@ static int handle_ulpm(u8 *io, struct device *dev,
 	return ret;
 }
 
-void __init nova_dsilink_v2_init(struct dsilink_ops *ops)
+void __devinit nova_dsilink_v2_init(struct dsilink_ops *ops)
 {
 	ops->force_stop = force_stop;
 	ops->read = read;
@@ -517,6 +575,7 @@ void __init nova_dsilink_v2_init(struct dsilink_ops *ops)
 	ops->disable = disable;
 	ops->update_frame_parameters = update_frame_parameters;
 	ops->set_clk_continous = set_clk_continous;
+	ops->enable_video_mode = enable_video_mode;
 	ops->handle_ulpm = handle_ulpm;
 }
 

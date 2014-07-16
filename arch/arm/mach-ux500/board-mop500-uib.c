@@ -23,6 +23,9 @@ enum mop500_uib {
 	STUIB,
 	U8500UIB,
 	U8500UIB_R3,
+	U9540UIBS_V1,
+	U9540UIBS_V2,
+	U9540UIBT_V1,
 };
 
 struct uib {
@@ -48,6 +51,21 @@ static struct uib __initdata mop500_uibs[] = {
 		.name   = "U8500-UIBR3",
 		.option = "u8500uibr3",
 		.init   = mop500_u8500uib_r3_init,
+	},
+	[U9540UIBS_V1] = {
+		.name   = "U9540-UIBS_V1",
+		.option = "u9540uibs_v1",
+		.init   = mop500_u9540uibs_v1_init,
+	},
+	[U9540UIBS_V2] = {
+		.name   = "U9540-UIBS_V2",
+		.option = "u9540uibs_v2",
+		.init   = mop500_u9540uibs_v2_init,
+	},
+	[U9540UIBT_V1] = {
+		.name   = "U9540-UIBT_V1",
+		.option = "u9540uibt_v1",
+		.init   = mop500_u9540uibt_v1_init,
 	},
 };
 
@@ -110,6 +128,12 @@ static void __init __mop500_uib_init(struct uib *uib, const char *why)
 		type_of_uib = U8500UIB;
 	else if (strcmp("u8500uibr3", uib->option) == 0)
 		type_of_uib = U8500UIB_R3;
+	else if (strcmp("u9540uibs_v1", uib->option) == 0)
+		type_of_uib = U9540UIBS_V1;
+	else if (strcmp("u9540uibs_v2", uib->option) == 0)
+		type_of_uib = U9540UIBS_V2;
+	else if (strcmp("u9540uibt_v1", uib->option) == 0)
+		type_of_uib = U9540UIBT_V1;
 
 	uib->init();
 }
@@ -127,6 +151,31 @@ int uib_is_u8500uib(void)
 int uib_is_u8500uibr3(void)
 {
 	return (type_of_uib == U8500UIB_R3);
+}
+
+int uib_is_u9540uibs_v1(void)
+{
+	return (type_of_uib == U9540UIBS_V1);
+}
+
+int uib_is_u9540uibs_v2(void)
+{
+	return (type_of_uib == U9540UIBS_V2);
+}
+
+int uib_is_u9540uibt_v1(void)
+{
+	return (type_of_uib == U9540UIBT_V1);
+}
+
+int uib_is_u9540uibs(void)
+{
+	return uib_is_u9540uibs_v1() || uib_is_u9540uibs_v2();
+}
+
+int uib_is_u9540uibt(void)
+{
+	return uib_is_u9540uibt_v1();
 }
 
 
@@ -228,6 +277,12 @@ int mop500_get_acc_id(void)
 		pr_err("failed to get i2c adapter\n");
 		return -1;
 	}
+#if defined(CONFIG_MACH_BAMBOOK)
+    status = i2c_smbus_xfer(i2c2, 0x19 , 0 ,
+            I2C_SMBUS_READ, 0x0F ,
+            I2C_SMBUS_BYTE_DATA, &data);
+
+#else
 	status = i2c_smbus_xfer(i2c2, 0x18 , 0 ,
 			I2C_SMBUS_READ, 0x0F ,
 			I2C_SMBUS_BYTE_DATA, &data);
@@ -236,6 +291,7 @@ int mop500_get_acc_id(void)
 				I2C_SMBUS_READ, 0x0F ,
 				I2C_SMBUS_BYTE_DATA, &data);
 	}
+#endif    
 	i2c_put_adapter(i2c2);
 	return (status < 0) ? status : data.byte;
 }
@@ -250,16 +306,16 @@ static struct platform_device *mop500_uib_platform_devs[] __initdata = {
 /*
  * Detect the UIB attached based on the presence or absence of i2c devices.
  */
-static int __init mop500_uib_init(void)
+static int __init u8500_uib_init(void)
 {
 	struct uib *uib = mop500_uibs;
 	struct i2c_adapter *i2c0;
 	struct i2c_adapter *i2c3;
 	int ret;
 
-	if (!cpu_is_u8500())
-		return -ENODEV;
-
+#if defined(CONFIG_MACH_BAMBOOK)
+    uib = &mop500_uibs[U8500UIB];
+#else
 	i2c0 = i2c_get_adapter(0);
 	if (!i2c0) {
 		__mop500_uib_init(&mop500_uibs[STUIB],
@@ -293,6 +349,7 @@ static int __init mop500_uib_init(void)
 		if (ret == 0)
 			uib = &mop500_uibs[STUIB];
 	}
+#endif
 	__mop500_uib_init(uib, "detected");
 	mop500_gpio_keys_init();
 	platform_add_devices(mop500_uib_platform_devs,
@@ -300,4 +357,130 @@ static int __init mop500_uib_init(void)
 	return 0;
 }
 
+static bool __init u9540_uib_is_connected(void)
+{
+	struct i2c_adapter *i2c2;
+	int ret;
+
+	i2c2 = i2c_get_adapter(2);
+	if (i2c2 == NULL)
+		return false;
+
+	/* try to talk to light sensor on the UIB... */
+	ret = i2c_smbus_xfer(i2c2, 0x29, 0, I2C_SMBUS_WRITE, 0,
+			I2C_SMBUS_QUICK, NULL);
+	i2c_put_adapter(i2c2);
+	return (ret == 0);
+}
+
+#define U9540_UIB_REV_PIN0 MOP500_EGPIO(8)
+#define U9540_UIB_REV_PIN1 MOP500_EGPIO(9)
+#define U9540_UIB_REV_PIN2 MOP500_EGPIO(10)
+#define U9540_UIB_REV_PIN3 MOP500_EGPIO(11)
+
+static u8 __init u9540_uib_revision(void)
+{
+	u8 revision = 0xFF;
+	int ret;
+
+	if (!u9540_uib_is_connected())
+		return 0xFE;
+
+	ret = gpio_request(U9540_UIB_REV_PIN0, __func__);
+	if (ret < 0) {
+		pr_err("%s: failed to request UIB ID GPIO\n", __func__);
+		goto out;
+	}
+	ret = gpio_request(U9540_UIB_REV_PIN1, __func__);
+	if (ret < 0) {
+		pr_err("%s: failed to request UIB ID GPIO\n", __func__);
+		goto out_free_pin0;
+	}
+	ret = gpio_request(U9540_UIB_REV_PIN2, __func__);
+	if (ret < 0) {
+		pr_err("%s: failed to request UIB ID GPIO\n", __func__);
+		goto out_free_pin1;
+	}
+	ret = gpio_request(U9540_UIB_REV_PIN3, __func__);
+	if (ret < 0) {
+		pr_err("%s: failed to request UIB ID GPIO\n", __func__);
+		goto out_free_pin2;
+	}
+
+	ret = gpio_direction_input(U9540_UIB_REV_PIN0);
+	if (ret < 0) {
+		pr_err("%s: failed to configure UIB ID GPIO\n", __func__);
+		goto out_free_pin3;
+	}
+	ret = gpio_direction_input(U9540_UIB_REV_PIN1);
+	if (ret < 0) {
+		pr_err("%s: failed to configure UIB ID GPIO\n", __func__);
+		goto out_free_pin3;
+	}
+	ret = gpio_direction_input(U9540_UIB_REV_PIN2);
+	if (ret < 0) {
+		pr_err("%s: failed to configure UIB ID GPIO\n", __func__);
+		goto out_free_pin3;
+	}
+	ret = gpio_direction_input(U9540_UIB_REV_PIN3);
+	if (ret < 0) {
+		pr_err("%s: failed to configure UIB ID GPIO\n", __func__);
+		goto out_free_pin3;
+	}
+
+	revision = (!!gpio_get_value_cansleep(U9540_UIB_REV_PIN0)) |
+			(!!gpio_get_value_cansleep(U9540_UIB_REV_PIN1) << 1) |
+			(!!gpio_get_value_cansleep(U9540_UIB_REV_PIN2) << 2) |
+			(!!gpio_get_value_cansleep(U9540_UIB_REV_PIN3) << 3);
+
+out_free_pin3:
+	gpio_free(U9540_UIB_REV_PIN3);
+out_free_pin2:
+	gpio_free(U9540_UIB_REV_PIN2);
+out_free_pin1:
+	gpio_free(U9540_UIB_REV_PIN1);
+out_free_pin0:
+	gpio_free(U9540_UIB_REV_PIN0);
+out:
+	return revision;
+}
+
+static int __init u9540_uib_init(void)
+{
+	int result = 0;
+	u8 rev;
+
+	rev = u9540_uib_revision();
+	switch (rev) {
+	case 0x00:
+		__mop500_uib_init(&mop500_uibs[U9540UIBS_V1], "identified");
+		break;
+	case 0x01:
+		__mop500_uib_init(&mop500_uibs[U9540UIBT_V1], "identified");
+		break;
+	case 0x02:
+		__mop500_uib_init(&mop500_uibs[U9540UIBS_V2], "identified");
+		break;
+	case 0xFE:
+		pr_err("u9540 UIB is not connected\n");
+		result = -ENODEV;
+		break;
+	default:
+		pr_err("u9540 UIB 0x%02x not supported!\n", rev);
+		result = -ENODEV;
+		break;
+	}
+	return result;
+}
+
+static int __init mop500_uib_init(void)
+{
+	if (cpu_is_u8500())
+		return u8500_uib_init();
+	if (cpu_is_u9540())
+		return u9540_uib_init();
+
+	pr_err("unknown cpu!\n");
+	return -ENODEV;
+}
 module_init(mop500_uib_init);

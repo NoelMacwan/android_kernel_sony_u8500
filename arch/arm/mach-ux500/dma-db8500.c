@@ -12,13 +12,15 @@
 
 #include <plat/ste_dma40.h>
 
+#ifdef CONFIG_HSI
 #include <mach/hsi.h>
+#endif
 #include <mach/setup.h>
 #include <mach/ste-dma40-db8500.h>
 #include <mach/pm.h>
 #include <mach/context.h>
 
-
+#include "id.h"
 
 static struct resource u8500_dma40_resources[] = {
 	[0] = {
@@ -72,6 +74,32 @@ static struct resource u9540_dma40_resources[] = {
 	}
 };
 
+static struct resource u8540_dma40_resources[] = {
+	[0] = {
+		.start = U8500_DMA_BASE,
+		.end   = U8500_DMA_BASE + SZ_4K - 1,
+		.flags = IORESOURCE_MEM,
+		.name  = "base",
+	},
+	[1] = {
+		.start = U8540_DMA_LCPA_BASE,
+		.end   = U8540_DMA_LCPA_BASE + SZ_4K - 1,
+		.flags = IORESOURCE_MEM,
+		.name  = "lcpa",
+	},
+	[2] = {
+		.start = IRQ_DB8500_DMA,
+		.end   = IRQ_DB8500_DMA,
+		.flags = IORESOURCE_IRQ
+	},
+	[3] = {
+		.start = U8540_DMA_LCLA_BASE,
+		.end   = U8540_DMA_LCLA_BASE + SZ_8K + SZ_2K - 1,
+		.flags = IORESOURCE_MEM,
+		.name  = "lcla_esram",
+	}
+};
+
 /* Default configuration for physcial memcpy */
 static struct stedma40_chan_cfg dma40_memcpy_conf_phy = {
 	.mode = STEDMA40_MODE_PHYSICAL,
@@ -111,14 +139,14 @@ static struct stedma40_chan_cfg dma40_memcpy_conf_log = {
 static dma_addr_t dma40_rx_map[DB8500_DMA_NR_DEV] = {
 	[DB8500_DMA_DEV0_SPI0_RX] = 0,
 	[DB8500_DMA_DEV1_SD_MMC0_RX] = U8500_SDI0_BASE + SD_MMC_TX_RX_REG_OFFSET,
-	[DB8500_DMA_DEV2_SD_MMC1_RX] = U8500_SDI1_BASE + SD_MMC_TX_RX_REG_OFFSET,
+	[DB8500_DMA_DEV2_SD_MMC1_RX] = 0,
 	[DB8500_DMA_DEV3_SD_MMC2_RX] = 0,
 	[DB8500_DMA_DEV4_I2C1_RX] = 0,
 	[DB8500_DMA_DEV5_I2C3_RX] = 0,
 	[DB8500_DMA_DEV6_I2C2_RX] = 0,
 	[DB8500_DMA_DEV7_I2C4_RX] = 0,
-	[DB8500_DMA_DEV8_SSP0_RX] =  U8500_SSP0_BASE + SSP_TX_RX_REG_OFFSET,
-	[DB8500_DMA_DEV9_SSP1_RX] = 0,
+	[DB8500_DMA_DEV8_SSP0_RX] = U8500_SSP0_BASE + SSP_TX_RX_REG_OFFSET,
+	[DB8500_DMA_DEV9_SSP1_RX] = U8500_SSP1_BASE + SSP_TX_RX_REG_OFFSET,
 	[DB8500_DMA_DEV10_MCDE_RX] = 0,
 	[DB8500_DMA_DEV11_UART2_RX] = 0,
 	[DB8500_DMA_DEV12_UART1_RX] = 0,
@@ -129,16 +157,18 @@ static dma_addr_t dma40_rx_map[DB8500_DMA_NR_DEV] = {
 	[DB8500_DMA_DEV17_USB_OTG_IEP_6_14] = U8500_USBOTG_BASE,
 	[DB8500_DMA_DEV18_USB_OTG_IEP_5_13] = U8500_USBOTG_BASE,
 	[DB8500_DMA_DEV19_USB_OTG_IEP_4_12] = U8500_USBOTG_BASE,
+#ifdef CONFIG_HSI
 	[DB8500_DMA_DEV20_SLIM0_CH0_RX_HSI_RX_CH0] = U8500_HSIR_BASE + 0x0 + STE_HSI_RX_BUFFERX,
 	[DB8500_DMA_DEV21_SLIM0_CH1_RX_HSI_RX_CH1] = U8500_HSIR_BASE + 0x4 + STE_HSI_RX_BUFFERX,
 	[DB8500_DMA_DEV22_SLIM0_CH2_RX_HSI_RX_CH2] = U8500_HSIR_BASE + 0x8 + STE_HSI_RX_BUFFERX,
 	[DB8500_DMA_DEV23_SLIM0_CH3_RX_HSI_RX_CH3] = U8500_HSIR_BASE + 0xC + STE_HSI_RX_BUFFERX,
+#endif
 	[DB8500_DMA_DEV24_SRC_SXA0_RX_TX] = 0,
 	[DB8500_DMA_DEV25_SRC_SXA1_RX_TX] = 0,
 	[DB8500_DMA_DEV26_SRC_SXA2_RX_TX] = 0,
 	[DB8500_DMA_DEV27_SRC_SXA3_RX_TX] = 0,
 	[DB8500_DMA_DEV28_SD_MM2_RX] = U8500_SDI2_BASE + SD_MMC_TX_RX_REG_OFFSET,
-	[DB8500_DMA_DEV29_SD_MM0_RX] = 0,
+	[DB8500_DMA_DEV29_SD_MM0_RX] = U8500_SDI0_BASE + SD_MMC_TX_RX_REG_OFFSET,
 	[DB8500_DMA_DEV30_MSP3_RX] = U8500_MSP3_BASE + MSP_TX_RX_REG_OFFSET,
 	[DB8500_DMA_DEV31_MSP0_RX_SLIM0_CH0_RX] = U8500_MSP0_BASE + MSP_TX_RX_REG_OFFSET,
 	[DB8500_DMA_DEV32_SD_MM1_RX] = U8500_SDI1_BASE + SD_MMC_TX_RX_REG_OFFSET,
@@ -150,7 +180,7 @@ static dma_addr_t dma40_rx_map[DB8500_DMA_NR_DEV] = {
 	[DB8500_DMA_DEV38_USB_OTG_IEP_1_9] = U8500_USBOTG_BASE,
 	[DB8500_DMA_DEV39_USB_OTG_IEP_8] = U8500_USBOTG_BASE,
 	[DB8500_DMA_DEV40_SPI3_RX] = 0,
-	[DB8500_DMA_DEV41_SD_MM3_RX] = U8500_SDI3_BASE + SD_MMC_TX_RX_REG_OFFSET,
+	[DB8500_DMA_DEV41_SD_MM3_RX] = 0,
 	[DB8500_DMA_DEV42_SD_MM4_RX] = U8500_SDI4_BASE + SD_MMC_TX_RX_REG_OFFSET,
 	[DB8500_DMA_DEV43_SD_MM5_RX] = 0,
 	[DB8500_DMA_DEV44_SRC_SXA4_RX_TX] = 0,
@@ -166,20 +196,25 @@ static dma_addr_t dma40_rx_map[DB8500_DMA_NR_DEV] = {
 	/* 56, 57, 58, 59 and 60 are not used */
 	[DB8500_DMA_DEV61_CAC0_RX] = 0,
 	/* 62 and 63 are not used */
+	[DB8540_DMA_DEV64_I2C5_RX] = 0,
+	[DB8540_DMA_DEV65_I2C6_RX] = 0,
+	[DB8540_DMA_DEV66_MSP4_RX] = 0,
+	[DB8540_DMA_DEV67_UART3_RX] = 0,
+	[DB8540_DMA_DEV68_UART4_RX] = 0,
 };
 
 /* Mapping between destination event lines and physical device address */
 static const dma_addr_t dma40_tx_map[DB8500_DMA_NR_DEV] = {
 	[DB8500_DMA_DEV0_SPI0_TX] = 0,
 	[DB8500_DMA_DEV1_SD_MMC0_TX] = U8500_SDI0_BASE + SD_MMC_TX_RX_REG_OFFSET,
-	[DB8500_DMA_DEV2_SD_MMC1_TX] = U8500_SDI1_BASE + SD_MMC_TX_RX_REG_OFFSET,
+	[DB8500_DMA_DEV2_SD_MMC1_TX] = 0,
 	[DB8500_DMA_DEV3_SD_MMC2_TX] = 0,
 	[DB8500_DMA_DEV4_I2C1_TX] = 0,
 	[DB8500_DMA_DEV5_I2C3_TX] = 0,
 	[DB8500_DMA_DEV6_I2C2_TX] = 0,
 	[DB8500_DMA_DEV7_I2C4_TX] = 0,
 	[DB8500_DMA_DEV8_SSP0_TX] = U8500_SSP0_BASE + SSP_TX_RX_REG_OFFSET,
-	[DB8500_DMA_DEV9_SSP1_TX] = 0,
+	[DB8500_DMA_DEV9_SSP1_TX] = U8500_SSP1_BASE + SSP_TX_RX_REG_OFFSET,
 	/* 10 is not used*/
 	[DB8500_DMA_DEV11_UART2_TX] = 0,
 	[DB8500_DMA_DEV12_UART1_TX] = 0,
@@ -190,16 +225,18 @@ static const dma_addr_t dma40_tx_map[DB8500_DMA_NR_DEV] = {
 	[DB8500_DMA_DEV17_USB_OTG_OEP_6_14] = U8500_USBOTG_BASE,
 	[DB8500_DMA_DEV18_USB_OTG_OEP_5_13] = U8500_USBOTG_BASE,
 	[DB8500_DMA_DEV19_USB_OTG_OEP_4_12] = U8500_USBOTG_BASE,
+#ifdef CONFIG_HSI
 	[DB8500_DMA_DEV20_SLIM0_CH0_TX_HSI_TX_CH0] = U8500_HSIT_BASE + 0x0 + STE_HSI_TX_BUFFERX,
 	[DB8500_DMA_DEV21_SLIM0_CH1_TX_HSI_TX_CH1] = U8500_HSIT_BASE + 0x4 + STE_HSI_TX_BUFFERX,
 	[DB8500_DMA_DEV22_SLIM0_CH2_TX_HSI_TX_CH2] = U8500_HSIT_BASE + 0x8 + STE_HSI_TX_BUFFERX,
 	[DB8500_DMA_DEV23_SLIM0_CH3_TX_HSI_TX_CH3] = U8500_HSIT_BASE + 0xC + STE_HSI_TX_BUFFERX,
+#endif
 	[DB8500_DMA_DEV24_DST_SXA0_RX_TX] = 0,
 	[DB8500_DMA_DEV25_DST_SXA1_RX_TX] = 0,
 	[DB8500_DMA_DEV26_DST_SXA2_RX_TX] = 0,
 	[DB8500_DMA_DEV27_DST_SXA3_RX_TX] = 0,
 	[DB8500_DMA_DEV28_SD_MM2_TX] = U8500_SDI2_BASE + SD_MMC_TX_RX_REG_OFFSET,
-	[DB8500_DMA_DEV29_SD_MM0_TX] = 0,
+	[DB8500_DMA_DEV29_SD_MM0_TX] = U8500_SDI0_BASE + SD_MMC_TX_RX_REG_OFFSET,
 	[DB8500_DMA_DEV30_MSP1_TX] = U8500_MSP1_BASE + MSP_TX_RX_REG_OFFSET,
 	[DB8500_DMA_DEV31_MSP0_TX_SLIM0_CH0_TX] = U8500_MSP0_BASE + MSP_TX_RX_REG_OFFSET,
 	[DB8500_DMA_DEV32_SD_MM1_TX] = U8500_SDI1_BASE + SD_MMC_TX_RX_REG_OFFSET,
@@ -211,7 +248,7 @@ static const dma_addr_t dma40_tx_map[DB8500_DMA_NR_DEV] = {
 	[DB8500_DMA_DEV38_USB_OTG_OEP_1_9] = U8500_USBOTG_BASE,
 	[DB8500_DMA_DEV39_USB_OTG_OEP_8] = U8500_USBOTG_BASE,
 	[DB8500_DMA_DEV40_SPI3_TX] = 0,
-	[DB8500_DMA_DEV41_SD_MM3_TX] = U8500_SDI3_BASE + SD_MMC_TX_RX_REG_OFFSET,
+	[DB8500_DMA_DEV41_SD_MM3_TX] = 0,
 	[DB8500_DMA_DEV42_SD_MM4_TX] = U8500_SDI4_BASE + SD_MMC_TX_RX_REG_OFFSET,
 	[DB8500_DMA_DEV43_SD_MM5_TX] = 0,
 	[DB8500_DMA_DEV44_DST_SXA4_RX_TX] = 0,
@@ -234,6 +271,11 @@ static const dma_addr_t dma40_tx_map[DB8500_DMA_NR_DEV] = {
 	[DB8500_DMA_DEV61_CAC0_TX] = 0,
 	[DB8500_DMA_DEV62_CAC0_TX_HAC0_TX] = 0,
 	[DB8500_DMA_DEV63_HAC0_TX] = 0,
+	[DB8540_DMA_DEV64_I2C5_TX] = 0,
+	[DB8540_DMA_DEV65_I2C6_TX] = 0,
+	[DB8540_DMA_DEV66_MSP4_TX] = 0,
+	[DB8540_DMA_DEV67_UART3_TX] = 0,
+	[DB8540_DMA_DEV68_UART4_TX] = 0,
 };
 
 /* Reserved event lines for memcpy only */
@@ -260,6 +302,7 @@ static struct stedma40_platform_data dma40_plat_data = {
 	/* Physical channels for which HW LLI should not be used */
 	.soft_lli_chans = NULL,
 	.num_of_soft_lli_chans = 0,
+	.num_of_phy_chans = 0,
 };
 
 #ifdef CONFIG_DBX500_CONTEXT
@@ -301,6 +344,9 @@ static void dma_context_notifier_init(void)
 	if (cpu_is_u9540())
 		base = ioremap(u9540_dma40_resources[0].start,
 			resource_size(&u9540_dma40_resources[0]));
+	else if (cpu_is_u8540())
+		base = ioremap(u8540_dma40_resources[0].start,
+			resource_size(&u8540_dma40_resources[0]));
 	else
 		base = ioremap(u8500_dma40_resources[0].start,
 			resource_size(&u8500_dma40_resources[0]));
@@ -319,7 +365,7 @@ static struct platform_device u8500_dma40_device = {
 	.dev = {
 		.platform_data = &dma40_plat_data,
 #ifdef CONFIG_PM
-		.pwr_domain = &ux500_dev_power_domain,
+		.pm_domain = &ux500_dev_power_domain,
 #endif
 	},
 	.name		= "dma40",
@@ -332,7 +378,7 @@ static struct platform_device u9540_dma40_device = {
 	.dev = {
 		.platform_data = &dma40_plat_data,
 #ifdef CONFIG_PM
-		.pwr_domain = &ux500_dev_power_domain,
+		.pm_domain = &ux500_dev_power_domain,
 #endif
 	},
 	.name		= "dma40",
@@ -341,17 +387,36 @@ static struct platform_device u9540_dma40_device = {
 	.resource	= u9540_dma40_resources
 };
 
+static struct platform_device u8540_dma40_device = {
+	.dev = {
+		.platform_data = &dma40_plat_data,
+#ifdef CONFIG_PM
+		.pm_domain = &ux500_dev_power_domain,
+#endif
+	},
+	.name		= "dma40",
+	.id		= 0,
+	.num_resources	= ARRAY_SIZE(u8540_dma40_resources),
+	.resource	= u8540_dma40_resources
+};
+
 void __init db8500_dma_init(void)
 {
 	int ret;
 
 	if (cpu_is_u9540()) {
+		dma40_plat_data.num_of_phy_chans = 10;
 		ret = platform_device_register(&u9540_dma40_device);
 		if (ret)
 			dev_err(&u9540_dma40_device.dev, "unable to register device: %d\n",
 				ret);
-	}
-	else {
+	} else if (cpu_is_u8540()) {
+		dma40_plat_data.num_of_phy_chans = 14;
+		ret = platform_device_register(&u8540_dma40_device);
+		if (ret)
+			dev_err(&u8540_dma40_device.dev, "unable to register device: %d\n",
+				ret);
+	} else {
 		ret = platform_device_register(&u8500_dma40_device);
 		if (ret)
 			dev_err(&u8500_dma40_device.dev, "unable to register device: %d\n",

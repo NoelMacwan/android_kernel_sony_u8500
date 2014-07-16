@@ -8,13 +8,10 @@
 #include <linux/spinlock.h>
 #include <linux/bitops.h>
 #include <linux/pasr.h>
+#include <linux/device.h>
+#include <linux/err.h>
 
 #include "helper.h"
-
-enum pasr_state {
-	PASR_REFRESH,
-	PASR_NO_REFRESH,
-};
 
 struct pasr_fw {
 	struct pasr_map *map;
@@ -33,6 +30,8 @@ void pasr_update_mask(struct pasr_section *section, enum pasr_state state)
 	else
 		set_bit(bit, &die->mem_reg);
 
+	section->state = state;
+
 	pr_debug("%s(): %s refresh section %#x. Die%d mem_reg = %#08lx\n"
 			, __func__, state == PASR_REFRESH ? "Start" : "Stop"
 			, section->start, die->idx, die->mem_reg);
@@ -43,6 +42,7 @@ void pasr_update_mask(struct pasr_section *section, enum pasr_state state)
 	return;
 }
 
+#ifdef CONFIG_PASR_ENABLE
 void pasr_put(phys_addr_t paddr, unsigned long size)
 {
 	struct pasr_section *s;
@@ -57,7 +57,7 @@ void pasr_put(phys_addr_t paddr, unsigned long size)
 		if (!s)
 			goto out;
 
-		cur_sz = ((paddr + size) < (s->start + PASR_SECTION_SZ)) ?
+		cur_sz = (paddr + size - 1 < s->start + PASR_SECTION_SZ - 1) ?
 			size : s->start + PASR_SECTION_SZ - paddr;
 
 		if (s->lock)
@@ -101,7 +101,7 @@ void pasr_get(phys_addr_t paddr, unsigned long size)
 		if (!s)
 			goto out;
 
-		cur_sz = ((paddr + size) < (s->start + PASR_SECTION_SZ)) ?
+		cur_sz = (paddr + size - 1 < s->start + PASR_SECTION_SZ - 1) ?
 			size : s->start + PASR_SECTION_SZ - paddr;
 
 		if (s->lock)
@@ -130,13 +130,14 @@ unlock:
 out:
 	return;
 }
+#endif /* CONFIG_PASR_ENABLE */
 
 int pasr_register_mask_function(phys_addr_t addr, void *function, void *cookie)
 {
 	struct pasr_die *die = pasr_addr2die(pasr.map, addr);
 
 	if (!die) {
-		pr_err("%s: No DDR die corresponding to address 0x%08x\n",
+		pr_debug("%s: No DDR die corresponding to address 0x%08x\n",
 				__func__, addr);
 		return -EINVAL;
 	}
@@ -148,7 +149,8 @@ int pasr_register_mask_function(phys_addr_t addr, void *function, void *cookie)
 	die->cookie = cookie;
 	die->apply_mask = function;
 
-	die->apply_mask(&die->mem_reg, die->cookie);
+	if (die->apply_mask)
+		die->apply_mask(&die->mem_reg, die->cookie);
 
 	return 0;
 }
@@ -159,3 +161,7 @@ int __init pasr_init_core(struct pasr_map *map)
 	return 0;
 }
 
+struct pasr_map *pasr_get_map(void)
+{
+	return pasr.map;
+}

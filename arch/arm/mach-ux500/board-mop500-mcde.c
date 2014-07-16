@@ -20,20 +20,22 @@
 #include <video/av8100.h>
 #include <video/mcde_display.h>
 #include <video/mcde_display-vuib500-dpi.h>
-#include <video/mcde_display-sony_acx424akp_dsi.h>
 #include <video/mcde_display-av8100.h>
 #include <video/mcde_fb.h>
 #include <video/mcde_dss.h>
 #include <plat/pincfg.h>
+
 #include "pins-db8500.h"
 #include "pins.h"
 #include "board-mop500.h"
+#include "id.h"
 
 #define DSI_UNIT_INTERVAL_0	0x9
 #define DSI_UNIT_INTERVAL_1	0x9
 #define DSI_UNIT_INTERVAL_2	0x5
 
-#define DSI_PLL_FREQ_HZ		840320000
+#define DSI_PLL_FREQ_HZ_VID	330000000
+#define DSI_PLL_FREQ_HZ_CMD	840320000
 /* Based on PLL DDR Freq at 798,72 MHz */
 #define HDMI_FREQ_HZ		33280000
 #define TV_FREQ_HZ		38400000
@@ -93,6 +95,7 @@ static struct mcde_port samsung_s6d16d0_port0 = {
 
 static struct mcde_display_dsi_platform_data samsung_s6d16d0_pdata0 = {
 	.link = 0,
+	.num_data_lanes = 2,
 };
 
 static struct mcde_display_device samsung_s6d16d0_display0 = {
@@ -108,24 +111,16 @@ static struct mcde_display_device samsung_s6d16d0_display0 = {
 };
 
 static struct mcde_port sony_port0 = {
-	.link = 0,
+	.mode = MCDE_PORTMODE_CMD, /* Change to _VID for video mode */
 	.sync_src = MCDE_SYNCSRC_BTA,
-	.frame_trig = MCDE_TRIG_HW,
 };
 
-static struct mcde_display_sony_acx424akp_platform_data
-			sony_acx424akp_display0_pdata = {
-	.reset_gpio = HREFV60_DISP1_RST_GPIO,
-};
+static struct mcde_display_dsi_platform_data sony_acx424akp_display0_pdata;
 
 static struct mcde_display_device sony_acx424akp_display0 = {
 	.name = "mcde_disp_sony_acx424akp",
 	.id = PRIMARY_DISPLAY_ID,
 	.port = &sony_port0,
-	.chnl_id = MCDE_CHNL_A,
-	.fifo = MCDE_FIFO_A,
-	.orientation = MCDE_DISPLAY_ROT_0,
-	.default_pixel_format = MCDE_OVLYPIXFMT_RGBA8888,
 	.dev = {
 		.platform_data = &sony_acx424akp_display0_pdata,
 	},
@@ -138,6 +133,7 @@ static struct mcde_port samsung_s6d16d0_port1 = {
 
 static struct mcde_display_dsi_platform_data samsung_s6d16d0_pdata1 = {
 	.link = 1,
+	.num_data_lanes = 2,
 };
 
 static struct mcde_display_device samsung_s6d16d0_display1 = {
@@ -151,6 +147,30 @@ static struct mcde_display_device samsung_s6d16d0_display1 = {
 	.dev = {
 		.platform_data = &samsung_s6d16d0_pdata1,
 	},
+};
+
+static struct mcde_port sharp_port0 = {
+        .mode = MCDE_PORTMODE_CMD, /* Change to _VID for video mode */
+        .sync_src = MCDE_SYNCSRC_BTA,
+        .frame_trig = MCDE_TRIG_HW,
+};
+
+static struct mcde_display_dsi_platform_data sharp_lq043t1_display0_pdata = {
+	.link = 1,
+        .num_data_lanes = 2,
+};
+
+static struct mcde_display_device sharp_lq043t1_display0 = {
+        .name = "mcde_disp_sharp_lq043t1",
+        .id = PRIMARY_DISPLAY_ID,
+        .port = &sharp_port0,
+        .chnl_id = MCDE_CHNL_A,
+        .fifo = MCDE_FIFO_A,
+        .orientation = MCDE_DISPLAY_ROT_0,
+        .default_pixel_format = MCDE_OVLYPIXFMT_RGBA8888,
+        .dev = {
+                .platform_data = &sharp_lq043t1_display0_pdata,
+        },
 };
 
 #ifdef CONFIG_U8500_TV_OUTPUT_AV8100
@@ -230,21 +250,24 @@ static int display_postregistered_callback(struct notifier_block *nb,
 		return 0;
 
 	mcde_dss_get_native_resolution(ddev, &width, &height);
-#ifdef CONFIG_MCDE_DISPLAY_PRIMARY_TRIPPLE_BUFFERED
 	if (ddev->id == PRIMARY_DISPLAY_ID)
 		virtual_height = height * 3;
 	else
-#endif
 		virtual_height = height * 2;
 
 #ifndef CONFIG_MCDE_DISPLAY_HDMI_FB_AUTO_CREATE
 	if (ddev->id == AV8100_DISPLAY_ID)
 		goto out;
 #endif
-
 	/* Create frame buffer */
+#if defined(CONFIG_MCDE_DISPLAY_BAMBOOK)
+	fbi = mcde_fb_create(ddev, width, height, width, virtual_height,
+				ddev->default_pixel_format, FB_ROTATE_UD);
+#else
 	fbi = mcde_fb_create(ddev, width, height, width, virtual_height,
 				ddev->default_pixel_format, FB_ROTATE_UR);
+#endif
+
 	if (IS_ERR(fbi)) {
 		dev_warn(&ddev->dev,
 			"Failed to create fb for display %s\n", ddev->name);
@@ -272,7 +295,7 @@ static int display_postregistered_callback(struct notifier_block *nb,
 		bool mcde_rotation = false;
 
 		/* Use mcde rotation for U8500 only */
-		if (cpu_is_u8500())
+		if (cpu_is_u8500_family())
 			mcde_rotation = true;
 
 		mfb = to_mcde_fb(fbi);
@@ -302,8 +325,9 @@ static struct notifier_block display_nb = {
 };
 #endif /* CONFIG_FB_MCDE */
 
-static int __init handle_display_devices_in_u8500(void)
+static int __init handle_display_devices(void)
 {
+	bool video_mode = false;
 	struct mcde_platform_data *pdata = ux500_mcde_device.dev.platform_data;
 
 	pr_debug("%s\n", __func__);
@@ -312,14 +336,32 @@ static int __init handle_display_devices_in_u8500(void)
 	(void)mcde_dss_register_notifier(&display_nb);
 #endif
 
+	if (uib_is_u8500uibr3() && sony_port0.mode == MCDE_PORTMODE_VID)
+		video_mode = true;
+
+	/*
+	 * display_initialized_during_boot will have the
+	 * port_video_mode value + 1 if the display was initiated during boot,
+	 * otherwise zero
+	 */
+	if (display_initialized_during_boot) {
+		/* restore video_mode value from boot */
+		u32 boot_video_mode = display_initialized_during_boot - 1;
+		/* if boot_video_mode not expected,
+		 * clear already initiated flag */
+		if ((boot_video_mode == MCDE_PORTMODE_VID) != video_mode)
+			display_initialized_during_boot = 0;
+	}
+
 	/* Set powermode to STANDBY if startup graphics is executed */
 	if (display_initialized_during_boot) {
 		samsung_s6d16d0_display0.power_mode = MCDE_DISPLAY_PM_STANDBY;
 		sony_acx424akp_display0.power_mode = MCDE_DISPLAY_PM_STANDBY;
+		sharp_lq043t1_display0.power_mode = MCDE_DISPLAY_PM_STANDBY;
 	}
 
 	/* Display reset GPIO is different depending on reference boards */
-	if (machine_is_hrefv60() || machine_is_u8520() || machine_is_u9540()) {
+	if (machine_is_hrefv60() || machine_is_u8520()) {
 		samsung_s6d16d0_pdata0.reset_gpio = HREFV60_DISP1_RST_GPIO;
 		samsung_s6d16d0_pdata1.reset_gpio = HREFV60_DISP2_RST_GPIO;
 	} else {
@@ -332,6 +374,7 @@ static int __init handle_display_devices_in_u8500(void)
 		struct clk *clk_dsi_pll;
 		struct clk *clk_hdmi;
 		struct clk *clk_tv;
+		u32 freq;
 
 		/*
 		 * The TV CLK is used as parent for the
@@ -359,20 +402,20 @@ static int __init handle_display_devices_in_u8500(void)
 		 * The DSI PLL CLK is used as DSI PLL for direct freq for
 		 * link 2. Link 0/1 is then divided with 1/2/4 from this freq.
 		 */
-		clk_dsi_pll = clk_get(&ux500_mcde_device.dev, "dsihs2");
-		if (DSI_PLL_FREQ_HZ != clk_round_rate(clk_dsi_pll,
-							DSI_PLL_FREQ_HZ))
+		freq = video_mode ? DSI_PLL_FREQ_HZ_VID : DSI_PLL_FREQ_HZ_CMD;
+		clk_dsi_pll = clk_get(&ux500_mcde_device.dev, "dsipll");
+		if (freq != clk_round_rate(clk_dsi_pll, freq))
 			pr_warning("%s: DSI_PLL freq differs %ld\n", __func__,
-				clk_round_rate(clk_dsi_pll, DSI_PLL_FREQ_HZ));
-		clk_set_rate(clk_dsi_pll, DSI_PLL_FREQ_HZ);
+					clk_round_rate(clk_dsi_pll, freq));
+		clk_set_rate(clk_dsi_pll, freq);
 		clk_put(clk_dsi_pll);
 	}
 
 	/* MCDE pixelfetchwtrmrk levels per overlay */
-	pdata->pixelfetchwtrmrk[0] = 48;	/* LCD 32 bpp */
-	pdata->pixelfetchwtrmrk[1] = 64;	/* LCD 16 bpp */
-	pdata->pixelfetchwtrmrk[2] = 128;	/* HDMI 32 bpp */
-	pdata->pixelfetchwtrmrk[3] = 192;	/* HDMI 16 bpp */
+	pdata->pixelfetchwtrmrk[0] = video_mode ? 128 : 48;	/* LCD 32bpp */
+	pdata->pixelfetchwtrmrk[1] = video_mode ? 128 : 64;	/* LCD 16bpp */
+	pdata->pixelfetchwtrmrk[2] = 128;			/* HDMI 32bpp */
+	pdata->pixelfetchwtrmrk[3] = 192;			/* HDMI 16bpp */
 
 	/* Not all STUIBs supports VSYNC, disable vsync for STUIB */
 	if (uib_is_stuib()) {
@@ -386,9 +429,11 @@ static int __init handle_display_devices_in_u8500(void)
 		(void)mcde_display_device_register(&samsung_s6d16d0_display0);
 	} else if (uib_is_u8500uibr3()) {
 		/* Sony display on U8500UIBV3 */
+		sony_acx424akp_display0_pdata.reset_gpio = HREFV60_DISP1_RST_GPIO;
 		(void)mcde_display_device_register(&sony_acx424akp_display0);
 	} else {
-		WARN_ON("Unknown UI board");
+		sharp_lq043t1_display0_pdata.reset_gpio = HREFV60_DISP1_RST_GPIO;
+		(void)mcde_display_device_register(&sharp_lq043t1_display0);
 	}
 
 	/* Display reset GPIO is different depending on reference boards */
@@ -405,38 +450,10 @@ static int __init handle_display_devices_in_u8500(void)
 	return 0;
 }
 
-static int __init handle_display_devices_in_u9540(void)
-{
-	struct mcde_platform_data *pdata = ux500_mcde_device.dev.platform_data;
-
-	pr_debug("%s\n", __func__);
-
-#ifdef CONFIG_FB_MCDE
-	(void)mcde_dss_register_notifier(&display_nb);
-#endif
-
-	/* Set powermode to STANDBY if startup graphics is executed */
-	if (display_initialized_during_boot)
-		sony_acx424akp_display0.power_mode = MCDE_DISPLAY_PM_ON;
-
-	/* MCDE pixelfetchwtrmrk levels per overlay */
-	pdata->pixelfetchwtrmrk[0] = 64;	/* LCD 32 bpp */
-	pdata->pixelfetchwtrmrk[1] = 96;	/* LCD 16 bpp */
-	pdata->pixelfetchwtrmrk[2] = 192;	/* HDMI 32 bpp */
-	pdata->pixelfetchwtrmrk[3] = 256;	/* HDMI 16 bpp */
-
-	sony_acx424akp_display0_pdata.reset_gpio = UIB_9540_DISP1_RST_GPIO;
-	(void)mcde_display_device_register(&sony_acx424akp_display0);
-
-	return 0;
-}
-
 static int __init init_display_devices(void)
 {
-	if (cpu_is_u8500())
-		return handle_display_devices_in_u8500();
-	else if (cpu_is_u9540())
-		return handle_display_devices_in_u9540();
+	if (cpu_is_u8500_family())
+		return handle_display_devices();
 	else
 		return 0;
 }

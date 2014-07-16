@@ -189,6 +189,13 @@ int cg2900_hci_uart_set_baudrate(struct hci_uart *hu, int baud)
 	/* Start by storing the old termios. */
 	memcpy(&old_termios, tty->termios, sizeof(old_termios));
 
+	/*
+	 * Make sure the core will not snap baudrate to something
+	 * "close to" requested rate by setting the BOTHER
+	 * (baud rate other) flag.
+	 */
+	tty->termios->c_cflag &= ~CBAUD;
+	tty->termios->c_cflag |= BOTHER | (BOTHER >> IBSHIFT);
 	tty_encode_baud_rate(tty, baud, baud);
 
 	/* Finally inform the driver */
@@ -268,8 +275,9 @@ static int hci_uart_close(struct hci_dev *hdev)
 }
 
 /* Send frames from HCI layer */
-static int hci_uart_send_frame(struct hci_dev* hdev, struct sk_buff *skb)
+static int hci_uart_send_frame(struct sk_buff *skb)
 {
+	struct hci_dev* hdev = (struct hci_dev *) skb->dev;
 	struct hci_uart *hu;
 
 	if (!hdev) {
@@ -395,7 +403,7 @@ static void hci_uart_tty_wakeup(struct tty_struct *tty)
 		return;
 
 	if (test_bit(HCI_UART_PROTO_SET, &hu->flags))
-		hci_uart_tx_wakeup(hu);
+		hu->proto->send_callback(hu);
 }
 
 /* hci_uart_tty_receive()
@@ -454,7 +462,7 @@ static int hci_uart_register_dev(struct hci_uart *hu)
 	hdev->send  = hci_uart_send_frame;
 
 	if (!reset)
-		set_bit(HCI_QUIRK_RESET_ON_CLOSE, &hdev->quirks);
+		set_bit(HCI_QUIRK_NO_RESET, &hdev->quirks);
 
 	if (test_bit(HCI_UART_RAW_DEVICE, &hu->hdev_flags))
 		set_bit(HCI_QUIRK_RAW_DEVICE, &hdev->quirks);
@@ -642,4 +650,3 @@ MODULE_DESCRIPTION("CG2900 Staging Bluetooth HCI UART driver ver " VERSION);
 MODULE_VERSION(VERSION);
 MODULE_LICENSE("GPL");
 MODULE_ALIAS_LDISC(N_CG2900_HCI);
-

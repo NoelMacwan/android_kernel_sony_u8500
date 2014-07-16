@@ -8,6 +8,7 @@
  * published by the Free Software Foundation.
  */
 #include <linux/moduleparam.h>
+#include <linux/export.h>
 #include <linux/debugfs.h>
 #include <linux/fs.h>
 #include <linux/seq_file.h>
@@ -347,6 +348,21 @@ void mmc_add_card_debugfs(struct mmc_card *card)
 	if (mmc_card_mmc(card))
 		if (!debugfs_create_file("ext_csd", S_IRUSR, root, card,
 					&mmc_dbg_ext_csd_fops))
+			goto err;
+
+	if (mmc_card_sd(card))
+		if (!debugfs_create_x32("ssr_au", S_IRUSR, root,
+					&card->ssr.au))
+			goto err;
+
+	if (mmc_card_sd(card))
+		if (!debugfs_create_x32("ssr_erase_timeout", S_IRUSR, root,
+				&card->ssr.erase_timeout))
+			goto err;
+
+	if (mmc_card_sd(card))
+		if (!debugfs_create_x32("ssr_erase_offset", S_IRUSR, root,
+				&card->ssr.erase_offset))
 			goto err;
 
 	return;

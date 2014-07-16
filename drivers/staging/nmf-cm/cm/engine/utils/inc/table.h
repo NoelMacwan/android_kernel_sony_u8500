@@ -23,8 +23,11 @@
   (the low INDEX_SHIFT bits) and the low bits of the "local" pointer
   shifted by INDEX_SHIFT are stored in the high bits:
 
-  handle bits: 31 ................................ 12 11 ...... 0
-              | lower bits of of the local pointer   |   index   |
+  handle bits: 31 ................................ 13     12     11 ...... 0
+              | lower bits of of the local pointer  |Status Flag|   index   |
+  Status Flag: It will indicate that the handle is allocated. If the 20 LSB of address are zero,
+               and the index is also zero, then in that case, handle will be zero, and it will cause to uninitialized
+               pointer in t_nmf_table, and cause to crash.
 
   This allows a straight translation from a user handle to a local pointer
   + a strong check to validate the value of a user handle.
@@ -37,7 +40,9 @@
 #define INDEX_SHIFT    12
 #define INDEX_MAX      (1UL << INDEX_SHIFT)
 #define INDEX_MASK     (INDEX_MAX-1)
-#define ENTRY2HANDLE(pointer, index) (((unsigned int)pointer << INDEX_SHIFT) | index)
+#define STATUSBIT_MASK (INDEX_MAX)
+#define LSBADDR_SHIFT  (INDEX_SHIFT + 1)
+#define ENTRY2HANDLE(pointer, index) ((((unsigned int)pointer << LSBADDR_SHIFT) | index)| STATUSBIT_MASK)
 #define TABLE_DEF_SIZE 0x1000
 
 typedef struct {
