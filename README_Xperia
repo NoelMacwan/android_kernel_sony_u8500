@@ -1,9 +1,9 @@
 Configuration files can be found in arch/arm/configs.
 
-Xperia P => riogrande_nypon_defconfig
-Xperia Go => xperiago_defconfig
-Xperia U => xperiau_defconfig
-Xperia Sola => xperiasola_defconfig
+Xperia P => sxdnypon_defconfig
+Xperia Go => sxdlotus_defconfig
+Xperia U => sxdkumquat_defconfig
+Xperia Sola => sxdpepper_defconfig
 
 
 To flash your kernel using Fastboot perform the following steps:
